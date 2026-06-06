@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import base64
+import io
+import threading
+import time
 from typing import Any
 
-from .config_service import ConfigNotFoundError, ConfigService, DEFAULT_MODEL
+from .config_service import ConfigService, DEFAULT_MODEL
+from .task_store import TaskStore, task_store as default_task_store
+
+
+_VALID_QUALITY = {"auto", "low", "medium", "high"}
 
 
 class ImageServiceError(Exception):
@@ -29,11 +37,31 @@ class AllProvidersFailed(ImageServiceError):
 
 
 class ImageService:
+    """Submits image tasks to the configured providers.
+
+    GPT-Image-2 is reached through the standard OpenAI-compatible Images API
+    (``POST {base}/v1/images/generations`` and ``POST {base}/v1/images/edits``),
+    which is what each node uses by default (``api_type == "openai"``). A node
+    can instead use a custom async relay (``api_type == "async"``) that exposes
+    ``/async/images`` submit + poll.
+
+    Because OpenAI image calls are slow (often minutes) and can exceed the
+    browser's request timeout, the whole lifecycle runs in a worker thread and
+    results are stored in an in-process task store. The frontend keeps polling
+    ``GET /api/status?task_id=...``; provider fallback happens inside the worker
+    so it works uniformly for both protocols.
+    """
+
     def __init__(
         self,
         config_service: ConfigService | None = None,
         http_client: Any | None = None,
         request_timeout: int = 30,
+        generation_timeout: int = 180,
+        async_poll_interval: float = 3.0,
+        async_max_wait: int = 300,
+        store: TaskStore | None = None,
+        run_async: bool = True,
     ):
         self.config_service = config_service or ConfigService()
         if http_client is None:
@@ -42,18 +70,27 @@ class ImageService:
             http_client = requests.Session()
         self.http_client = http_client
         self.request_timeout = request_timeout
+        self.generation_timeout = generation_timeout
+        self.async_poll_interval = async_poll_interval
+        self.async_max_wait = async_max_wait
+        self.store = store or default_task_store
+        # When False the worker runs inline (used by tests for determinism).
+        self.run_async = run_async
 
-    def submit_generation(self, prompt: str, size: str = "1024x1024", n: int = 1) -> dict[str, Any]:
-        prompt = self._normalize_prompt(prompt)
-        n = self._normalize_image_count(n)
-        size = self._normalize_size(size)
-        payload = {
-            "model": DEFAULT_MODEL,
-            "prompt": prompt,
-            "size": size,
-            "n": n,
+    # ------------------------------------------------------------------ submit
+
+    def submit_generation(
+        self, prompt: str, size: str = "1024x1024", n: int = 1, quality: str | None = None
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "prompt": self._normalize_prompt(prompt),
+            "size": self._normalize_size(size),
+            "n": self._normalize_image_count(n),
         }
-        return self._submit_with_fallback(payload=payload, operation="generate")
+        quality = self._normalize_quality(quality)
+        if quality:
+            payload["quality"] = quality
+        return self._start_task(payload=payload, operation="generate")
 
     def submit_edit_generation(
         self,
@@ -64,141 +101,322 @@ class ImageService:
         n: int = 1,
         edit_mode: str = "mask",
         selection: dict[str, Any] | None = None,
+        quality: str | None = None,
     ) -> dict[str, Any]:
-        prompt = self._normalize_prompt(prompt)
-        n = self._normalize_image_count(n)
-        size = self._normalize_size(size)
-        image = self._normalize_image_data_url(image, "image")
-        mask = self._normalize_image_data_url(mask, "mask")
         edit_mode = str(edit_mode or "mask").strip() or "mask"
         if edit_mode not in {"mask", "selection"}:
             raise GenerationValidationError("edit_mode 只支持 mask 或 selection", status_code=400)
         if selection is not None and not isinstance(selection, dict):
             raise GenerationValidationError("selection 必须是对象", status_code=400)
 
-        payload = {
-            "model": DEFAULT_MODEL,
-            "prompt": prompt,
-            "size": size,
-            "n": n,
-            "image": image,
-            "mask": mask,
+        payload: dict[str, Any] = {
+            "prompt": self._normalize_prompt(prompt),
+            "size": self._normalize_size(size),
+            "n": self._normalize_image_count(n),
+            "image": self._normalize_image_data_url(image, "image"),
+            "mask": self._normalize_image_data_url(mask, "mask"),
             "edit_mode": edit_mode,
         }
+        quality = self._normalize_quality(quality)
+        if quality:
+            payload["quality"] = quality
         if selection is not None:
             payload["selection"] = selection
-        return self._submit_with_fallback(payload=payload, operation="edit")
+        return self._start_task(payload=payload, operation="edit")
 
-    def _submit_with_fallback(self, payload: dict[str, Any], operation: str) -> dict[str, Any]:
+    def _start_task(self, payload: dict[str, Any], operation: str) -> dict[str, Any]:
         providers = self.config_service.get_enabled_configs()
-        attempts: list[dict[str, Any]] = []
-
         if not providers:
             raise AllProvidersFailed("没有可用的 API 配置，请先启用至少一个节点", status_code=400)
 
-        # Fallback 核心逻辑：
-        # 1. 配置文件中的数组顺序就是优先级，前端拖拽排序后会持久化这个顺序。
-        # 2. 每个节点只负责“提交异步任务”，不在这里等待生成完成，避免 Flask 请求阻塞 1-3 分钟。
-        # 3. 任一节点出现认证失败、超时、5xx、返回结构缺失 task_id 等问题，都记录失败并切到下一个启用节点。
-        for provider in providers:
-            try:
-                result = self._submit_with_provider(provider, payload=payload, operation=operation)
-            except Exception as exc:
-                attempts.append(self._failed_attempt(provider, exc))
-                continue
-
-            attempts.append({"api_id": provider["id"], "api_name": provider["name"], "ok": True})
-            result["attempts"] = attempts
-            return result
-
-        raise AllProvidersFailed(
-            "所有 API 节点提交任务均失败",
-            status_code=502,
-            details={"attempts": attempts},
-        )
-
-    def poll_generation_status(self, api_id: str, task_id: str) -> dict[str, Any]:
-        if not str(api_id or "").strip():
-            raise GenerationValidationError("api_id 不能为空", status_code=400)
-        if not str(task_id or "").strip():
-            raise GenerationValidationError("task_id 不能为空", status_code=400)
-
-        try:
-            provider = self.config_service.get_config(api_id)
-        except ConfigNotFoundError as exc:
-            raise GenerationValidationError(f"找不到任务对应的 API 配置: {api_id}", status_code=404) from exc
-
-        url = f"{provider['base_url'].rstrip('/')}/async/images/{task_id}"
-        try:
-            response = self.http_client.get(
-                url,
-                headers=self._headers(provider),
-                timeout=self.request_timeout,
+        task_id = self.store.create(operation)
+        if self.run_async:
+            thread = threading.Thread(
+                target=self._execute_task,
+                args=(task_id, providers, payload, operation),
+                daemon=True,
             )
-            data = self._parse_response_json(response, provider)
-            self._ensure_success_status(response, data, provider)
-        except ImageServiceError:
-            raise
-        except Exception as exc:
-            raise ProviderRequestError(
-                "查询任务状态失败",
-                status_code=502,
-                details={"api_id": provider["id"], "api_name": provider["name"], "error": str(exc)},
-            ) from exc
+            thread.start()
+        else:
+            self._execute_task(task_id, providers, payload, operation)
+        return {"task_id": task_id, "status": "queued", "operation": operation}
 
-        status = str(data.get("status", "")).strip().lower()
-        if not status:
+    # ------------------------------------------------------------------ worker
+
+    def _execute_task(
+        self,
+        task_id: str,
+        providers: list[dict[str, Any]],
+        payload: dict[str, Any],
+        operation: str,
+    ) -> None:
+        self.store.update(task_id, status="processing")
+        attempts: list[dict[str, Any]] = []
+        try:
+            for provider in providers:
+                self.store.update(task_id, api_id=provider["id"], api_name=provider["name"])
+                try:
+                    urls, expires_at = self._run_provider(provider, payload, operation)
+                except Exception as exc:  # noqa: BLE001 - record and fall back
+                    attempts.append(self._failed_attempt(provider, exc))
+                    self.store.update(task_id, attempts=list(attempts))
+                    continue
+
+                if not urls:
+                    attempts.append(
+                        self._failed_attempt(provider, ProviderRequestError("节点返回空图片列表"))
+                    )
+                    self.store.update(task_id, attempts=list(attempts))
+                    continue
+
+                attempts.append({"api_id": provider["id"], "api_name": provider["name"], "ok": True})
+                self.store.update(
+                    task_id,
+                    status="completed",
+                    urls=urls,
+                    expires_at=expires_at,
+                    attempts=list(attempts),
+                    error=None,
+                )
+                return
+
+            self.store.update(
+                task_id,
+                status="failed",
+                attempts=list(attempts),
+                error="所有 API 节点均失败",
+            )
+        except Exception as exc:  # noqa: BLE001 - never let the worker die silently
+            self.store.update(task_id, status="failed", attempts=list(attempts), error=str(exc))
+
+    def _run_provider(
+        self, provider: dict[str, Any], payload: dict[str, Any], operation: str
+    ) -> tuple[list[str], Any]:
+        if provider.get("api_type") == "async":
+            return self._run_async_provider(provider, payload, operation)
+        return self._run_openai_provider(provider, payload, operation)
+
+    # --------------------------------------------------- OpenAI-compatible API
+
+    def _run_openai_provider(
+        self, provider: dict[str, Any], payload: dict[str, Any], operation: str
+    ) -> tuple[list[str], Any]:
+        model = provider.get("model") or DEFAULT_MODEL
+        if operation == "edit":
+            url = self._openai_endpoint(provider["base_url"], "images/edits")
+            image_bytes, image_mime = self._decode_data_url(payload["image"], "image")
+            mask_bytes = self._build_openai_mask(payload["image"], payload["mask"], payload.get("selection"))
+            files = {
+                "image": (f"image.{self._ext_for_mime(image_mime)}", image_bytes, image_mime),
+                "mask": ("mask.png", mask_bytes, "image/png"),
+            }
+            data = {
+                "model": model,
+                "prompt": payload["prompt"],
+                "size": payload["size"],
+                "n": str(payload["n"]),
+            }
+            if payload.get("quality"):
+                data["quality"] = payload["quality"]
+            response = self.http_client.post(
+                url,
+                headers=self._auth_headers(provider),
+                files=files,
+                data=data,
+                timeout=self.generation_timeout,
+            )
+        else:
+            url = self._openai_endpoint(provider["base_url"], "images/generations")
+            body = {
+                "model": model,
+                "prompt": payload["prompt"],
+                "size": payload["size"],
+                "n": payload["n"],
+            }
+            if payload.get("quality"):
+                body["quality"] = payload["quality"]
+            response = self.http_client.post(
+                url,
+                headers=self._auth_headers(provider, json_content=True),
+                json=body,
+                timeout=self.generation_timeout,
+            )
+
+        data = self._parse_response_json(response, provider)
+        self._ensure_success_status(response, data, provider)
+        return self._extract_openai_images(data, provider), None
+
+    def _extract_openai_images(self, data: dict[str, Any], provider: dict[str, Any]) -> list[str]:
+        items = data.get("data")
+        if not isinstance(items, list) or not items:
             raise ProviderRequestError(
-                "状态查询返回缺少 status 字段",
+                "OpenAI 响应缺少图片数据 (data)",
                 status_code=502,
                 details={"api_id": provider["id"], "api_name": provider["name"], "response": data},
             )
+        output_format = str(data.get("output_format") or "png").lower()
+        urls: list[str] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            b64 = item.get("b64_json")
+            if b64:
+                urls.append(f"data:image/{output_format};base64,{b64}")
+                continue
+            url = item.get("url")
+            if url:
+                urls.append(url)
+        if not urls:
+            raise ProviderRequestError(
+                "OpenAI 响应中没有可用的图片 (b64_json/url)",
+                status_code=502,
+                details={"api_id": provider["id"], "api_name": provider["name"], "response": data},
+            )
+        return urls
 
-        # 轮询只代理一次中转站状态查询；4 秒递归/定时轮询由前端负责，后端保持无状态。
-        return {
-            "api_id": provider["id"],
-            "api_name": provider["name"],
-            "task_id": task_id,
-            "status": status,
-            "urls": data.get("urls") if isinstance(data.get("urls"), list) else [],
-            "expires_at": data.get("expires_at"),
-            "error": data.get("error"),
-            "raw": data,
+    def _build_openai_mask(
+        self, image_data_url: str, mask_data_url: str, selection: dict[str, Any] | None
+    ) -> bytes:
+        """Produce an OpenAI-compatible mask PNG.
+
+        The editor paints the *target* region opaque on a transparent canvas,
+        but OpenAI treats *transparent* pixels as the area to edit, so the alpha
+        is inverted. When the editor reports the image's letterbox rect inside
+        its canvas (``selection.box``) the mask is cropped to it and resized to
+        the source image so the edited region lines up pixel-for-pixel.
+        """
+        try:
+            from PIL import Image
+        except ImportError as exc:  # pragma: no cover - dependency guard
+            raise ProviderRequestError(
+                "局部编辑需要 Pillow 依赖，请先安装 backend/requirements.txt",
+                status_code=500,
+            ) from exc
+
+        image_bytes, _ = self._decode_data_url(image_data_url, "image")
+        mask_bytes, _ = self._decode_data_url(mask_data_url, "mask")
+        source = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+        width, height = source.size
+        mask_img = Image.open(io.BytesIO(mask_bytes)).convert("RGBA")
+
+        box = selection.get("box") if isinstance(selection, dict) else None
+        if isinstance(box, dict):
+            try:
+                x, y = int(box["x"]), int(box["y"])
+                w, h = int(box["width"]), int(box["height"])
+            except (KeyError, TypeError, ValueError):
+                x = y = w = h = 0
+            if w > 0 and h > 0:
+                mask_img = mask_img.crop((x, y, x + w, y + h))
+
+        if mask_img.size != (width, height):
+            mask_img = mask_img.resize((width, height))
+
+        alpha = mask_img.split()[3].point(lambda value: 255 - value)
+        out = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        out.putalpha(alpha)
+        buffer = io.BytesIO()
+        out.save(buffer, format="PNG")
+        return buffer.getvalue()
+
+    @staticmethod
+    def _openai_endpoint(base_url: str, path: str) -> str:
+        base = base_url.rstrip("/")
+        if base.endswith("/v1"):
+            return f"{base}/{path}"
+        return f"{base}/v1/{path}"
+
+    # ------------------------------------------------------- async relay (opt)
+
+    def _run_async_provider(
+        self, provider: dict[str, Any], payload: dict[str, Any], operation: str
+    ) -> tuple[list[str], Any]:
+        base = provider["base_url"].rstrip("/")
+        body: dict[str, Any] = {
+            "model": provider.get("model") or DEFAULT_MODEL,
+            "prompt": payload["prompt"],
+            "size": payload["size"],
+            "n": payload["n"],
         }
+        if payload.get("quality"):
+            body["quality"] = payload["quality"]
+        if operation == "edit":
+            body["image"] = payload["image"]
+            body["mask"] = payload["mask"]
+            body["edit_mode"] = payload.get("edit_mode", "mask")
+            if payload.get("selection") is not None:
+                body["selection"] = payload["selection"]
 
-    def _submit_with_provider(self, provider: dict[str, Any], payload: dict[str, Any], operation: str) -> dict[str, Any]:
-        url = f"{provider['base_url'].rstrip('/')}/async/images"
-        request_payload = dict(payload)
-        request_payload["model"] = provider.get("model") or payload.get("model") or DEFAULT_MODEL
         response = self.http_client.post(
-            url,
-            headers=self._headers(provider, json_content=True),
-            json=request_payload,
+            f"{base}/async/images",
+            headers=self._auth_headers(provider, json_content=True),
+            json=body,
             timeout=self.request_timeout,
         )
         data = self._parse_response_json(response, provider)
         self._ensure_success_status(response, data, provider)
-
-        task_id = data.get("task_id")
-        if not task_id:
+        upstream_task_id = data.get("task_id")
+        if not upstream_task_id:
             raise ProviderRequestError(
                 "提交任务成功响应缺少 task_id",
                 status_code=502,
                 details={"api_id": provider["id"], "api_name": provider["name"], "response": data},
             )
 
+        poll_url = f"{base}/async/images/{upstream_task_id}"
+        deadline = time.monotonic() + self.async_max_wait
+        while True:
+            status_response = self.http_client.get(
+                poll_url,
+                headers=self._auth_headers(provider),
+                timeout=self.request_timeout,
+            )
+            status_data = self._parse_response_json(status_response, provider)
+            self._ensure_success_status(status_response, status_data, provider)
+            status = str(status_data.get("status", "")).strip().lower()
+            if status == "completed":
+                urls = status_data.get("urls") if isinstance(status_data.get("urls"), list) else []
+                return urls, status_data.get("expires_at")
+            if status == "failed":
+                raise ProviderRequestError(
+                    status_data.get("error") or "上游任务失败",
+                    status_code=502,
+                    details={"api_id": provider["id"], "api_name": provider["name"]},
+                )
+            if time.monotonic() >= deadline:
+                raise ProviderRequestError(
+                    "上游任务轮询超时",
+                    status_code=504,
+                    details={"api_id": provider["id"], "api_name": provider["name"]},
+                )
+            time.sleep(self.async_poll_interval)
+
+    # ------------------------------------------------------------------ status
+
+    def poll_generation_status(self, api_id: str = "", task_id: str = "") -> dict[str, Any]:
+        task_id = str(task_id or "").strip()
+        if not task_id:
+            raise GenerationValidationError("task_id 不能为空", status_code=400)
+
+        task = self.store.get(task_id)
+        if task is None:
+            raise GenerationValidationError("任务不存在或已过期", status_code=404)
+
         return {
+            "api_id": task.get("api_id"),
+            "api_name": task.get("api_name"),
             "task_id": task_id,
-            "api_id": provider["id"],
-            "api_name": provider["name"],
-            "status": data.get("status", "queued"),
-            "poll_url": data.get("poll_url"),
-            "model": request_payload["model"],
-            "operation": operation,
-            "raw": data,
+            "operation": task.get("operation"),
+            "status": task.get("status"),
+            "urls": task.get("urls") or [],
+            "attempts": task.get("attempts") or [],
+            "expires_at": task.get("expires_at"),
+            "error": task.get("error"),
         }
 
-    def _headers(self, provider: dict[str, Any], json_content: bool = False) -> dict[str, str]:
+    # ------------------------------------------------------------------ shared
+
+    def _auth_headers(self, provider: dict[str, Any], json_content: bool = False) -> dict[str, str]:
         headers = {"Authorization": f"Bearer {provider['api_key']}"}
         if json_content:
             headers["Content-Type"] = "application/json"
@@ -209,7 +427,7 @@ class ImageService:
             data = response.json()
         except Exception as exc:
             raise ProviderRequestError(
-                "中转站返回的不是合法 JSON",
+                "API 节点返回的不是合法 JSON",
                 status_code=502,
                 details={
                     "api_id": provider["id"],
@@ -220,7 +438,7 @@ class ImageService:
             ) from exc
         if not isinstance(data, dict):
             raise ProviderRequestError(
-                "中转站 JSON 响应必须是对象",
+                "API 节点 JSON 响应必须是对象",
                 status_code=502,
                 details={"api_id": provider["id"], "api_name": provider["name"], "response": data},
             )
@@ -230,7 +448,12 @@ class ImageService:
         status_code = int(getattr(response, "status_code", 200) or 200)
         if 200 <= status_code < 300:
             return
-        message = data.get("error") or data.get("message") or getattr(response, "text", "") or "请求失败"
+        error = data.get("error")
+        if isinstance(error, dict):
+            message = error.get("message") or error.get("type")
+        else:
+            message = error
+        message = message or data.get("message") or getattr(response, "text", "") or "请求失败"
         raise ProviderRequestError(
             f"API 节点请求失败: HTTP {status_code}",
             status_code=502,
@@ -252,6 +475,8 @@ class ImageService:
             "details": details,
         }
 
+    # --------------------------------------------------------------- normalize
+
     @staticmethod
     def _normalize_prompt(prompt: str) -> str:
         value = str(prompt or "").strip()
@@ -271,10 +496,23 @@ class ImageService:
 
     @staticmethod
     def _normalize_size(size: str) -> str:
-        value = str(size or "").strip()
+        value = str(size or "").strip().lower()
+        if value == "auto":
+            return "auto"
         parts = value.split("x")
         if len(parts) != 2 or not all(part.isdigit() and int(part) > 0 for part in parts):
-            raise GenerationValidationError("size 必须形如 1024x1024", status_code=400)
+            raise GenerationValidationError("size 必须形如 1024x1024 或 auto", status_code=400)
+        return value
+
+    @staticmethod
+    def _normalize_quality(quality: str | None) -> str | None:
+        if quality is None:
+            return None
+        value = str(quality).strip().lower()
+        if not value:
+            return None
+        if value not in _VALID_QUALITY:
+            raise GenerationValidationError("quality 只支持 auto/low/medium/high", status_code=400)
         return value
 
     @staticmethod
@@ -283,3 +521,25 @@ class ImageService:
         if not text.startswith("data:image/") or ";base64," not in text:
             raise GenerationValidationError(f"{field_name} 必须是 data:image/*;base64 格式", status_code=400)
         return text
+
+    @staticmethod
+    def _decode_data_url(value: str, field_name: str) -> tuple[bytes, str]:
+        text = str(value or "").strip()
+        if not text.startswith("data:image/") or ";base64," not in text:
+            raise GenerationValidationError(f"{field_name} 必须是 data:image/*;base64 格式", status_code=400)
+        header, encoded = text.split(";base64,", 1)
+        mime = header[len("data:") :] or "image/png"
+        try:
+            raw = base64.b64decode(encoded)
+        except Exception as exc:
+            raise GenerationValidationError(f"{field_name} base64 解码失败", status_code=400) from exc
+        return raw, mime
+
+    @staticmethod
+    def _ext_for_mime(mime: str) -> str:
+        return {
+            "image/png": "png",
+            "image/jpeg": "jpg",
+            "image/jpg": "jpg",
+            "image/webp": "webp",
+        }.get(mime.lower(), "png")

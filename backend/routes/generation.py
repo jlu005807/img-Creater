@@ -19,8 +19,9 @@ def generate_image():
             prompt=payload.get("prompt", ""),
             size=payload.get("size", "1024x1024"),
             n=payload.get("n", 1),
+            quality=payload.get("quality"),
         )
-        # 中转站提交成功只代表异步任务已入队，图片未生成完成，因此返回 202 Accepted。
+        # 任务进入后台 worker（OpenAI 兼容调用或异步中转轮询），尚未生成完成，返回 202 Accepted。
         return _success(result, status=202)
     except Exception as exc:
         return _image_error(exc)
@@ -38,8 +39,9 @@ def edit_image():
             n=payload.get("n", 1),
             edit_mode=payload.get("edit_mode", "mask"),
             selection=payload.get("selection"),
+            quality=payload.get("quality"),
         )
-        # 编辑任务与文生图一样走异步队列，前端继续用 /status 轮询同一个 task_id。
+        # 编辑任务与文生图一样走后台 worker，前端继续用 /status 轮询同一个 task_id。
         return _success(result, status=202)
     except Exception as exc:
         return _image_error(exc)

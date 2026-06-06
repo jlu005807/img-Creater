@@ -11,18 +11,13 @@ class FakeImageService:
         self.submit_calls = []
         self.status_calls = []
 
-    def submit_generation(self, prompt, size="1024x1024", n=1):
-        self.submit_calls.append({"prompt": prompt, "size": size, "n": n})
-        return {
-            "task_id": "task-123",
-            "api_id": "api-1",
-            "api_name": "Primary",
-            "status": "queued",
-            "poll_url": "/async/images/task-123",
-            "attempts": [{"api_id": "api-1", "api_name": "Primary", "ok": True}],
-        }
+    def submit_generation(self, prompt, size="1024x1024", n=1, quality=None):
+        self.submit_calls.append({"prompt": prompt, "size": size, "n": n, "quality": quality})
+        return {"task_id": "task-123", "status": "queued", "operation": "generate"}
 
-    def submit_edit_generation(self, prompt, image, mask, size="1024x1024", n=1, edit_mode="mask", selection=None):
+    def submit_edit_generation(
+        self, prompt, image, mask, size="1024x1024", n=1, edit_mode="mask", selection=None, quality=None
+    ):
         self.submit_calls.append(
             {
                 "prompt": prompt,
@@ -32,28 +27,23 @@ class FakeImageService:
                 "n": n,
                 "edit_mode": edit_mode,
                 "selection": selection,
+                "quality": quality,
             }
         )
-        return {
-            "task_id": "edit-task-123",
-            "api_id": "api-1",
-            "api_name": "Primary",
-            "status": "queued",
-            "operation": "edit",
-            "attempts": [{"api_id": "api-1", "api_name": "Primary", "ok": True}],
-        }
+        return {"task_id": "edit-task-123", "status": "queued", "operation": "edit"}
 
-    def poll_generation_status(self, api_id, task_id):
+    def poll_generation_status(self, api_id="", task_id=""):
         self.status_calls.append({"api_id": api_id, "task_id": task_id})
         return {
-            "api_id": api_id,
+            "api_id": api_id or "api-1",
             "api_name": "Primary",
             "task_id": task_id,
+            "operation": "generate",
             "status": "completed",
             "urls": ["https://cdn.example.com/image.png"],
+            "attempts": [{"api_id": "api-1", "api_name": "Primary", "ok": True}],
             "expires_at": 1780309714,
             "error": None,
-            "raw": {"status": "completed"},
         }
 
 
@@ -125,7 +115,7 @@ class BackendRouteTests(TestCase):
         self.assertEqual(generate_response.get_json()["data"]["task_id"], "task-123")
         self.assertEqual(
             self.image_service.submit_calls,
-            [{"prompt": "a red house", "size": "1024x1024", "n": 1}],
+            [{"prompt": "a red house", "size": "1024x1024", "n": 1, "quality": None}],
         )
 
         status_response = self.client.get("/api/status", query_string={"api_id": "api-1", "task_id": "task-123"})
@@ -159,6 +149,7 @@ class BackendRouteTests(TestCase):
                 "n": 1,
                 "edit_mode": "mask",
                 "selection": {"type": "rect", "bbox": {"x": 8, "y": 9, "width": 100, "height": 120}},
+                "quality": None,
             },
         )
 

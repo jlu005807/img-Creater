@@ -10,6 +10,22 @@ from typing import Any
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "data" / "configs.json"
 DEFAULT_MODEL = "gpt-image-2"
+DEFAULT_API_TYPE = "openai"
+
+# Upstream protocol per node. "openai" is the standard OpenAI-compatible
+# Images API (/v1/images/generations, /v1/images/edits); "async" is a custom
+# relay that exposes /async/images submit + poll.
+_API_TYPE_ALIASES = {
+    "openai": "openai",
+    "openai-compatible": "openai",
+    "openai_compatible": "openai",
+    "compatible": "openai",
+    "images": "openai",
+    "sync": "openai",
+    "async": "async",
+    "relay": "async",
+    "async_images": "async",
+}
 
 
 class ConfigServiceError(Exception):
@@ -148,6 +164,7 @@ class ConfigService:
         api_key = str(merged.get("api_key", "")).strip()
         model = str(merged.get("model") or DEFAULT_MODEL).strip()
         status = self._normalize_status(merged.get("status", True))
+        api_type = self._normalize_api_type(merged.get("api_type", DEFAULT_API_TYPE))
 
         if not name:
             raise ConfigValidationError("配置名称不能为空")
@@ -164,8 +181,17 @@ class ConfigService:
             "base_url": base_url,
             "api_key": api_key,
             "model": model,
+            "api_type": api_type,
             "status": status,
         }
+
+    @staticmethod
+    def _normalize_api_type(value: Any) -> str:
+        text = str(value or DEFAULT_API_TYPE).strip().lower()
+        resolved = _API_TYPE_ALIASES.get(text)
+        if resolved is None:
+            raise ConfigValidationError("api_type 只支持 openai 或 async")
+        return resolved
 
     @staticmethod
     def _normalize_status(value: Any) -> bool:
