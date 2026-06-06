@@ -20,7 +20,7 @@
 
 body {
   margin: 0;
-  min-width: 320px;
+  min-width: 1280px;
   color: var(--studio-ink);
   background:
     linear-gradient(90deg, rgba(23, 33, 38, 0.035) 1px, transparent 1px),
@@ -49,8 +49,8 @@ textarea {
 
 .gallery-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-  gap: 16px;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 18px;
 }
 
 .el-button {
@@ -63,4 +63,3 @@ textarea {
 .el-input-number {
   border-radius: 7px;
 }
-

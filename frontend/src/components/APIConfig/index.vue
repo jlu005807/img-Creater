@@ -127,7 +127,7 @@ onMounted(loadConfigs)
 <template>
   <section class="space-y-4">
     <div class="studio-panel rounded-lg p-5">
-      <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+      <div class="flex items-start justify-between gap-3">
         <div>
           <p class="text-xs font-semibold uppercase tracking-[0.16em] text-[var(--studio-teal)]">Provider Routing</p>
           <h2 class="mt-1 text-2xl font-black">API 节点管理</h2>
@@ -137,7 +137,7 @@ onMounted(loadConfigs)
       </div>
     </div>
 
-    <div class="grid gap-4 xl:grid-cols-[430px_minmax(0,1fr)]">
+    <div class="grid grid-cols-[430px_minmax(0,1fr)] gap-4">
       <form class="studio-panel rounded-lg p-5" @submit.prevent="submitForm">
         <div class="mb-4 flex items-center justify-between">
           <h3 class="text-lg font-black">{{ formTitle }}</h3>
@@ -173,7 +173,7 @@ onMounted(loadConfigs)
       </form>
 
       <div class="studio-panel min-h-[420px] rounded-lg p-5">
-        <div class="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <div class="mb-4 flex items-center justify-between gap-2">
           <div>
             <h3 class="text-lg font-black">调用优先级</h3>
             <p class="text-sm text-[var(--studio-muted)]">{{ enabledCount }} 个启用节点</p>
@@ -192,7 +192,7 @@ onMounted(loadConfigs)
             v-for="(item, index) in configs"
             :key="item.id"
             draggable="true"
-            class="grid gap-3 rounded-md border border-[var(--studio-line)] bg-white p-3 transition hover:border-[var(--studio-teal)] sm:grid-cols-[36px_minmax(0,1fr)_auto]"
+            class="grid grid-cols-[36px_minmax(0,1fr)_auto] gap-3 rounded-md border border-[var(--studio-line)] bg-white p-3 transition hover:border-[var(--studio-teal)]"
             @dragstart="onDragStart(index)"
             @dragover.prevent
             @drop="onDrop(index)"
@@ -222,4 +222,3 @@ onMounted(loadConfigs)
     </div>
   </section>
 </template>
-

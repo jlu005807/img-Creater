@@ -13,15 +13,15 @@ const navItems = [
 </script>
 
 <template>
-  <div class="min-h-screen p-4 lg:p-6">
-    <div class="mx-auto flex min-h-[calc(100vh-32px)] max-w-[1500px] flex-col gap-4 lg:min-h-[calc(100vh-48px)] lg:flex-row">
-      <aside class="studio-panel flex shrink-0 items-center justify-between rounded-lg px-4 py-3 lg:w-64 lg:flex-col lg:items-stretch lg:p-5">
+  <div class="min-h-screen p-6">
+    <div class="mx-auto grid min-h-[calc(100vh-48px)] max-w-[1680px] grid-cols-[260px_minmax(0,1fr)] gap-5">
+      <aside class="studio-panel flex shrink-0 flex-col items-stretch rounded-lg p-5">
         <div>
           <p class="text-xs font-semibold uppercase tracking-[0.16em] text-[var(--studio-coral)]">Local Studio</p>
           <h1 class="mt-1 text-xl font-black leading-tight text-[var(--studio-ink)] lg:text-2xl">GPT Img2 Creater</h1>
         </div>
 
-        <nav class="flex gap-2 lg:mt-8 lg:flex-col">
+        <nav class="mt-8 flex flex-col gap-2">
           <button
             v-for="item in navItems"
             :key="item.key"
@@ -39,7 +39,7 @@ const navItems = [
           </button>
         </nav>
 
-        <div class="hidden rounded-md border border-[var(--studio-line)] bg-white/70 p-3 text-xs leading-5 text-[var(--studio-muted)] lg:block">
+        <div class="mt-auto rounded-md border border-[var(--studio-line)] bg-white/70 p-3 text-xs leading-5 text-[var(--studio-muted)]">
           当前后端默认代理 <span class="font-semibold text-[var(--studio-ink)]">/api</span>，Vite 开发环境会转发到 Flask。
         </div>
       </aside>
@@ -51,4 +51,3 @@ const navItems = [
     </div>
   </div>
 </template>
-

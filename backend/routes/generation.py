@@ -26,6 +26,25 @@ def generate_image():
         return _image_error(exc)
 
 
+@generation_bp.post("/edit")
+def edit_image():
+    try:
+        payload = _json_payload()
+        result = _image_service().submit_edit_generation(
+            prompt=payload.get("prompt", ""),
+            image=payload.get("image", ""),
+            mask=payload.get("mask", ""),
+            size=payload.get("size", "1024x1024"),
+            n=payload.get("n", 1),
+            edit_mode=payload.get("edit_mode", "mask"),
+            selection=payload.get("selection"),
+        )
+        # 编辑任务与文生图一样走异步队列，前端继续用 /status 轮询同一个 task_id。
+        return _success(result, status=202)
+    except Exception as exc:
+        return _image_error(exc)
+
+
 @generation_bp.get("/status")
 def get_generation_status():
     try:

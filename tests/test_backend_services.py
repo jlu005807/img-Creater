@@ -145,6 +145,57 @@ class BackendServiceTests(TestCase):
             self.assertEqual(result["attempts"][0]["api_id"], primary["id"])
             self.assertFalse(result["attempts"][0]["ok"])
 
+    def test_submit_edit_generation_sends_image_and_mask_payload(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "configs.json"
+            config_service = ConfigService(config_path=config_path)
+            provider = config_service.create_config(
+                {
+                    "name": "Primary",
+                    "base_url": "https://primary.example.com/",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "status": True,
+                }
+            )
+            http_client = FakeHttpClient(
+                post_responses=[
+                    FakeResponse(
+                        status_code=200,
+                        payload={"task_id": "edit-task-123", "status": "queued", "poll_url": "/poll/edit-task-123"},
+                    ),
+                ]
+            )
+            service = ImageService(config_service=config_service, http_client=http_client)
+
+            result = service.submit_edit_generation(
+                prompt="replace the selected area with a glass control panel",
+                image="data:image/png;base64,aW1hZ2U=",
+                mask="data:image/png;base64,bWFzaw==",
+                size="1024x1024",
+                n=1,
+                edit_mode="mask",
+                selection={"type": "brush", "bbox": {"x": 10, "y": 20, "width": 120, "height": 160}},
+            )
+
+            self.assertEqual(result["task_id"], "edit-task-123")
+            self.assertEqual(result["api_id"], provider["id"])
+            self.assertEqual(result["operation"], "edit")
+            self.assertEqual(http_client.posts[0][0], "https://primary.example.com/async/images")
+            self.assertEqual(
+                http_client.posts[0][1]["json"],
+                {
+                    "model": "gpt-image-2",
+                    "prompt": "replace the selected area with a glass control panel",
+                    "size": "1024x1024",
+                    "n": 1,
+                    "image": "data:image/png;base64,aW1hZ2U=",
+                    "mask": "data:image/png;base64,bWFzaw==",
+                    "edit_mode": "mask",
+                    "selection": {"type": "brush", "bbox": {"x": 10, "y": 20, "width": 120, "height": 160}},
+                },
+            )
+
     def test_poll_generation_status_uses_api_id_to_query_original_provider(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = Path(tmp_dir) / "configs.json"

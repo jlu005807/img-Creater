@@ -47,6 +47,49 @@ class ImageService:
         prompt = self._normalize_prompt(prompt)
         n = self._normalize_image_count(n)
         size = self._normalize_size(size)
+        payload = {
+            "model": DEFAULT_MODEL,
+            "prompt": prompt,
+            "size": size,
+            "n": n,
+        }
+        return self._submit_with_fallback(payload=payload, operation="generate")
+
+    def submit_edit_generation(
+        self,
+        prompt: str,
+        image: str,
+        mask: str,
+        size: str = "1024x1024",
+        n: int = 1,
+        edit_mode: str = "mask",
+        selection: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        prompt = self._normalize_prompt(prompt)
+        n = self._normalize_image_count(n)
+        size = self._normalize_size(size)
+        image = self._normalize_image_data_url(image, "image")
+        mask = self._normalize_image_data_url(mask, "mask")
+        edit_mode = str(edit_mode or "mask").strip() or "mask"
+        if edit_mode not in {"mask", "selection"}:
+            raise GenerationValidationError("edit_mode 只支持 mask 或 selection", status_code=400)
+        if selection is not None and not isinstance(selection, dict):
+            raise GenerationValidationError("selection 必须是对象", status_code=400)
+
+        payload = {
+            "model": DEFAULT_MODEL,
+            "prompt": prompt,
+            "size": size,
+            "n": n,
+            "image": image,
+            "mask": mask,
+            "edit_mode": edit_mode,
+        }
+        if selection is not None:
+            payload["selection"] = selection
+        return self._submit_with_fallback(payload=payload, operation="edit")
+
+    def _submit_with_fallback(self, payload: dict[str, Any], operation: str) -> dict[str, Any]:
         providers = self.config_service.get_enabled_configs()
         attempts: list[dict[str, Any]] = []
 
@@ -59,7 +102,7 @@ class ImageService:
         # 3. 任一节点出现认证失败、超时、5xx、返回结构缺失 task_id 等问题，都记录失败并切到下一个启用节点。
         for provider in providers:
             try:
-                result = self._submit_with_provider(provider, prompt=prompt, size=size, n=n)
+                result = self._submit_with_provider(provider, payload=payload, operation=operation)
             except Exception as exc:
                 attempts.append(self._failed_attempt(provider, exc))
                 continue
@@ -123,18 +166,14 @@ class ImageService:
             "raw": data,
         }
 
-    def _submit_with_provider(self, provider: dict[str, Any], prompt: str, size: str, n: int) -> dict[str, Any]:
+    def _submit_with_provider(self, provider: dict[str, Any], payload: dict[str, Any], operation: str) -> dict[str, Any]:
         url = f"{provider['base_url'].rstrip('/')}/async/images"
-        payload = {
-            "model": provider.get("model") or DEFAULT_MODEL,
-            "prompt": prompt,
-            "size": size,
-            "n": n,
-        }
+        request_payload = dict(payload)
+        request_payload["model"] = provider.get("model") or payload.get("model") or DEFAULT_MODEL
         response = self.http_client.post(
             url,
             headers=self._headers(provider, json_content=True),
-            json=payload,
+            json=request_payload,
             timeout=self.request_timeout,
         )
         data = self._parse_response_json(response, provider)
@@ -154,7 +193,8 @@ class ImageService:
             "api_name": provider["name"],
             "status": data.get("status", "queued"),
             "poll_url": data.get("poll_url"),
-            "model": payload["model"],
+            "model": request_payload["model"],
+            "operation": operation,
             "raw": data,
         }
 
@@ -237,3 +277,9 @@ class ImageService:
             raise GenerationValidationError("size 必须形如 1024x1024", status_code=400)
         return value
 
+    @staticmethod
+    def _normalize_image_data_url(value: str, field_name: str) -> str:
+        text = str(value or "").strip()
+        if not text.startswith("data:image/") or ";base64," not in text:
+            raise GenerationValidationError(f"{field_name} 必须是 data:image/*;base64 格式", status_code=400)
+        return text

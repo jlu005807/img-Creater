@@ -4,6 +4,10 @@ export function generateImages(payload) {
   return apiClient.post('/generate', payload)
 }
 
+export function editImage(payload) {
+  return apiClient.post('/edit', payload)
+}
+
 export function getGenerationStatus({ apiId, taskId }) {
   return apiClient.get('/status', {
     params: {
@@ -12,4 +16,3 @@ export function getGenerationStatus({ apiId, taskId }) {
     },
   })
 }
-

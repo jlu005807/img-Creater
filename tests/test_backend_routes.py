@@ -22,6 +22,27 @@ class FakeImageService:
             "attempts": [{"api_id": "api-1", "api_name": "Primary", "ok": True}],
         }
 
+    def submit_edit_generation(self, prompt, image, mask, size="1024x1024", n=1, edit_mode="mask", selection=None):
+        self.submit_calls.append(
+            {
+                "prompt": prompt,
+                "image": image,
+                "mask": mask,
+                "size": size,
+                "n": n,
+                "edit_mode": edit_mode,
+                "selection": selection,
+            }
+        )
+        return {
+            "task_id": "edit-task-123",
+            "api_id": "api-1",
+            "api_name": "Primary",
+            "status": "queued",
+            "operation": "edit",
+            "attempts": [{"api_id": "api-1", "api_name": "Primary", "ok": True}],
+        }
+
     def poll_generation_status(self, api_id, task_id):
         self.status_calls.append({"api_id": api_id, "task_id": task_id})
         return {
@@ -111,6 +132,35 @@ class BackendRouteTests(TestCase):
         self.assertEqual(status_response.status_code, 200)
         self.assertEqual(status_response.get_json()["data"]["status"], "completed")
         self.assertEqual(self.image_service.status_calls, [{"api_id": "api-1", "task_id": "task-123"}])
+
+    def test_edit_route_submits_masked_edit_task(self):
+        edit_response = self.client.post(
+            "/api/edit",
+            json={
+                "prompt": "replace selected area",
+                "image": "data:image/png;base64,aW1hZ2U=",
+                "mask": "data:image/png;base64,bWFzaw==",
+                "size": "1024x1024",
+                "n": 1,
+                "edit_mode": "mask",
+                "selection": {"type": "rect", "bbox": {"x": 8, "y": 9, "width": 100, "height": 120}},
+            },
+        )
+
+        self.assertEqual(edit_response.status_code, 202)
+        self.assertEqual(edit_response.get_json()["data"]["task_id"], "edit-task-123")
+        self.assertEqual(
+            self.image_service.submit_calls[-1],
+            {
+                "prompt": "replace selected area",
+                "image": "data:image/png;base64,aW1hZ2U=",
+                "mask": "data:image/png;base64,bWFzaw==",
+                "size": "1024x1024",
+                "n": 1,
+                "edit_mode": "mask",
+                "selection": {"type": "rect", "bbox": {"x": 8, "y": 9, "width": 100, "height": 120}},
+            },
+        )
 
 
 if __name__ == "__main__":
