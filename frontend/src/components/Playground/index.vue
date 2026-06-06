@@ -26,9 +26,21 @@ const task = ref(null)
 const images = ref([])
 const errorMessage = ref('')
 const attempts = ref([])
+const expiresAt = ref(null)
 
 let elapsedTimer = null
 let pollTimer = null
+
+const expiresLabel = computed(() => {
+  const raw = Number(expiresAt.value)
+  if (!Number.isFinite(raw) || raw <= 0) return ''
+  const ms = raw < 1e12 ? raw * 1000 : raw
+  try {
+    return new Date(ms).toLocaleString()
+  } catch {
+    return ''
+  }
+})
 
 const statusLabel = computed(() => {
   const labels = {
@@ -66,6 +78,7 @@ function resetRun() {
   task.value = null
   errorMessage.value = ''
   attempts.value = []
+  expiresAt.value = null
 }
 
 async function submitTask() {
@@ -139,8 +152,8 @@ async function pollStatusOnce() {
   }
 
   try {
-    // 轮询递归核心逻辑：无论文生图还是局部编辑，提交成功后都只拿 task_id。
-    // 前端固定每 4 秒查询 Flask /status；后端按提交时返回的 api_id 回到同一 API 节点查询。
+    // 提交后只拿 task_id；后端在 worker 线程里完成"调用上游/容灾切换/轮询"的整个生命周期，
+    // 结果存入内存任务表。前端固定每 4 秒查询 Flask /status，读取最新状态、命中的节点与尝试记录。
     // queued/processing 继续排队；completed/failed/timeout 立即停止，避免重复请求。
     const result = await getGenerationStatus({
       apiId: task.value.apiId,
@@ -148,8 +161,20 @@ async function pollStatusOnce() {
     })
     status.value = result.status
 
+    // 节点与尝试记录在 worker 完成后才确定，这里随状态一起回填到任务监视器。
+    if (result.api_name || result.api_id) {
+      task.value = { ...task.value, apiId: result.api_id, apiName: result.api_name }
+    }
+    if (result.operation) {
+      task.value = { ...task.value, operation: result.operation }
+    }
+    if (Array.isArray(result.attempts) && result.attempts.length) {
+      attempts.value = result.attempts
+    }
+
     if (result.status === 'completed') {
       images.value = result.urls || []
+      expiresAt.value = result.expires_at ?? null
       loading.value = false
       clearTimers()
       if (!images.value.length) {
@@ -159,7 +184,7 @@ async function pollStatusOnce() {
     }
 
     if (result.status === 'failed') {
-      stopWithError(result.error || '中转站返回任务失败')
+      stopWithError(result.error || '任务失败')
       return
     }
 
@@ -321,7 +346,10 @@ onBeforeUnmount(clearTimers)
             <p class="text-xs font-semibold uppercase tracking-[0.16em] text-[var(--studio-amber)]">Gallery Output</p>
             <h2 class="mt-1 text-2xl font-black">生成结果</h2>
           </div>
-          <p class="text-sm text-[var(--studio-muted)]">{{ images.length }} 张图片</p>
+          <div class="text-right text-sm text-[var(--studio-muted)]">
+            <p>{{ images.length }} 张图片</p>
+            <p v-if="expiresLabel" class="mt-0.5 text-xs text-[var(--studio-amber)]">链接将于 {{ expiresLabel }} 过期</p>
+          </div>
         </div>
 
         <div v-if="showSkeleton" class="gallery-grid">

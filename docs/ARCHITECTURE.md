@@ -8,11 +8,11 @@
 Vue 3 Desktop UI
   -> Axios /api
   -> Flask Routes
-  -> Service Layer
-  -> Third-party async image API
+  -> Service Layer (worker thread + in-process TaskStore)
+  -> Upstream image API (OpenAI 兼容 /v1/images，或自定义 /async/images)
 ```
 
-系统目标不是自己生成图片，而是作为一个本地工作台去管理配置、提交异步任务、轮询状态和展示结果。
+系统目标不是自己生成图片，而是作为一个本地工作台去管理配置、把任务交给后台 worker 调用上游、轮询状态和展示结果。
 
 ## 2. 运行角色划分
 
@@ -27,17 +27,17 @@ Vue 3 Desktop UI
 
 ### 后端负责
 
-- 管理本地 API 节点配置
+- 管理本地 API 节点配置（含每节点的 `api_type`）
 - 校验请求参数
-- 按节点优先级执行 Fallback 提交
-- 将异步任务状态查询代理到原始接单节点
+- 在 worker 线程内按节点优先级执行容灾，并适配不同上游协议（OpenAI 兼容 / 异步中转）
+- 把任务生命周期与结果保存在进程内 `TaskStore`，供 `/status` 查询
 - 对前端统一返回结构化错误
 
 ### 上游服务负责
 
 - 真正执行图片生成或编辑
-- 返回 `task_id`
-- 提供任务状态和结果 URL
+- OpenAI 兼容：同步返回 `data[].b64_json` / `url`
+- 异步中转：返回 `task_id` 并提供状态查询
 
 ## 3. 后端结构
 
@@ -50,6 +50,7 @@ backend/
   services/
     config_service.py
     image_service.py
+    task_store.py
   data/
     configs.json
 ```
@@ -113,17 +114,26 @@ backend/
 
 职责：
 
-- 校验生成请求参数
-- 校验局部编辑请求参数
-- 调用上游异步图片接口
-- 处理提交阶段的 Fallback
-- 轮询指定节点上的任务状态
+- 校验生成 / 局部编辑请求参数
+- 在 worker 线程内按节点优先级容灾执行
+- 按节点 `api_type` 适配上游协议：
+  - `openai`：`/v1/images/generations`（JSON）、`/v1/images/edits`（multipart），把 `b64_json`/`url` 规整为可展示链接；编辑时用 Pillow 对齐并反转遮罩
+  - `async`：提交 `/async/images` 后在 worker 内轮询直至完成
+- 把状态/结果写入 `TaskStore`
 
 关键方法：
 
-- `submit_generation(...)`
-- `submit_edit_generation(...)`
-- `poll_generation_status(...)`
+- `submit_generation(...)` / `submit_edit_generation(...)`：建任务、起 worker，立即返回 `task_id`
+- `_execute_task(...)`：worker 主体，遍历节点 + 容灾
+- `poll_generation_status(task_id)`：从 `TaskStore` 读取状态
+
+### `services/task_store.py`
+
+职责：
+
+- 进程内、线程安全的任务表（`create` / `update` / `get`）
+- 记录 `status` / `urls` / `attempts` / `api_id` / `api_name` / `error` / `expires_at`
+- 按 TTL 自动回收，进程重启不保留
 
 ## 4. 前端结构
 
@@ -210,13 +220,13 @@ frontend/src/
 ```text
 User fills prompt and options
   -> Playground calls POST /api/generate
-  -> generation.py
-  -> ImageService.submit_generation()
-  -> Try enabled providers in order
-  -> Upstream returns task_id
-  -> Frontend stores api_id + task_id
-  -> Frontend polls GET /api/status every 4s
-  -> Upstream returns completed + urls
+  -> generation.py -> ImageService.submit_generation()
+  -> TaskStore.create() + start worker thread, return task_id (202)
+  -> Worker: try enabled providers in order
+       openai -> POST {base}/v1/images/generations -> b64_json/url
+       async  -> POST {base}/async/images then poll until completed
+  -> Worker writes status/urls/attempts into TaskStore
+  -> Frontend polls GET /api/status?task_id every 4s
   -> Gallery renders images
 ```
 
@@ -224,33 +234,31 @@ User fills prompt and options
 
 ```text
 User uploads image
-  -> RegionEditor draws mask
-  -> RegionEditor exports image + mask + selection
+  -> RegionEditor draws mask + exports image + mask + selection(box)
   -> Playground calls POST /api/edit
-  -> generation.py
-  -> ImageService.submit_edit_generation()
-  -> Try enabled providers in order
-  -> Upstream returns task_id
-  -> Frontend polls GET /api/status every 4s
+  -> generation.py -> ImageService.submit_edit_generation()
+  -> TaskStore.create() + start worker, return task_id (202)
+  -> Worker per provider:
+       openai -> Pillow rebuilds mask (crop to box, resize, invert alpha)
+               -> POST {base}/v1/images/edits (multipart image+mask)
+       async  -> POST {base}/async/images (JSON, with image/mask) then poll
+  -> Frontend polls GET /api/status?task_id every 4s
   -> Completed result displayed in gallery
 ```
 
-## 7. Fallback 机制
+## 7. 容灾（Fallback）机制
 
-Fallback 只发生在“提交任务”这一步。
+容灾发生在 worker 线程内，对两种协议统一生效。
 
 具体规则：
 
-1. 读取全部启用节点
-2. 按配置数组顺序依次尝试提交到 `{base_url}/async/images`
-3. 某个节点成功返回 `task_id` 后立即停止继续尝试
-4. 把每次尝试结果写入 `attempts`
-5. 前端后续轮询必须使用成功接单节点的 `api_id`
+1. worker 读取全部启用节点，按配置数组顺序依次尝试
+2. 每个节点执行完整生命周期（openai 同步调用；async 提交后轮询）
+3. 某个节点成功产出图片即停止，写入 `completed` + `urls`
+4. 每次尝试结果写入任务的 `attempts`
+5. 全部失败则任务置为 `failed`，并带上 `error`
 
-这样做的原因是：
-
-- 任务一旦进入某个上游系统，就必须回到原系统查询状态
-- 轮询阶段不能再做节点切换，否则无法保证任务一致性
+因为状态保存在后端 `TaskStore` 中，前端只用 `task_id` 查询，无需在轮询阶段绑定具体节点。
 
 ## 8. 局部编辑的遮罩模型
 
@@ -258,14 +266,12 @@ Fallback 只发生在“提交任务”这一步。
 
 - 背景透明
 - 用户涂抹或框选时写入白色不透明区域
-- 提交前导出为 PNG `data URL`
+- 提交前导出为 PNG `data URL`，并附带图片在画布中的 letterbox 矩形 `selection.box`
 
-后端只验证格式，不对遮罩内容做图像级处理。
+后端处理因协议而异：
 
-这意味着：
-
-- 具体如何理解 `mask`，由上游图片服务决定
-- 本项目只保证把原图、遮罩和附带元数据稳定发送出去
+- `openai`：用 Pillow 把画布尺寸的遮罩按 `selection.box` 裁回原图区域、缩放到原图尺寸，并**反转 alpha**（OpenAI 约定：透明处即编辑区）后作为 `mask` 文件上传
+- `async`：只校验格式，原样把 `image`/`mask`/`selection` 透传给上游
 
 ## 9. 错误处理策略
 
@@ -278,9 +284,8 @@ Fallback 只发生在“提交任务”这一步。
 ### 图片任务错误
 
 - 请求参数错误：返回 `400`
-- 轮询时找不到节点：返回 `404`
-- 上游全部失败：返回 `502`
-- 上游返回异常结构：返回 `502`
+- 轮询时任务不存在或已过期：返回 `404`
+- 上游全部失败 / 返回异常结构：记录在任务的 `attempts` 与 `error`，轮询得到 `failed`
 
 前端会把后端返回的 `error.message` 直接展示给用户，并停止当前轮询。
 

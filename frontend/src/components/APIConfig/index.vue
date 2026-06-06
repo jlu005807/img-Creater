@@ -15,13 +15,27 @@ const emptyForm = {
   base_url: '',
   api_key: '',
   model: 'gpt-image-2',
+  api_type: 'openai',
   status: true,
 }
 
 const form = reactive({ ...emptyForm })
 
-const formTitle = computed(() => (editingId.value ? '编辑中转节点' : '新增中转节点'))
+const apiTypeOptions = [
+  { value: 'openai', label: 'OpenAI 兼容', hint: '标准 /v1/images 接口（推荐，gpt-image-2 默认）' },
+  { value: 'async', label: '异步中转', hint: '自定义 /async/images 提交 + 轮询协议' },
+]
+
+const formTitle = computed(() => (editingId.value ? '编辑 API 节点' : '新增 API 节点'))
 const enabledCount = computed(() => configs.value.filter((item) => item.status).length)
+const apiTypeLabel = (value) => (value === 'async' ? '异步中转' : 'OpenAI 兼容')
+const endpointHint = computed(() => {
+  const base = (form.base_url || '').trim().replace(/\/+$/, '')
+  if (!base) return ''
+  if (form.api_type === 'async') return `${base}/async/images`
+  const root = base.endsWith('/v1') ? base : `${base}/v1`
+  return `${root}/images/generations`
+})
 
 function resetForm() {
   Object.assign(form, emptyForm)
@@ -67,6 +81,7 @@ function editConfig(item) {
     base_url: item.base_url,
     api_key: item.api_key,
     model: item.model || 'gpt-image-2',
+    api_type: item.api_type || 'openai',
     status: Boolean(item.status),
   })
 }
@@ -161,6 +176,16 @@ onMounted(loadConfigs)
             <span class="mb-1 block text-sm font-semibold">模型</span>
             <el-input v-model="form.model" placeholder="gpt-image-2" />
           </label>
+          <label class="block">
+            <span class="mb-1 block text-sm font-semibold">接入协议</span>
+            <el-select v-model="form.api_type" class="w-full">
+              <el-option v-for="opt in apiTypeOptions" :key="opt.value" :label="opt.label" :value="opt.value">
+                <span class="font-semibold">{{ opt.label }}</span>
+                <span class="ml-2 text-xs text-[var(--studio-muted)]">{{ opt.hint }}</span>
+              </el-option>
+            </el-select>
+            <p v-if="endpointHint" class="mt-1 break-all text-xs text-[var(--studio-muted)]">实际请求：{{ endpointHint }}</p>
+          </label>
           <div class="flex items-center justify-between rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface-soft)] px-3 py-2">
             <span class="text-sm font-semibold">启用节点</span>
             <el-switch v-model="form.status" />
@@ -208,7 +233,7 @@ onMounted(loadConfigs)
                 <span class="text-xs font-semibold text-[var(--studio-amber)]">#{{ index + 1 }}</span>
               </div>
               <p class="mt-1 truncate text-sm text-[var(--studio-muted)]">{{ item.base_url }}</p>
-              <p class="mt-1 text-xs text-[var(--studio-muted)]">{{ item.model }}</p>
+              <p class="mt-1 text-xs text-[var(--studio-muted)]">{{ item.model }} · {{ apiTypeLabel(item.api_type) }}</p>
             </div>
 
             <div class="flex items-center gap-2">

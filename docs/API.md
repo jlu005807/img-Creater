@@ -64,9 +64,10 @@ Content-Type: application/json
 ```json
 {
   "name": "Primary",
-  "base_url": "https://example.com",
+  "base_url": "https://api.openai.com",
   "api_key": "sk-xxx",
   "model": "gpt-image-2",
+  "api_type": "openai",
   "status": true
 }
 ```
@@ -77,6 +78,7 @@ Content-Type: application/json
 - `base_url`: 上游服务根地址，必须以 `http://` 或 `https://` 开头
 - `api_key`: 节点访问密钥
 - `model`: 默认模型名
+- `api_type`: 接入协议，`openai`（OpenAI 兼容，默认）或 `async`（自定义异步中转）
 - `status`: 是否启用
 
 成功时返回 `201 Created`。
@@ -160,33 +162,26 @@ Content-Type: application/json
 - `size`: 必填，格式必须为 `宽x高`，例如 `1024x1024`
 - `n`: 必填，正整数
 
+可选字段：
+
+- `quality`: `auto` / `low` / `medium` / `high`（OpenAI 兼容节点透传）
+
 ### 响应
 
-成功时返回 `202 Accepted`：
+提交后任务进入后台 worker，立即返回 `202 Accepted`，只带本地 `task_id`：
 
 ```json
 {
   "success": true,
   "data": {
-    "task_id": "task-123",
-    "api_id": "config-id",
-    "api_name": "Primary",
+    "task_id": "5f3c…",
     "status": "queued",
-    "poll_url": "/async/images/task-123",
-    "model": "gpt-image-2",
-    "operation": "generate",
-    "attempts": [
-      {
-        "api_id": "config-id",
-        "api_name": "Primary",
-        "ok": true
-      }
-    ]
+    "operation": "generate"
   }
 }
 ```
 
-`attempts` 用来记录本次提交经过了哪些节点，以及每个节点是否成功接单。
+命中的节点（`api_id`/`api_name`）与每个节点是否成功的 `attempts` 记录会在任务执行完成后，通过 `GET /api/status` 返回。
 
 ## 4. 局部编辑
 
@@ -247,21 +242,18 @@ Content-Type: application/json
 
 ### 后端行为
 
-局部编辑不会走单独的新协议，后端仍然向上游发送：
-
-```text
-POST {base_url}/async/images
-```
-
-只是会在 JSON 体中增加 `image`、`mask`、`edit_mode`、`selection` 这些字段。
+- `openai` 节点：以 `multipart/form-data` 调用 `POST {base_url}/v1/images/edits`，把原图与遮罩作为 `image`、`mask` 文件上传。遮罩由后端用 Pillow 依据 `selection.box` 裁剪回原图区域、缩放到原图尺寸，并反转透明区域（OpenAI 约定：透明处即编辑区）。
+- `async` 节点：以 JSON 调用 `POST {base_url}/async/images`，在请求体中附带 `image`、`mask`、`edit_mode`、`selection`。
 
 ## 5. 查询任务状态
 
 ### 请求
 
 ```http
-GET /api/status?api_id={api_id}&task_id={task_id}
+GET /api/status?task_id={task_id}
 ```
+
+任务状态保存在后端进程内的任务表中，因此只需 `task_id` 即可查询（`api_id` 参数可选，仅作兼容保留）。
 
 ### 响应
 
@@ -271,21 +263,20 @@ GET /api/status?api_id={api_id}&task_id={task_id}
   "data": {
     "api_id": "config-id",
     "api_name": "Primary",
-    "task_id": "task-123",
+    "task_id": "5f3c…",
+    "operation": "generate",
     "status": "completed",
-    "urls": ["https://cdn.example.com/image.png"],
-    "expires_at": 1780309714,
-    "error": null,
-    "raw": {
-      "status": "completed",
-      "urls": ["https://cdn.example.com/image.png"],
-      "expires_at": 1780309714
-    }
+    "urls": ["data:image/png;base64,...", "https://cdn.example.com/image.png"],
+    "attempts": [
+      { "api_id": "config-id", "api_name": "Primary", "ok": true }
+    ],
+    "expires_at": null,
+    "error": null
   }
 }
 ```
 
-`status` 常见取值：
+`status` 取值：
 
 - `queued`
 - `processing`
@@ -294,9 +285,10 @@ GET /api/status?api_id={api_id}&task_id={task_id}
 
 说明：
 
-- 轮询时必须带上原始提交时返回的 `api_id`
-- 一旦某个节点成功接单，后续状态查询必须回到同一个节点
-- `urls` 只在任务完成时有意义
+- `api_id`/`api_name` 表示 worker 最终命中（或正在尝试）的节点，可能为 `null`（任务刚入队时）。
+- `attempts` 记录每个被尝试节点是否成功，便于排查容灾路径。
+- `urls` 只在 `completed` 时有意义；OpenAI 兼容节点通常是 `data:` URL，异步中转节点通常是远程 URL。
+- 任务不存在或已过期返回 `404`。
 
 ## 6. 常见错误
 
@@ -315,27 +307,27 @@ GET /api/status?api_id={api_id}&task_id={task_id}
 常见原因：
 
 - 查询或修改了不存在的配置项
-- 轮询时提供了无效的 `api_id`
+- 轮询时提供了不存在或已过期的 `task_id`
 
 ### 502 Bad Gateway
 
-常见原因：
+常见原因（记录在任务的 `attempts` 与 `error` 中）：
 
-- 所有启用节点都提交失败
+- 所有启用节点均失败
 - 上游接口超时
 - 上游返回了非 JSON 响应
-- 上游返回了 4xx/5xx，或响应中缺少 `task_id`
+- 上游返回了 4xx/5xx，或响应缺少图片数据（OpenAI 的 `data[].b64_json`/`url`，或异步中转的 `task_id`）
 
 ## 7. 上游图片服务契约
 
-当前项目约定上游服务至少提供两类接口：
+### 7.1 OpenAI 兼容（`api_type = openai`，默认）
 
 ```text
-POST {base_url}/async/images
-GET  {base_url}/async/images/{task_id}
+POST {base_url}/v1/images/generations   # JSON
+POST {base_url}/v1/images/edits         # multipart/form-data
 ```
 
-示例提交体：
+文生图示例提交体（JSON）：
 
 ```json
 {
@@ -346,13 +338,24 @@ GET  {base_url}/async/images/{task_id}
 }
 ```
 
-局部编辑时会在此基础上增加：
+局部编辑使用 `multipart/form-data`，字段：`model`、`prompt`、`size`、`n`、`image`（文件）、`mask`（文件，PNG，透明处即编辑区）。
+
+响应（两类接口一致）：
 
 ```json
 {
-  "image": "data:image/png;base64,...",
-  "mask": "data:image/png;base64,...",
-  "edit_mode": "mask",
-  "selection": {}
+  "created": 1780309714,
+  "data": [{ "b64_json": "..." }]
 }
 ```
+
+后端会把 `b64_json` 转成 `data:image/...;base64,...`，或直接透传 `url`。
+
+### 7.2 自定义异步中转（`api_type = async`）
+
+```text
+POST {base_url}/async/images
+GET  {base_url}/async/images/{task_id}
+```
+
+提交体为 JSON，局部编辑时在 `model/prompt/size/n` 基础上增加 `image`、`mask`、`edit_mode`、`selection`；后端在 worker 内提交后轮询 `GET` 直至 `completed`/`failed`。

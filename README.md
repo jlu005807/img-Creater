@@ -6,19 +6,21 @@
 
 ## 当前能力
 
-- 文生图：提交 `prompt`、尺寸和生成张数，走异步任务队列。
+- 文生图：提交 `prompt`、尺寸和生成张数，由后台任务完成生成。
 - 局部编辑：上传原图后，可用矩形框选或画笔涂抹生成 `mask`，再把原图和遮罩提交给 AI 修改。
+- 多接入协议：每个节点可选 **OpenAI 兼容**（标准 `/v1/images` 接口，gpt-image-2 默认）或 **异步中转**（自定义 `/async/images`）。
 - 多 API 节点：支持新增、编辑、删除、启用/禁用和拖拽排序。
-- Fallback 提交：提交任务时会按节点优先级依次尝试，直到某个节点成功返回 `task_id`。
+- Fallback 容灾：后台 worker 按节点优先级依次尝试，直到某个节点成功产出图片。
 - 状态轮询：前端每 4 秒轮询一次任务状态，最长轮询 5 分钟。
 - 结果画廊：生成完成后直接展示图片结果，并支持下载。
 - PC-only：当前不做移动端适配，页面最小宽度为 `1280px`。
 
 ## 技术栈
 
-- 后端：Python 3、Flask、flask-cors、requests
+- 后端：Python 3、Flask、flask-cors、requests、Pillow
 - 前端：Vue 3、Vite、Element Plus、Tailwind CSS、Axios
 - 本地存储：`backend/data/configs.json`
+- 主题：浅色 / 深色双主题（首启跟随系统，可手动切换并记忆）
 
 ## 目录结构
 
@@ -63,22 +65,25 @@ tests/
 
 ### 1. 安装后端依赖
 
-如果项目还没有虚拟环境，可以先创建：
+如果项目还没有虚拟环境，可以先创建并且激活(linux也类似，但是激活命令不一样)
 
 ```powershell
 python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+# linux
+.venv/bin/activate 
 ```
 
 安装依赖：
 
 ```powershell
-.venv\Scripts\python.exe -m pip install -r backend\requirements.txt
+python -m pip install -r backend\requirements.txt
 ```
 
 ### 2. 启动后端
 
 ```powershell
-.venv\Scripts\python.exe -m backend.app
+python -m backend.app
 ```
 
 默认地址：
@@ -90,13 +95,13 @@ python -m venv .venv
 
 ```powershell
 cd frontend
-npm.cmd install
+npm install
 ```
 
 ### 4. 启动前端
 
 ```powershell
-npm.cmd run dev
+npm run dev
 ```
 
 默认地址：
@@ -141,16 +146,18 @@ npm.cmd run dev
 6. 提交任务
 7. 前端会自动轮询 `/api/status`，直到返回结果
 
-## 异步任务模型
+## 任务模型
 
-无论文生图还是局部编辑，后端都只负责：
+GPT-Image-2 通过兼容 OpenAI 协议的接口访问，单次生成可能耗时数十秒甚至数分钟，超过浏览器请求超时。因此整个生命周期放在**后端 worker 线程**中执行，结果写入进程内的任务表（`task_store`）：
 
-1. 读取本地启用的 API 节点列表
-2. 按优先级向上游提交异步图片任务
-3. 返回 `task_id`、`api_id` 和尝试记录
-4. 使用同一个 `api_id` 轮询任务状态
+1. 前端 `POST /api/generate` 或 `/api/edit`，后端立即创建本地任务并返回 `task_id`（HTTP 202）。
+2. worker 读取启用节点，按优先级依次调用上游：
+   - `openai` 节点：同步调用 `/v1/images/generations` 或 `/v1/images/edits`，把返回的 `b64_json`/`url` 规整为可直接展示的链接。
+   - `async` 节点：提交 `/async/images` 后由后端在 worker 内轮询直到完成。
+   - 任一节点失败即切换到下一个启用节点（容灾在 worker 内统一完成）。
+3. 前端每 4 秒 `GET /api/status?task_id=...` 读取最新状态、命中的节点与尝试记录，直到 `completed`/`failed`。
 
-任务真正完成发生在第三方图片服务端，前端不会阻塞等待单个 HTTP 请求直到生成结束。
+任务表仅存在于内存中，进程重启后不保留；并设有 TTL 自动回收，适合本地单用户场景。
 
 ## 配置说明
 
@@ -167,6 +174,7 @@ backend/data/configs.json
 - `base_url`
 - `api_key`
 - `model`
+- `api_type`：`openai`（OpenAI 兼容，默认）或 `async`（自定义异步中转）
 - `status`
 - `created_at`
 - `updated_at`
@@ -175,19 +183,23 @@ backend/data/configs.json
 
 ## 上游接口约定
 
-当前后端假设第三方中转站实现如下接口：
+默认按**兼容 OpenAI 协议**的接口访问（`api_type = openai`）：
+
+```text
+POST {base_url}/v1/images/generations   # 文生图，JSON
+POST {base_url}/v1/images/edits         # 局部编辑，multipart（image + mask 文件）
+```
+
+- `base_url` 已以 `/v1` 结尾时不会重复拼接。
+- 响应中的 `b64_json` 会转成 `data:image/...;base64,...`，`url` 则原样透传。
+- 局部编辑的 `mask` 会由后端用 Pillow 按原图尺寸对齐，并反转透明区域以符合 OpenAI「透明处即编辑区」的约定。
+
+若节点设为 `api_type = async`，则改用自定义异步中转协议：
 
 ```text
 POST {base_url}/async/images
 GET  {base_url}/async/images/{task_id}
 ```
-
-局部编辑提交时会额外带上：
-
-- `image`
-- `mask`
-- `edit_mode`
-- `selection`
 
 详细字段见 [docs/API.md](docs/API.md)。
 

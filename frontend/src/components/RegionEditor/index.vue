@@ -234,6 +234,16 @@ function exportPayload() {
     selection: {
       type: tool.value,
       canvas: { width: CANVAS_WIDTH, height: CANVAS_HEIGHT },
+      // Letterbox rect of the image inside the canvas, so the backend can crop
+      // the canvas-sized mask back to the source image and align it pixel-wise.
+      box: imageBox
+        ? {
+            x: Math.round(imageBox.x),
+            y: Math.round(imageBox.y),
+            width: Math.round(imageBox.width),
+            height: Math.round(imageBox.height),
+          }
+        : null,
       bbox: getMaskBoundingBox(),
     },
   }
