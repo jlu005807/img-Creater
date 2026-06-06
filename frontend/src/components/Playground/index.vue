@@ -209,11 +209,11 @@ onBeforeUnmount(clearTimers)
           <el-button :icon="RefreshLeft" @click="reusePrompt">示例</el-button>
         </div>
 
-        <div class="mb-4 grid grid-cols-2 rounded-md border border-[var(--studio-line)] bg-white p-1">
+        <div class="mb-4 grid grid-cols-2 rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface)] p-1">
           <button
             type="button"
             class="h-10 rounded-[6px] text-sm font-bold transition"
-            :class="mode === 'generate' ? 'bg-[var(--studio-ink)] text-white' : 'text-[var(--studio-muted)] hover:bg-[var(--studio-paper)]'"
+            :class="mode === 'generate' ? 'bg-[var(--studio-solid)] text-[var(--studio-on-solid)]' : 'text-[var(--studio-muted)] hover:bg-[var(--studio-paper)]'"
             @click="mode = 'generate'"
           >
             文生图
@@ -221,7 +221,7 @@ onBeforeUnmount(clearTimers)
           <button
             type="button"
             class="h-10 rounded-[6px] text-sm font-bold transition"
-            :class="mode === 'edit' ? 'bg-[var(--studio-ink)] text-white' : 'text-[var(--studio-muted)] hover:bg-[var(--studio-paper)]'"
+            :class="mode === 'edit' ? 'bg-[var(--studio-solid)] text-[var(--studio-on-solid)]' : 'text-[var(--studio-muted)] hover:bg-[var(--studio-paper)]'"
             @click="mode = 'edit'"
           >
             局部编辑
@@ -256,11 +256,11 @@ onBeforeUnmount(clearTimers)
         </div>
 
         <div v-if="mode === 'edit'" class="mt-4 grid grid-cols-2 gap-3 text-sm">
-          <div class="rounded-md border border-[var(--studio-line)] bg-white/70 p-3">
+          <div class="rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface-soft)] p-3">
             <p class="text-xs text-[var(--studio-muted)]">原图</p>
             <p class="mt-1 font-black">{{ maskState.hasImage ? '已上传' : '未上传' }}</p>
           </div>
-          <div class="rounded-md border border-[var(--studio-line)] bg-white/70 p-3">
+          <div class="rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface-soft)] p-3">
             <p class="text-xs text-[var(--studio-muted)]">蒙版</p>
             <p class="mt-1 font-black">{{ maskState.hasMask ? '已选择' : '未选择' }}</p>
           </div>
@@ -287,19 +287,19 @@ onBeforeUnmount(clearTimers)
         </div>
 
         <div class="mt-4 grid grid-cols-4 gap-3 text-sm">
-          <div class="rounded-md border border-[var(--studio-line)] bg-white/70 p-3">
+          <div class="rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface-soft)] p-3">
             <p class="text-xs text-[var(--studio-muted)]">耗时</p>
             <p class="mt-1 text-xl font-black">{{ elapsedSeconds }}s</p>
           </div>
-          <div class="rounded-md border border-[var(--studio-line)] bg-white/70 p-3">
+          <div class="rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface-soft)] p-3">
             <p class="text-xs text-[var(--studio-muted)]">任务</p>
             <p class="mt-1 truncate text-sm font-bold">{{ task?.taskId || '-' }}</p>
           </div>
-          <div class="rounded-md border border-[var(--studio-line)] bg-white/70 p-3">
+          <div class="rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface-soft)] p-3">
             <p class="text-xs text-[var(--studio-muted)]">节点</p>
             <p class="mt-1 truncate text-sm font-bold">{{ task?.apiName || '-' }}</p>
           </div>
-          <div class="rounded-md border border-[var(--studio-line)] bg-white/70 p-3">
+          <div class="rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface-soft)] p-3">
             <p class="text-xs text-[var(--studio-muted)]">模式</p>
             <p class="mt-1 text-sm font-bold">{{ operationLabel }}</p>
           </div>
@@ -308,7 +308,7 @@ onBeforeUnmount(clearTimers)
         <el-alert v-if="errorMessage" class="mt-4" type="error" :closable="false" :title="errorMessage" />
 
         <div v-if="attempts.length" class="mt-4 flex flex-wrap gap-2">
-          <div v-for="attempt in attempts" :key="`${attempt.api_id}-${attempt.ok}`" class="flex items-center gap-2 rounded-md border border-[var(--studio-line)] bg-white px-3 py-2 text-sm">
+          <div v-for="attempt in attempts" :key="`${attempt.api_id}-${attempt.ok}`" class="flex items-center gap-2 rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface)] px-3 py-2 text-sm">
             <span>{{ attempt.api_name }}</span>
             <el-tag size="small" :type="attempt.ok ? 'success' : 'danger'">{{ attempt.ok ? '成功' : '失败' }}</el-tag>
           </div>
@@ -336,18 +336,18 @@ onBeforeUnmount(clearTimers)
         </div>
 
         <div v-else-if="images.length" class="gallery-grid">
-          <figure v-for="(url, index) in images" :key="url" class="group relative overflow-hidden rounded-md border border-[var(--studio-line)] bg-white">
+          <figure v-for="(url, index) in images" :key="url" class="group relative overflow-hidden rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface)]">
             <img :src="url" :alt="`生成图片 ${index + 1}`" class="aspect-square h-full w-full object-cover" loading="lazy" />
             <figcaption class="absolute inset-x-0 bottom-0 flex translate-y-full items-center justify-between bg-[rgba(23,33,38,0.86)] px-3 py-2 text-sm text-white transition group-hover:translate-y-0">
               <span>Image {{ index + 1 }}</span>
-              <a :href="url" download target="_blank" rel="noreferrer" class="inline-flex h-8 w-8 items-center justify-center rounded-md bg-white text-[var(--studio-ink)]" title="下载图片">
+              <a :href="url" download target="_blank" rel="noreferrer" class="inline-flex h-8 w-8 items-center justify-center rounded-md bg-white text-[#172126]" title="下载图片">
                 <el-icon><Download /></el-icon>
               </a>
             </figcaption>
           </figure>
         </div>
 
-        <div v-else class="flex h-full min-h-[520px] items-center justify-center rounded-md border border-dashed border-[var(--studio-line)] bg-white/55 px-6 text-center">
+        <div v-else class="flex h-full min-h-[520px] items-center justify-center rounded-md border border-dashed border-[var(--studio-line)] bg-[var(--studio-surface-soft)] px-6 text-center">
           <div>
             <el-icon class="text-4xl text-[var(--studio-teal)]"><Picture /></el-icon>
             <p class="mt-3 text-lg font-black">等待结果</p>

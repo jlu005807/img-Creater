@@ -161,7 +161,7 @@ onMounted(loadConfigs)
             <span class="mb-1 block text-sm font-semibold">模型</span>
             <el-input v-model="form.model" placeholder="gpt-image-2" />
           </label>
-          <div class="flex items-center justify-between rounded-md border border-[var(--studio-line)] bg-white/70 px-3 py-2">
+          <div class="flex items-center justify-between rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface-soft)] px-3 py-2">
             <span class="text-sm font-semibold">启用节点</span>
             <el-switch v-model="form.status" />
           </div>
@@ -192,7 +192,7 @@ onMounted(loadConfigs)
             v-for="(item, index) in configs"
             :key="item.id"
             draggable="true"
-            class="grid grid-cols-[36px_minmax(0,1fr)_auto] gap-3 rounded-md border border-[var(--studio-line)] bg-white p-3 transition hover:border-[var(--studio-teal)]"
+            class="grid grid-cols-[36px_minmax(0,1fr)_auto] gap-3 rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface)] p-3 transition hover:border-[var(--studio-teal)]"
             @dragstart="onDragStart(index)"
             @dragover.prevent
             @drop="onDrop(index)"

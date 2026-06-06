@@ -70,12 +70,15 @@ function drawScene() {
   canvas.width = CANVAS_WIDTH
   canvas.height = CANVAS_HEIGHT
   const ctx = canvas.getContext('2d')
+  const styles = getComputedStyle(canvas)
+  const canvasBg = styles.getPropertyValue('--studio-canvas').trim() || '#f6f2ea'
+  const mutedColor = styles.getPropertyValue('--studio-muted').trim() || '#6f777f'
   ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
-  ctx.fillStyle = '#f6f2ea'
+  ctx.fillStyle = canvasBg
   ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
 
   if (!imageElement) {
-    ctx.fillStyle = '#6f777f'
+    ctx.fillStyle = mutedColor
     ctx.font = '600 18px Aptos, sans-serif'
     ctx.textAlign = 'center'
     ctx.fillText('上传一张需要局部修改的图片', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2)
@@ -267,7 +270,7 @@ defineExpose({ exportPayload, clearMask })
 
     <canvas
       ref="canvasRef"
-      class="h-[520px] w-full rounded-md border border-[var(--studio-line)] bg-[#f6f2ea]"
+      class="h-[520px] w-full rounded-md border border-[var(--studio-line)] bg-[var(--studio-canvas)]"
       @pointerdown.prevent="pointerDown"
       @pointermove.prevent="pointerMove"
       @pointerup.prevent="pointerUp"

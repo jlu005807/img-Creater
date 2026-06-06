@@ -2,16 +2,105 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ============================================================
+   Studio design tokens
+   Light theme is the default on :root; dark theme overrides the
+   same tokens under html.dark (Element Plus dark-mode convention).
+   Because every token flips in dark mode, the Element Plus palette
+   overrides below resolve correctly in both themes via color-mix.
+   ============================================================ */
 :root {
-  --studio-ink: #172126;
-  --studio-muted: #66717a;
-  --studio-paper: #f5f2ea;
-  --studio-panel: #fffdf7;
-  --studio-line: #ded8ca;
+  /* Surfaces & text */
+  --studio-ink: #172126; /* primary text */
+  --studio-muted: #66717a; /* secondary text */
+  --studio-paper: #f5f2ea; /* page background */
+  --studio-panel: #fffdf7; /* main panel surface */
+  --studio-surface: #ffffff; /* inset cards (was bg-white) */
+  --studio-surface-soft: rgba(255, 255, 255, 0.7); /* was bg-white/70 */
+  --studio-line: #ded8ca; /* hairline borders */
+  --studio-canvas: #f6f2ea; /* region editor canvas background */
+
+  /* Solid pill button (navigation / mode toggle) */
+  --studio-solid: #172126;
+  --studio-on-solid: #ffffff;
+
+  /* Accent palette */
   --studio-teal: #0f8f8c;
   --studio-coral: #d96b4d;
   --studio-amber: #b98a24;
   --studio-green: #317a59;
+
+  /* Chrome */
+  --studio-grid: rgba(23, 33, 38, 0.035);
+  --studio-panel-border: rgba(23, 33, 38, 0.12);
+  --studio-shadow: rgba(19, 29, 41, 0.1);
+  --studio-scrollbar: rgba(23, 33, 38, 0.28);
+
+  color-scheme: light;
+}
+
+html.dark {
+  --studio-ink: #e8e5db;
+  --studio-muted: #97a1a9;
+  --studio-paper: #0f1417;
+  --studio-panel: #181f23;
+  --studio-surface: #1e262b;
+  --studio-surface-soft: rgba(255, 255, 255, 0.045);
+  --studio-line: #2d373d;
+  --studio-canvas: #11161a;
+
+  --studio-solid: #e8e5db;
+  --studio-on-solid: #14181b;
+
+  --studio-teal: #2db3ac;
+  --studio-coral: #ec8460;
+  --studio-amber: #d8a83f;
+  --studio-green: #4fa37b;
+
+  --studio-grid: rgba(255, 255, 255, 0.04);
+  --studio-panel-border: rgba(255, 255, 255, 0.09);
+  --studio-shadow: rgba(0, 0, 0, 0.45);
+  --studio-scrollbar: rgba(255, 255, 255, 0.26);
+
+  color-scheme: dark;
+}
+
+/* ---- Element Plus palette mapped onto the studio tokens ----
+   color-mix references --studio-panel as the "mix toward" surface,
+   so light shades lighten in light mode and darken in dark mode. */
+:root,
+html.dark {
+  --el-color-primary: var(--studio-coral);
+  --el-color-primary-light-3: color-mix(in srgb, var(--studio-coral) 70%, var(--studio-panel));
+  --el-color-primary-light-5: color-mix(in srgb, var(--studio-coral) 50%, var(--studio-panel));
+  --el-color-primary-light-7: color-mix(in srgb, var(--studio-coral) 30%, var(--studio-panel));
+  --el-color-primary-light-8: color-mix(in srgb, var(--studio-coral) 20%, var(--studio-panel));
+  --el-color-primary-light-9: color-mix(in srgb, var(--studio-coral) 12%, var(--studio-panel));
+  --el-color-primary-dark-2: color-mix(in srgb, var(--studio-coral) 82%, black);
+
+  --el-color-success: var(--studio-green);
+  --el-color-warning: var(--studio-amber);
+
+  --el-border-radius-base: 7px;
+}
+
+/* Warm the core Element Plus surfaces in dark mode so popovers,
+   selects, inputs and dialogs match the studio dark palette
+   instead of Element's default cool grey. */
+html.dark {
+  --el-bg-color: var(--studio-panel);
+  --el-bg-color-page: var(--studio-paper);
+  --el-bg-color-overlay: var(--studio-surface);
+  --el-text-color-primary: var(--studio-ink);
+  --el-text-color-regular: var(--studio-ink);
+  --el-text-color-secondary: var(--studio-muted);
+  --el-text-color-placeholder: var(--studio-muted);
+  --el-border-color: var(--studio-line);
+  --el-border-color-light: var(--studio-line);
+  --el-border-color-lighter: var(--studio-line);
+  --el-fill-color-blank: var(--studio-surface);
+  --el-fill-color-light: var(--studio-surface-soft);
+  --el-mask-color: rgba(8, 12, 14, 0.8);
 }
 
 * {
@@ -23,11 +112,12 @@ body {
   min-width: 1280px;
   color: var(--studio-ink);
   background:
-    linear-gradient(90deg, rgba(23, 33, 38, 0.035) 1px, transparent 1px),
-    linear-gradient(180deg, rgba(23, 33, 38, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, var(--studio-grid) 1px, transparent 1px),
+    linear-gradient(180deg, var(--studio-grid) 1px, transparent 1px),
     var(--studio-paper);
   background-size: 28px 28px;
   font-family: Aptos, ui-sans-serif, system-ui, sans-serif;
+  transition: background-color 0.25s ease, color 0.25s ease;
 }
 
 button,
@@ -37,13 +127,13 @@ textarea {
 }
 
 .studio-panel {
-  border: 1px solid rgba(23, 33, 38, 0.12);
-  background: rgba(255, 253, 247, 0.94);
-  box-shadow: 0 18px 55px rgba(19, 29, 41, 0.1);
+  border: 1px solid var(--studio-panel-border);
+  background: var(--studio-panel);
+  box-shadow: 0 18px 55px var(--studio-shadow);
 }
 
 .thin-scrollbar {
-  scrollbar-color: rgba(23, 33, 38, 0.28) transparent;
+  scrollbar-color: var(--studio-scrollbar) transparent;
   scrollbar-width: thin;
 }
 
