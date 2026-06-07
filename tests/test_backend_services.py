@@ -187,6 +187,31 @@ class OpenAIProviderTests(TestCase):
 
             self.assertEqual(http_client.posts[0][0], "https://relay.example.com/v1/images/generations")
 
+    def test_generation_omits_size_when_auto(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service, _ = self._config_service(
+                tmp_dir,
+                [
+                    {
+                        "name": "Primary",
+                        "base_url": "https://api.openai.com",
+                        "api_key": "key-1",
+                        "model": "gpt-image-2",
+                        "status": True,
+                    }
+                ],
+            )
+            http_client = FakeHttpClient(
+                post_responses=[FakeResponse(200, {"data": [{"b64_json": "QUJD"}]})]
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="hi", size="auto", n=1)
+            service.poll_generation_status(task_id=submit["task_id"])
+
+            # size='auto' must be omitted so non-gpt-image upstreams don't 400.
+            self.assertNotIn("size", http_client.posts[0][1]["json"])
+
     def test_generation_falls_back_to_next_enabled_node(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_service, created = self._config_service(

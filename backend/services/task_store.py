@@ -40,6 +40,7 @@ class TaskStore:
                 "error": None,
                 "expires_at": None,
                 "created_at": time.time(),
+                "completed_at": None,
             }
         return task_id
 
@@ -48,6 +49,9 @@ class TaskStore:
             task = self._tasks.get(task_id)
             if task is not None:
                 task.update(fields)
+                # Stamp terminal time so TTL only reaps finished tasks.
+                if fields.get("status") in {"completed", "failed"} and not task.get("completed_at"):
+                    task["completed_at"] = time.time()
 
     def get(self, task_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -55,8 +59,14 @@ class TaskStore:
             return dict(task) if task is not None else None
 
     def _evict_expired_locked(self) -> None:
+        # Only evict tasks that have finished and whose TTL has elapsed; never
+        # reap a still-running task (queued/processing have no completed_at).
         cutoff = time.time() - self._ttl
-        stale = [tid for tid, task in self._tasks.items() if task.get("created_at", 0) < cutoff]
+        stale = [
+            tid
+            for tid, task in self._tasks.items()
+            if task.get("completed_at") is not None and task["completed_at"] < cutoff
+        ]
         for tid in stale:
             self._tasks.pop(tid, None)
 

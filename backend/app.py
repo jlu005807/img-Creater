@@ -6,11 +6,21 @@ from flask_cors import CORS
 
 def create_app() -> Flask:
     app = Flask(__name__)
-    CORS(app, resources={r"/api/*": {"origins": "*"}})
+    # Local single-user tool: only the Vite dev origin needs cross-origin access.
+    allowed = os.getenv("FRONTEND_ORIGIN", "http://127.0.0.1:5173,http://localhost:5173").split(",")
+    CORS(app, resources={r"/api/*": {"origins": [o.strip() for o in allowed if o.strip()]}})
 
     # Cap request bodies so oversized base64 image/mask uploads can't exhaust
     # memory; edits carry the original image + mask inline.
     app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
+
+    # One app-scoped ImageService so its requests.Session connection pool is
+    # reused across tasks (the detached worker threads outlive each request).
+    if "IMAGE_SERVICE" not in app.config:
+        from .services.config_service import ConfigService
+        from .services.image_service import ImageService
+
+        app.config["IMAGE_SERVICE"] = ImageService(config_service=ConfigService())
 
     @app.get("/api/health")
     def health_check():

@@ -152,11 +152,20 @@ class ImageService:
     ) -> None:
         self.store.update(task_id, status="processing")
         attempts: list[dict[str, Any]] = []
+        # One aggregate budget for the whole task so cumulative work across
+        # providers can't exceed the client's wait (frontend MAX_WAIT ~300s).
+        deadline = time.monotonic() + self.generation_timeout
         try:
             for provider in providers:
+                if time.monotonic() >= deadline:
+                    attempts.append(
+                        self._failed_attempt(provider, ProviderRequestError("任务总时长已超时", status_code=504))
+                    )
+                    self.store.update(task_id, attempts=list(attempts))
+                    break
                 self.store.update(task_id, api_id=provider["id"], api_name=provider["name"])
                 try:
-                    urls, expires_at = self._run_provider(provider, payload, operation)
+                    urls, expires_at = self._run_provider(provider, payload, operation, deadline)
                 except Exception as exc:  # noqa: BLE001 - record and fall back
                     attempts.append(self._failed_attempt(provider, exc))
                     self.store.update(task_id, attempts=list(attempts))
@@ -190,18 +199,26 @@ class ImageService:
             self.store.update(task_id, status="failed", attempts=list(attempts), error=str(exc))
 
     def _run_provider(
-        self, provider: dict[str, Any], payload: dict[str, Any], operation: str
+        self, provider: dict[str, Any], payload: dict[str, Any], operation: str, deadline: float | None = None
     ) -> tuple[list[str], Any]:
         if provider.get("api_type") == "async":
-            return self._run_async_provider(provider, payload, operation)
-        return self._run_openai_provider(provider, payload, operation)
+            return self._run_async_provider(provider, payload, operation, deadline)
+        return self._run_openai_provider(provider, payload, operation, deadline)
+
+    def _remaining(self, deadline: float | None) -> float:
+        """Seconds left in the task budget, capped at request_timeout; never
+        below 1s so a final attempt can still complete or fail cleanly."""
+        if deadline is None:
+            return self.generation_timeout
+        return max(1.0, min(self.generation_timeout, deadline - time.monotonic()))
 
     # --------------------------------------------------- OpenAI-compatible API
 
     def _run_openai_provider(
-        self, provider: dict[str, Any], payload: dict[str, Any], operation: str
+        self, provider: dict[str, Any], payload: dict[str, Any], operation: str, deadline: float | None = None
     ) -> tuple[list[str], Any]:
         model = provider.get("model") or DEFAULT_MODEL
+        timeout = self._remaining(deadline)
         if operation == "edit":
             url = self._openai_endpoint(provider["base_url"], "images/edits")
             image_bytes, image_mime = self._decode_data_url(payload["image"], "image")
@@ -223,23 +240,26 @@ class ImageService:
                 headers=self._auth_headers(provider),
                 files=files,
                 data=data,
-                timeout=self.generation_timeout,
+                timeout=timeout,
             )
         else:
             url = self._openai_endpoint(provider["base_url"], "images/generations")
             body = {
                 "model": model,
                 "prompt": payload["prompt"],
-                "size": payload["size"],
                 "n": payload["n"],
             }
+            # Most OpenAI-compatible endpoints reject size='auto'; omit it and
+            # let upstream pick its default in that case.
+            if payload["size"] != "auto":
+                body["size"] = payload["size"]
             if payload.get("quality"):
                 body["quality"] = payload["quality"]
             response = self.http_client.post(
                 url,
                 headers=self._auth_headers(provider, json_content=True),
                 json=body,
-                timeout=self.generation_timeout,
+                timeout=timeout,
             )
 
         data = self._parse_response_json(response, provider)
@@ -254,14 +274,17 @@ class ImageService:
                 status_code=502,
                 details={"api_id": provider["id"], "api_name": provider["name"], "response": data},
             )
-        output_format = str(data.get("output_format") or "png").lower()
+        default_format = str(data.get("output_format") or "png").lower()
         urls: list[str] = []
         for item in items:
             if not isinstance(item, dict):
                 continue
             b64 = item.get("b64_json")
             if b64:
-                urls.append(f"data:image/{output_format};base64,{b64}")
+                # Prefer a per-item format if the provider gives one; else fall
+                # back to the response-level output_format.
+                fmt = str(item.get("output_format") or default_format).lower()
+                urls.append(f"data:image/{fmt};base64,{b64}")
                 continue
             url = item.get("url")
             if url:
@@ -329,15 +352,16 @@ class ImageService:
     # ------------------------------------------------------- async relay (opt)
 
     def _run_async_provider(
-        self, provider: dict[str, Any], payload: dict[str, Any], operation: str
+        self, provider: dict[str, Any], payload: dict[str, Any], operation: str, deadline: float | None = None
     ) -> tuple[list[str], Any]:
         base = provider["base_url"].rstrip("/")
         body: dict[str, Any] = {
             "model": provider.get("model") or DEFAULT_MODEL,
             "prompt": payload["prompt"],
-            "size": payload["size"],
             "n": payload["n"],
         }
+        if payload["size"] != "auto":
+            body["size"] = payload["size"]
         if payload.get("quality"):
             body["quality"] = payload["quality"]
         if operation == "edit":
@@ -347,11 +371,16 @@ class ImageService:
             if payload.get("selection") is not None:
                 body["selection"] = payload["selection"]
 
+        # Bound the whole submit+poll cycle by the task budget, not just a
+        # private async_max_wait, so it can't outlive the client's wait.
+        if deadline is None:
+            deadline = time.monotonic() + min(self.async_max_wait, self.generation_timeout)
+
         response = self.http_client.post(
             f"{base}/async/images",
             headers=self._auth_headers(provider, json_content=True),
             json=body,
-            timeout=self.request_timeout,
+            timeout=self._remaining(deadline),
         )
         data = self._parse_response_json(response, provider)
         self._ensure_success_status(response, data, provider)
@@ -364,12 +393,18 @@ class ImageService:
             )
 
         poll_url = f"{base}/async/images/{upstream_task_id}"
-        deadline = time.monotonic() + self.async_max_wait
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ProviderRequestError(
+                    "上游任务轮询超时",
+                    status_code=504,
+                    details={"api_id": provider["id"], "api_name": provider["name"]},
+                )
             status_response = self.http_client.get(
                 poll_url,
                 headers=self._auth_headers(provider),
-                timeout=self.request_timeout,
+                timeout=max(1.0, min(self.request_timeout, remaining)),
             )
             status_data = self._parse_response_json(status_response, provider)
             self._ensure_success_status(status_response, status_data, provider)
@@ -383,12 +418,9 @@ class ImageService:
                     status_code=502,
                     details={"api_id": provider["id"], "api_name": provider["name"]},
                 )
-            if time.monotonic() >= deadline:
-                raise ProviderRequestError(
-                    "上游任务轮询超时",
-                    status_code=504,
-                    details={"api_id": provider["id"], "api_name": provider["name"]},
-                )
+            # Don't sleep past the deadline.
+            if deadline - time.monotonic() <= self.async_poll_interval:
+                continue
             time.sleep(self.async_poll_interval)
 
     # ------------------------------------------------------------------ status
