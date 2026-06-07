@@ -335,6 +335,40 @@ class CustomProviderTests(TestCase):
             self.assertEqual(http_client.posts[0][0], "https://my-proxy.example.com/api/v2/img")
 
 
+class ReferenceImageTests(TestCase):
+    def test_openai_generation_with_references_uses_edits_multipart(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "Primary",
+                    "base_url": "https://api.openai.com",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "status": True,
+                }
+            )
+            http_client = FakeHttpClient(
+                post_responses=[FakeResponse(200, {"data": [{"b64_json": "QUJD"}]})]
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(
+                prompt="blend these",
+                size="1024x1024",
+                n=1,
+                reference_images=[_png_data_url((4, 4)), _png_data_url((4, 4))],
+            )
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "completed")
+            url, kwargs = http_client.posts[0]
+            self.assertEqual(url, "https://api.openai.com/v1/images/edits")
+            # Two reference images sent as image[] multipart files.
+            self.assertEqual(len(kwargs["files"]), 2)
+            self.assertTrue(all(f[0] == "image[]" for f in kwargs["files"]))
+
+
 class ChatProviderTests(TestCase):
     def test_chat_completions_posts_and_extracts_images(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

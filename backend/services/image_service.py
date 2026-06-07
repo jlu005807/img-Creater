@@ -80,7 +80,12 @@ class ImageService:
     # ------------------------------------------------------------------ submit
 
     def submit_generation(
-        self, prompt: str, size: str = "1024x1024", n: int = 1, quality: str | None = None
+        self,
+        prompt: str,
+        size: str = "1024x1024",
+        n: int = 1,
+        quality: str | None = None,
+        reference_images: list[str] | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "prompt": self._normalize_prompt(prompt),
@@ -90,6 +95,9 @@ class ImageService:
         quality = self._normalize_quality(quality)
         if quality:
             payload["quality"] = quality
+        refs = self._normalize_reference_images(reference_images)
+        if refs:
+            payload["reference_images"] = refs
         return self._start_task(payload=payload, operation="generate")
 
     def submit_edit_generation(
@@ -102,6 +110,7 @@ class ImageService:
         edit_mode: str = "mask",
         selection: dict[str, Any] | None = None,
         quality: str | None = None,
+        composite: str | None = None,
     ) -> dict[str, Any]:
         edit_mode = str(edit_mode or "mask").strip() or "mask"
         if edit_mode not in {"mask", "selection"}:
@@ -122,6 +131,11 @@ class ImageService:
             payload["quality"] = quality
         if selection is not None:
             payload["selection"] = selection
+        # Pre-composed original+overlay image (frontend auto-generates it); the
+        # async/custom relays forward it so an upstream that wants a single
+        # blended image can use it directly.
+        if composite:
+            payload["composite"] = self._normalize_image_data_url(composite, "composite")
         return self._start_task(payload=payload, operation="edit")
 
     def _start_task(self, payload: dict[str, Any], operation: str) -> dict[str, Any]:
@@ -237,6 +251,26 @@ class ImageService:
                 "size": payload["size"],
                 "n": str(payload["n"]),
             }
+            if payload.get("quality"):
+                data["quality"] = payload["quality"]
+            response = self.http_client.post(
+                url,
+                headers=self._auth_headers(provider),
+                files=files,
+                data=data,
+                timeout=timeout,
+            )
+        elif payload.get("reference_images"):
+            # gpt-image accepts reference images via the edits endpoint as
+            # multiple image[] files (no mask) — used for reference-guided gen.
+            url = self._openai_endpoint(provider["base_url"], "images/edits")
+            files = []
+            for i, ref in enumerate(payload["reference_images"]):
+                raw, mime = self._decode_data_url(ref, "参考图")
+                files.append(("image[]", (f"ref{i}.{self._ext_for_mime(mime)}", raw, mime)))
+            data = {"model": model, "prompt": payload["prompt"], "n": str(payload["n"])}
+            if payload["size"] != "auto":
+                data["size"] = payload["size"]
             if payload.get("quality"):
                 data["quality"] = payload["quality"]
             response = self.http_client.post(
@@ -368,10 +402,14 @@ class ImageService:
             body["size"] = payload["size"]
         if payload.get("quality"):
             body["quality"] = payload["quality"]
+        if payload.get("reference_images"):
+            body["reference_images"] = payload["reference_images"]
         if operation == "edit":
             body["image"] = payload["image"]
             body["mask"] = payload["mask"]
             body["edit_mode"] = payload.get("edit_mode", "mask")
+            if payload.get("composite"):
+                body["composite"] = payload["composite"]
             if payload.get("selection") is not None:
                 body["selection"] = payload["selection"]
 
@@ -531,12 +569,16 @@ class ImageService:
             body["size"] = payload["size"]
         if payload.get("quality"):
             body["quality"] = payload["quality"]
+        if payload.get("reference_images"):
+            body["reference_images"] = payload["reference_images"]
 
         # Local edits: send image + mask inline as data URLs (same as async relay).
         if operation == "edit":
             body["image"] = payload["image"]
             body["mask"] = payload["mask"]
             body["edit_mode"] = payload.get("edit_mode", "mask")
+            if payload.get("composite"):
+                body["composite"] = payload["composite"]
             if payload.get("selection") is not None:
                 body["selection"] = payload["selection"]
 
@@ -563,9 +605,17 @@ class ImageService:
         model = provider.get("model") or DEFAULT_MODEL
         timeout = self._remaining(deadline)
         url = self._openai_endpoint(provider["base_url"], "chat/completions")
+        refs = payload.get("reference_images") or []
+        if refs:
+            content = [{"type": "text", "text": payload["prompt"]}]
+            for ref in refs:
+                content.append({"type": "image_url", "image_url": {"url": ref}})
+            messages = [{"role": "user", "content": content}]
+        else:
+            messages = [{"role": "user", "content": payload["prompt"]}]
         body: dict[str, Any] = {
             "model": model,
-            "messages": [{"role": "user", "content": payload["prompt"]}],
+            "messages": messages,
         }
         response = self.http_client.post(
             url,
@@ -671,6 +721,25 @@ class ImageService:
         if not text.startswith("data:image/") or ";base64," not in text:
             raise GenerationValidationError(f"{field_name} 必须是 data:image/*;base64 格式", status_code=400)
         return text
+
+    @staticmethod
+    def _normalize_reference_images(value: Any) -> list[str]:
+        """Validate the optional reference-image list (data URLs). The per-user
+        upload cap is enforced on the frontend; here we just keep a sane upper
+        bound (8) so a crafted request can't attach an unbounded number."""
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise GenerationValidationError("reference_images 必须是数组", status_code=400)
+        refs: list[str] = []
+        for item in value[:8]:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            if not text.startswith("data:image/") or ";base64," not in text:
+                raise GenerationValidationError("参考图必须是 data:image/*;base64 格式", status_code=400)
+            refs.append(text)
+        return refs
 
     @staticmethod
     def _decode_data_url(value: str, field_name: str) -> tuple[bytes, str]:

@@ -11,12 +11,23 @@ class FakeImageService:
         self.submit_calls = []
         self.status_calls = []
 
-    def submit_generation(self, prompt, size="1024x1024", n=1, quality=None):
-        self.submit_calls.append({"prompt": prompt, "size": size, "n": n, "quality": quality})
+    def submit_generation(self, prompt, size="1024x1024", n=1, quality=None, reference_images=None):
+        self.submit_calls.append(
+            {"prompt": prompt, "size": size, "n": n, "quality": quality, "reference_images": reference_images}
+        )
         return {"task_id": "task-123", "status": "queued", "operation": "generate"}
 
     def submit_edit_generation(
-        self, prompt, image, mask, size="1024x1024", n=1, edit_mode="mask", selection=None, quality=None
+        self,
+        prompt,
+        image,
+        mask,
+        size="1024x1024",
+        n=1,
+        edit_mode="mask",
+        selection=None,
+        quality=None,
+        composite=None,
     ):
         self.submit_calls.append(
             {
@@ -28,6 +39,7 @@ class FakeImageService:
                 "edit_mode": edit_mode,
                 "selection": selection,
                 "quality": quality,
+                "composite": composite,
             }
         )
         return {"task_id": "edit-task-123", "status": "queued", "operation": "edit"}
@@ -132,7 +144,7 @@ class BackendRouteTests(TestCase):
         self.assertEqual(generate_response.get_json()["data"]["task_id"], "task-123")
         self.assertEqual(
             self.image_service.submit_calls,
-            [{"prompt": "a red house", "size": "1024x1024", "n": 1, "quality": None}],
+            [{"prompt": "a red house", "size": "1024x1024", "n": 1, "quality": None, "reference_images": None}],
         )
 
         status_response = self.client.get("/api/status", query_string={"api_id": "api-1", "task_id": "task-123"})
@@ -167,6 +179,7 @@ class BackendRouteTests(TestCase):
                 "edit_mode": "mask",
                 "selection": {"type": "rect", "bbox": {"x": 8, "y": 9, "width": 100, "height": 120}},
                 "quality": None,
+                "composite": None,
             },
         )
 
