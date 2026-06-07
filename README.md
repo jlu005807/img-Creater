@@ -1,8 +1,8 @@
 # GPT Img2 Creater
 
-`GPT Img2 Creater` 是一个本地运行的桌面端图片工作台，用来管理多个异步图片生成 API 节点，并在文生图之外支持局部编辑流程。
+`GPT Img2 Creater` 是一个本地运行的桌面端图片工作台，用来管理多个图片生成 API 节点（兼容 OpenAI 协议的 gpt-image-2 等），并在文生图之外支持局部编辑流程。
 
-当前版本只实现 PC 端体验，界面参考工作台式布局：左侧是导航和配置，右侧是生成控制台、局部编辑画布、任务状态和结果画廊。
+当前版本只实现 PC 端体验，采用工作台式布局：顶栏放标题、主题切换与设置入口（齿轮 → 弹窗）；下方左侧是会话历史队列，中间是生成控制台与局部编辑画布，右侧是任务状态与结果画廊。
 
 ## 当前能力
 
@@ -25,36 +25,41 @@
 
 - 后端：Python 3、Flask、flask-cors、requests、Pillow
 - 前端：Vue 3、Vite、Element Plus、Tailwind CSS、Axios
-- 本地存储：`backend/data/configs.json`
-- 主题：浅色 / 深色双主题（首启跟随系统，可手动切换并记忆）
+- 后端配置存储：`backend/data/configs.json`（运行时生成，已忽略；模板见 `configs.example.json`）
+- 前端本地存储：历史记录、表单草稿、主题、偏好与提示词模板均存于浏览器 `localStorage`
 
 ## 目录结构
 
 ```text
-install.ps1 / install.sh   # 一键安装脚本
+install.ps1 / install.sh   # 一键安装脚本（Windows / Linux·macOS）
 run.ps1 / run.sh           # 一键运行脚本
+.gitattributes             # 锁定行尾（*.sh 用 LF）
 
 backend/
   app.py
-  data/configs.json
+  data/
+    configs.example.json   # 配置模板（configs.json 运行时生成且被忽略）
   routes/
     configs.py
     generation.py
   services/
     config_service.py
     image_service.py
-    task_store.py
+    task_store.py          # 进程内任务表
 
 frontend/
   src/
-    api/
+    api/                   # client / configs / generation
     components/
-      APIConfig/
-      Playground/
-      RegionEditor/
+      APIConfig/           # API 节点管理
+      Playground/          # 生成控制台 + 历史 + 结果画廊
+      RegionEditor/        # 局部编辑画布
+      Settings/            # 设置弹窗（API / 偏好 / 提示词模板）
     composables/
       useTheme.js
       useGenerationHistory.js
+      useSettings.js       # 最大字数 / 参考图上限
+      usePromptTemplates.js
     utils/
       download.js
     App.vue
@@ -154,48 +159,53 @@ npm run dev
 ### 5. 打开界面并配置第一个 API 节点
 
 1. 打开 `http://127.0.0.1:5173`
-2. 进入左侧 `设置`
+2. 点击右上角 **齿轮图标** 打开设置，进入 `API 设置` 标签
 3. 新增一个节点，至少填写：
    - `name`
    - `base_url`
    - `api_key`
    - `model`
+   - `接入协议`（默认 `OpenAI 兼容`；可选 Chat Completions / 自定义 URL / 异步中转）
 4. 保持节点为启用状态
-5. 如有多个节点，可在列表中拖拽调整优先级
+5. 如有多个节点，可在列表中拖拽调整优先级（后端按从上到下顺序容灾）
 
 ## 使用说明
 
 ### 文生图
 
-1. 进入左侧 `工作区`
-2. 保持模式为 `文生图`
-3. 输入 `Prompt`
-4. 选择图片尺寸和生成张数
-5. 点击提交按钮
+1. 保持模式为 `文生图`
+2. 输入 `Prompt`（可点「示例」/「随机」一键填入，或「放大」全屏编辑）
+3. 选择尺寸（比例预设或自定义宽高）
+4. 可选：上传最多 N 张参考图辅助生成（上限在设置中可调）
+5. 点击「生成图片」或按 `Ctrl/⌘ + Enter`
 6. 等待状态从 `queued/processing` 进入 `completed`
-7. 在右侧结果区查看和下载图片
+7. 在右侧结果区查看（按原始比例完整展示）、点击放大灯箱预览、下载
 
 ### 局部编辑
 
-1. 在 `工作区` 切换到 `局部编辑`
-2. 上传原图
-3. 选择编辑工具：
-   - `涂抹`：适合不规则区域
-   - `框选`：适合矩形区域
-4. 在画布上标出需要修改的区域
-5. 输入编辑提示词，描述只应修改被遮罩覆盖的部分
-6. 提交任务
-7. 前端会自动轮询 `/api/status`，直到返回结果
+1. 切换到 `局部编辑`
+2. 上传或拖拽原图
+3. 在原图上直接标记修改区域（半透明青色实时叠加）：
+   - `涂抹`：画笔标记不规则区域
+   - `框选`：矩形标记
+   - `擦除`：去掉多余标记；`Ctrl+Z` 撤销；可切换遮罩显隐、点「放大」精细编辑
+4. 输入编辑提示词，描述只应修改被标记覆盖的部分
+5. 提交任务（前端自动合成「原图 + 半透明遮罩」混合图与遮罩一并提交，无需手动制作蒙版）
+6. 前端会自动轮询 `/api/status`，直到返回结果
+
+> 历史记录在左侧队列实时显示状态（生成中 ⟳ / 已完成 ✓ / 失败 ✗），支持搜索、时间筛选、复用参数、查看结果，失败项可一键「重试并覆盖」。
 
 ## 任务模型
 
 GPT-Image-2 通过兼容 OpenAI 协议的接口访问，单次生成可能耗时数十秒甚至数分钟，超过浏览器请求超时。因此整个生命周期放在**后端 worker 线程**中执行，结果写入进程内的任务表（`task_store`）：
 
 1. 前端 `POST /api/generate` 或 `/api/edit`，后端立即创建本地任务并返回 `task_id`（HTTP 202）。
-2. worker 读取启用节点，按优先级依次调用上游：
-   - `openai` 节点：同步调用 `/v1/images/generations` 或 `/v1/images/edits`，把返回的 `b64_json`/`url` 规整为可直接展示的链接。
-   - `async` 节点：提交 `/async/images` 后由后端在 worker 内轮询直到完成。
-   - 任一节点失败即切换到下一个启用节点（容灾在 worker 内统一完成）。
+2. worker 读取启用节点，按优先级依次调用上游（按节点 `api_type` 适配协议）：
+   - `openai`：同步调用 `/v1/images/generations` 或 `/v1/images/edits`，把返回的 `b64_json`/`url` 规整为可直接展示的链接。
+   - `chat`：调用 `/v1/chat/completions`，从响应中解析图片。
+   - `custom`：直接 POST 到填写的完整 URL，不拼接任何路径。
+   - `async`：提交 `/async/images` 后由后端在 worker 内轮询直到完成。
+   - 任一节点失败即切换到下一个启用节点（容灾在 worker 内统一完成，整体受任务总时长上限约束）。
 3. 前端每 4 秒 `GET /api/status?task_id=...` 读取最新状态、命中的节点与尝试记录，直到 `completed`/`failed`。
 
 任务表仅存在于内存中，进程重启后不保留；并设有 TTL 自动回收，适合本地单用户场景。
@@ -215,12 +225,14 @@ backend/data/configs.json
 - `base_url`
 - `api_key`
 - `model`
-- `api_type`：`openai`（OpenAI 兼容，默认）或 `async`（自定义异步中转）
+- `api_type`：接入协议，`openai`（默认）/ `chat` / `custom` / `async`
 - `status`
 - `created_at`
 - `updated_at`
 
 列表顺序就是任务提交时的优先级顺序。
+
+> 安全：`backend/data/configs.json` 仅保存在本地，且已加入 `.gitignore`；所有返回节点的接口都会把 `api_key` 脱敏为 `••••后四位`，浏览器不会拿到完整密钥。
 
 ## 上游接口约定
 
@@ -235,14 +247,18 @@ POST {base_url}/v1/images/edits         # 局部编辑，multipart（image + mas
 - 响应中的 `b64_json` 会转成 `data:image/...;base64,...`，`url` 则原样透传。
 - 局部编辑的 `mask` 会由后端用 Pillow 按原图尺寸对齐，并反转透明区域以符合 OpenAI「透明处即编辑区」的约定。
 
-若节点设为 `api_type = async`，则改用自定义异步中转协议：
+其他协议：
+
+- `api_type = chat`：`POST {base_url}/v1/chat/completions`，从响应中解析图片。
+- `api_type = custom`：直接 `POST {base_url}`（填写完整地址，不拼接路径）。
+- `api_type = async`：自定义异步中转——
 
 ```text
 POST {base_url}/async/images
 GET  {base_url}/async/images/{task_id}
 ```
 
-详细字段见 [docs/API.md](docs/API.md)。
+文生图可附带 `reference_images`（参考图）；局部编辑会附带 `image` / `mask` / `composite`（自动合成的混合图）。详细字段见 [docs/API.md](docs/API.md)。
 
 ## 验证命令
 
@@ -267,16 +283,21 @@ npm.cmd run build
 - 确认前端运行在 `127.0.0.1:5173`
 - 确认本机没有其他进程占用这两个端口
 
-### 提交任务后立刻失败
+### 提交任务后失败
 
-- 检查 API 节点的 `base_url` 是否可访问
-- 检查 `api_key` 是否有效
-- 检查上游是否实现了 `/async/images` 协议
+- 检查 API 节点的 `base_url` 是否可访问、`api_key` 是否有效
+- 检查节点的 `接入协议` 是否与上游实际支持的协议一致（OpenAI 兼容 / Chat / 自定义 URL / 异步中转）
+- 任务监视器的「尝试记录」会列出每个节点的失败原因，便于排查容灾路径
 
 ### 局部编辑无法提交
 
-- 必须同时存在原图和遮罩
-- `image` 与 `mask` 都必须是 `data:image/*;base64,...` 格式
+- 必须先上传原图，并在图上涂抹或框选出至少一块修改区域
+- 无需手动制作蒙版——遮罩与混合图由前端自动生成
+
+### 跨域 / 端口
+
+- 后端默认仅允许 `http://127.0.0.1:5173`、`http://localhost:5173` 跨域；如改了前端地址，用 `FRONTEND_ORIGIN` 环境变量覆盖
+- 上传体积上限 25MB（局部编辑会内联原图、遮罩、混合图的 base64）
 
 ## 相关文档
 

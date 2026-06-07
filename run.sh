@@ -41,7 +41,8 @@ open_browser() {
 }
 
 printf '==> Starting backend (Flask) on http://127.0.0.1:5000\n'
-"$VENV_PYTHON" -m backend.app &
+# Run without the debug reloader for a clean one-shot launch.
+FLASK_DEBUG=0 "$VENV_PYTHON" -m backend.app &
 BACKEND_PID=$!
 
 printf '==> Starting frontend (Vite) on http://127.0.0.1:5173\n'

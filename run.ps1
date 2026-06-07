@@ -32,6 +32,8 @@ $cleanup = {
 }
 
 try {
+  # Run without the debug reloader for a clean one-shot launch.
+  $env:FLASK_DEBUG = '0'
   Write-Host "==> Starting backend (Flask) on http://127.0.0.1:5000" -ForegroundColor Cyan
   $backend = Start-Process -FilePath $venvPython -ArgumentList '-m', 'backend.app' `
     -WorkingDirectory $root -PassThru -NoNewWindow

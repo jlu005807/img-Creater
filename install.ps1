@@ -59,4 +59,14 @@ try {
 }
 Write-Ok 'Frontend dependencies installed'
 
-Write-Host "`nDone. Start everything with:  .\run.ps1" -ForegroundColor Green
+# --- Seed local config from the template if missing -----------------------
+$configPath = Join-Path $root 'backend\data\configs.json'
+$examplePath = Join-Path $root 'backend\data\configs.example.json'
+if (-not (Test-Path $configPath) -and (Test-Path $examplePath)) {
+  Copy-Item $examplePath $configPath
+  Write-Ok 'Created backend\data\configs.json from template'
+}
+
+Write-Host "`nDone." -ForegroundColor Green
+Write-Host "Start everything with:  .\run.ps1" -ForegroundColor Green
+Write-Host "Then open the gear icon (top-right) to add an API node." -ForegroundColor Green

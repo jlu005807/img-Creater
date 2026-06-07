@@ -44,4 +44,12 @@ step 'Installing frontend dependencies (npm install)'
 ( cd frontend && npm install )
 ok 'Frontend dependencies installed'
 
-printf '\nDone. Start everything with:  ./run.sh\n'
+# Seed local config from the template if missing.
+if [ ! -f backend/data/configs.json ] && [ -f backend/data/configs.example.json ]; then
+  cp backend/data/configs.example.json backend/data/configs.json
+  ok 'Created backend/data/configs.json from template'
+fi
+
+printf '\nDone.\n'
+printf 'Start everything with:  ./run.sh\n'
+printf 'Then open the gear icon (top-right) to add an API node.\n'
