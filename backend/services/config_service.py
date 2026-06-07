@@ -29,6 +29,9 @@ _API_TYPE_ALIASES = {
     "manual": "custom",
     "direct": "custom",
     "raw": "custom",
+    "chat": "chat",
+    "chat_completions": "chat",
+    "completions": "chat",
 }
 
 
@@ -215,7 +218,7 @@ class ConfigService:
         text = str(value or DEFAULT_API_TYPE).strip().lower()
         resolved = _API_TYPE_ALIASES.get(text)
         if resolved is None:
-            raise ConfigValidationError("api_type 只支持 openai、async 或 custom")
+            raise ConfigValidationError("api_type 只支持 openai、async、custom 或 chat")
         return resolved
 
     @staticmethod

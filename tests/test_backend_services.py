@@ -332,8 +332,37 @@ class CustomProviderTests(TestCase):
 
             self.assertEqual(result["status"], "completed")
             self.assertEqual(result["urls"], ["https://cdn/pic.png"])
-            # Posts to the exact user-provided URL — no path appended.
             self.assertEqual(http_client.posts[0][0], "https://my-proxy.example.com/api/v2/img")
+
+
+class ChatProviderTests(TestCase):
+    def test_chat_completions_posts_and_extracts_images(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "Chat",
+                    "base_url": "https://api.openai.com",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "chat",
+                    "status": True,
+                }
+            )
+            http_client = FakeHttpClient(
+                post_responses=[FakeResponse(200, {"data": [{"b64_json": "QUJD"}], "output_format": "png"})]
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="hi", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["urls"], ["data:image/png;base64,QUJD"])
+            self.assertEqual(http_client.posts[0][0], "https://api.openai.com/v1/chat/completions")
+            body = http_client.posts[0][1]["json"]
+            self.assertEqual(body["model"], "gpt-image-2")
+            self.assertEqual(body["messages"], [{"role": "user", "content": "hi"}])
 
 
 class AsyncRelayProviderTests(TestCase):

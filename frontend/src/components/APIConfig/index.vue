@@ -23,7 +23,8 @@ const form = reactive({ ...emptyForm })
 const editingKeyPreview = ref('')
 
 const apiTypeOptions = [
-  { value: 'openai', label: 'OpenAI 兼容', hint: '标准 /v1/images 接口（推荐，gpt-image-2 默认）' },
+  { value: 'openai', label: 'OpenAI 兼容', hint: '标准 /v1/images 接口（推荐）' },
+  { value: 'chat', label: 'Chat Completions', hint: 'POST /v1/chat/completions（部分代理用此端点）' },
   { value: 'custom', label: '自定义 URL', hint: '直接 POST 到填写的完整地址，不拼接任何路径' },
   { value: 'async', label: '异步中转', hint: '自定义 /async/images 提交 + 轮询协议' },
 ]
@@ -33,6 +34,7 @@ const enabledCount = computed(() => configs.value.filter((item) => item.status).
 const apiTypeLabel = (value) => {
   if (value === 'async') return '异步中转'
   if (value === 'custom') return '自定义 URL'
+  if (value === 'chat') return 'Chat 补全'
   return 'OpenAI 兼容'
 }
 const endpointHint = computed(() => {
@@ -40,8 +42,9 @@ const endpointHint = computed(() => {
   if (!base) return ''
   if (form.api_type === 'custom') return `直接请求：${base}`
   if (form.api_type === 'async') return `提交：${base}/async/images`
+  if (form.api_type === 'chat') return `请求：${base}/v1/chat/completions`
   const root = base.endsWith('/v1') ? base : `${base}/v1`
-  return `文生图：${root}/images/generations`
+  return `请求：${root}/images/generations`
 })
 
 function resetForm() {

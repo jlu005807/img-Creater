@@ -205,6 +205,8 @@ class ImageService:
             return self._run_async_provider(provider, payload, operation, deadline)
         if provider.get("api_type") == "custom":
             return self._run_custom_provider(provider, payload, operation, deadline)
+        if provider.get("api_type") == "chat":
+            return self._run_chat_completions_provider(provider, payload, operation, deadline)
         return self._run_openai_provider(provider, payload, operation, deadline)
 
     def _remaining(self, deadline: float | None) -> float:
@@ -548,6 +550,80 @@ class ImageService:
         data = self._parse_response_json(response, provider)
         self._ensure_success_status(response, data, provider)
         return self._extract_openai_images(data, provider), None
+
+    # ------------------------------------------------------- Chat Completions
+
+    def _run_chat_completions_provider(
+        self, provider: dict[str, Any], payload: dict[str, Any], operation: str, deadline: float | None = None
+    ) -> tuple[list[str], Any]:
+        """POST to ``/v1/chat/completions`` — some providers expose gpt-image
+        models through this endpoint rather than the Images API.
+        Parses ``data``, ``output``, and ``choices[].message.content`` for
+        image urls/b64."""
+        model = provider.get("model") or DEFAULT_MODEL
+        timeout = self._remaining(deadline)
+        url = self._openai_endpoint(provider["base_url"], "chat/completions")
+        body: dict[str, Any] = {
+            "model": model,
+            "messages": [{"role": "user", "content": payload["prompt"]}],
+        }
+        response = self.http_client.post(
+            url,
+            headers=self._auth_headers(provider, json_content=True),
+            json=body,
+            timeout=timeout,
+        )
+        data = self._parse_response_json(response, provider)
+        self._ensure_success_status(response, data, provider)
+        return self._extract_chat_images(data, provider), None
+
+    def _extract_chat_images(self, data: dict[str, Any], provider: dict[str, Any]) -> list[str]:
+        """Extract images from a Chat Completions response: data array (gpt-image),
+        output array, or data-URI images embedded in choices text."""
+        # 1) data array (gpt-image style)
+        items = data.get("data")
+        if isinstance(items, list) and items:
+            default_fmt = str(data.get("output_format") or "png").lower()
+            urls = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                b64 = item.get("b64_json")
+                if b64:
+                    fmt = str(item.get("output_format") or default_fmt).lower()
+                    urls.append(f"data:image/{fmt};base64,{b64}")
+                    continue
+                url = item.get("url")
+                if url:
+                    urls.append(url)
+            if urls:
+                return urls
+
+        # 2) output array
+        output = data.get("output")
+        if isinstance(output, list):
+            urls = []
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                b64 = item.get("b64_json")
+                if b64:
+                    fmt = str(item.get("output_format") or "png").lower()
+                    urls.append(f"data:image/{fmt};base64,{b64}")
+                    continue
+                url = item.get("url")
+                if url:
+                    urls.append(url)
+            if urls:
+                return urls
+
+        # This is genuinely a non-image chat — that's a provider error for an
+        # image tool.
+        raise ProviderRequestError(
+            "Chat Completions 响应中未找到图片数据 (data/output)",
+            status_code=502,
+            details={"api_id": provider["id"], "api_name": provider["name"], "response": data},
+        )
 
     # --------------------------------------------------------------- normalize
 
