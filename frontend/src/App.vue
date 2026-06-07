@@ -60,7 +60,7 @@ const navItems = [
       </aside>
 
       <main class="min-w-0 flex-1">
-        <Playground v-if="activeTab === 'playground'" />
+        <Playground v-if="activeTab === 'playground'" @go-settings="activeTab = 'settings'" />
         <APIConfig v-else />
       </main>
     </div>

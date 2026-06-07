@@ -1,13 +1,17 @@
 <script setup>
-import { computed, onBeforeUnmount, reactive, ref } from 'vue'
-import { Download, MagicStick, Picture, RefreshLeft, ZoomIn } from '@element-plus/icons-vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { Clock, Delete, Download, MagicStick, Picture, RefreshLeft, Setting, ZoomIn } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { editImage, generateImages, getGenerationStatus } from '../../api/generation'
 import { downloadImage } from '../../utils/download'
+import { useGenerationHistory } from '../../composables/useGenerationHistory'
 import RegionEditor from '../RegionEditor/index.vue'
+
+const emit = defineEmits(['go-settings'])
 
 const MAX_WAIT_SECONDS = 300
 const POLL_INTERVAL_MS = 4000
+const DRAFT_KEY = 'studio-form-draft'
 
 const form = reactive({
   prompt: '',
@@ -28,6 +32,9 @@ const images = ref([])
 const errorMessage = ref('')
 const attempts = ref([])
 const expiresAt = ref(null)
+const needsProvider = ref(false)
+const historyOpen = ref(false)
+const { history, addEntry, removeEntry, clearHistory } = useGenerationHistory()
 
 let elapsedTimer = null
 let pollTimer = null
@@ -80,6 +87,7 @@ function resetRun() {
   errorMessage.value = ''
   attempts.value = []
   expiresAt.value = null
+  needsProvider.value = false
 }
 
 async function submitTask() {
@@ -178,7 +186,16 @@ async function pollStatusOnce() {
       expiresAt.value = result.expires_at ?? null
       loading.value = false
       clearTimers()
-      if (!images.value.length) {
+      if (images.value.length) {
+        addEntry({
+          prompt: form.prompt.trim(),
+          mode: mode.value,
+          size: form.size,
+          n: form.n,
+          urls: images.value,
+          apiName: task.value?.apiName || result.api_name || '',
+        })
+      } else {
         errorMessage.value = '任务完成但未返回图片 URL'
       }
       return
@@ -199,6 +216,7 @@ function stopWithError(message) {
   loading.value = false
   status.value = 'failed'
   errorMessage.value = message
+  needsProvider.value = typeof message === 'string' && message.includes('API 配置')
   clearTimers()
 }
 
@@ -227,6 +245,65 @@ async function downloadOne(url, index) {
   }
 }
 
+function formatHistoryTime(ts) {
+  try {
+    return new Date(ts).toLocaleString()
+  } catch {
+    return ''
+  }
+}
+
+function reuseHistory(entry) {
+  form.prompt = entry.prompt || ''
+  if (entry.size) form.size = entry.size
+  if (entry.n) form.n = entry.n
+  if (entry.mode) mode.value = entry.mode
+  historyOpen.value = false
+  ElMessage.success('已回填该记录的参数')
+}
+
+function viewHistory(entry) {
+  if (!entry.urls || !entry.urls.length) {
+    ElMessage.info('该记录的图片未在本地保存（base64 结果仅当前会话可见），可复用参数重新生成')
+    return
+  }
+  images.value = entry.urls
+  status.value = 'completed'
+  errorMessage.value = ''
+  historyOpen.value = false
+}
+
+function goSettings() {
+  emit('go-settings')
+}
+
+function restoreDraft() {
+  try {
+    const draft = JSON.parse(window.localStorage.getItem(DRAFT_KEY))
+    if (draft && typeof draft === 'object') {
+      form.prompt = draft.prompt || ''
+      if (draft.size) form.size = draft.size
+      if (draft.n) form.n = draft.n
+      if (draft.mode) mode.value = draft.mode
+    }
+  } catch {
+    /* ignore malformed draft */
+  }
+}
+
+// Persist the form so input survives a reload.
+watch([() => form.prompt, () => form.size, () => form.n, mode], () => {
+  try {
+    window.localStorage.setItem(
+      DRAFT_KEY,
+      JSON.stringify({ prompt: form.prompt, size: form.size, n: form.n, mode: mode.value }),
+    )
+  } catch {
+    /* ignore quota / availability errors */
+  }
+})
+
+onMounted(restoreDraft)
 onBeforeUnmount(clearTimers)
 </script>
 
@@ -270,7 +347,9 @@ onBeforeUnmount(clearTimers)
             resize="none"
             maxlength="3000"
             show-word-limit
-            placeholder="描述要生成或修改的画面；局部编辑时只会把蒙版区域交给 AI 修改..."
+            placeholder="描述要生成或修改的画面；局部编辑时只会把蒙版区域交给 AI 修改…（Ctrl/⌘ + Enter 提交）"
+            @keydown.ctrl.enter.prevent="submitTask"
+            @keydown.meta.enter.prevent="submitTask"
           />
         </label>
 
@@ -340,6 +419,11 @@ onBeforeUnmount(clearTimers)
 
         <el-alert v-if="errorMessage" class="mt-4" type="error" :closable="false" :title="errorMessage" />
 
+        <div v-if="needsProvider" class="mt-4 flex items-center justify-between gap-3 rounded-md border border-[var(--studio-coral)] bg-[var(--studio-surface-soft)] px-4 py-3">
+          <p class="text-sm text-[var(--studio-ink)]">还没有可用的 API 节点，先去「设置」添加并启用一个节点。</p>
+          <el-button type="primary" :icon="Setting" @click="goSettings">前往设置</el-button>
+        </div>
+
         <div v-if="attempts.length" class="mt-4 flex flex-wrap gap-2">
           <div v-for="attempt in attempts" :key="`${attempt.api_id}-${attempt.ok}`" class="flex items-center gap-2 rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface)] px-3 py-2 text-sm">
             <span>{{ attempt.api_name }}</span>
@@ -354,9 +438,14 @@ onBeforeUnmount(clearTimers)
             <p class="text-xs font-semibold uppercase tracking-[0.16em] text-[var(--studio-amber)]">Gallery Output</p>
             <h2 class="mt-1 text-2xl font-black">生成结果</h2>
           </div>
-          <div class="text-right text-sm text-[var(--studio-muted)]">
-            <p>{{ images.length }} 张图片</p>
-            <p v-if="expiresLabel" class="mt-0.5 text-xs text-[var(--studio-amber)]">链接将于 {{ expiresLabel }} 过期</p>
+          <div class="flex items-end gap-3">
+            <div class="text-right text-sm text-[var(--studio-muted)]">
+              <p>{{ images.length }} 张图片</p>
+              <p v-if="expiresLabel" class="mt-0.5 text-xs text-[var(--studio-amber)]">链接将于 {{ expiresLabel }} 过期</p>
+            </div>
+            <el-badge :value="history.length" :hidden="!history.length" :max="99">
+              <el-button :icon="Clock" @click="historyOpen = true">历史</el-button>
+            </el-badge>
           </div>
         </div>
 
@@ -411,5 +500,59 @@ onBeforeUnmount(clearTimers)
         </div>
       </div>
     </main>
+
+    <el-drawer v-model="historyOpen" title="生成历史" direction="rtl" size="420px">
+      <div class="mb-3 flex items-center justify-between">
+        <span class="text-sm text-[var(--studio-muted)]">共 {{ history.length }} 条记录</span>
+        <el-button v-if="history.length" text type="danger" :icon="Delete" @click="clearHistory">清空</el-button>
+      </div>
+
+      <div v-if="!history.length" class="flex min-h-[200px] items-center justify-center text-sm text-[var(--studio-muted)]">
+        暂无历史记录
+      </div>
+
+      <div v-else class="thin-scrollbar space-y-3 overflow-auto pr-1">
+        <article
+          v-for="entry in history"
+          :key="entry.id"
+          class="rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface)] p-3"
+        >
+          <div class="mb-2 flex items-center justify-between gap-2">
+            <el-tag size="small" :type="entry.mode === 'edit' ? 'warning' : 'info'">
+              {{ entry.mode === 'edit' ? '局部编辑' : '文生图' }}
+            </el-tag>
+            <span class="text-xs text-[var(--studio-muted)]">{{ formatHistoryTime(entry.time) }}</span>
+          </div>
+          <p class="line-clamp-2 text-sm text-[var(--studio-ink)]">{{ entry.prompt || '（无 Prompt）' }}</p>
+          <p class="mt-1 text-xs text-[var(--studio-muted)]">{{ entry.size }} · {{ entry.imageCount }} 张 · {{ entry.apiName || '—' }}</p>
+
+          <div v-if="entry.urls && entry.urls.length" class="mt-2 flex gap-2 overflow-hidden">
+            <img
+              v-for="(url, i) in entry.urls.slice(0, 4)"
+              :key="i"
+              :src="url"
+              alt=""
+              class="h-12 w-12 rounded border border-[var(--studio-line)] object-cover"
+              loading="lazy"
+            />
+          </div>
+
+          <div class="mt-3 flex items-center gap-2">
+            <el-button size="small" :icon="RefreshLeft" @click="reuseHistory(entry)">复用参数</el-button>
+            <el-button size="small" type="primary" :icon="Picture" @click="viewHistory(entry)">查看结果</el-button>
+            <el-button size="small" text type="danger" :icon="Delete" @click="removeEntry(entry.id)" />
+          </div>
+        </article>
+      </div>
+    </el-drawer>
   </section>
 </template>
+
+<style scoped>
+.line-clamp-2 {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+</style>
