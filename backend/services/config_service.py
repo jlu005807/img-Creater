@@ -25,6 +25,10 @@ _API_TYPE_ALIASES = {
     "async": "async",
     "relay": "async",
     "async_images": "async",
+    "custom": "custom",
+    "manual": "custom",
+    "direct": "custom",
+    "raw": "custom",
 }
 
 
@@ -211,7 +215,7 @@ class ConfigService:
         text = str(value or DEFAULT_API_TYPE).strip().lower()
         resolved = _API_TYPE_ALIASES.get(text)
         if resolved is None:
-            raise ConfigValidationError("api_type 只支持 openai 或 async")
+            raise ConfigValidationError("api_type 只支持 openai、async 或 custom")
         return resolved
 
     @staticmethod

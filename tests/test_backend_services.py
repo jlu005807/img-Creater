@@ -308,6 +308,34 @@ class OpenAIProviderTests(TestCase):
             self.assertNotIn("Content-Type", kwargs["headers"])
 
 
+class CustomProviderTests(TestCase):
+    def test_custom_posts_directly_to_exact_url(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "Direct",
+                    "base_url": "https://my-proxy.example.com/api/v2/img",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "custom",
+                    "status": True,
+                }
+            )
+            http_client = FakeHttpClient(
+                post_responses=[FakeResponse(200, {"data": [{"url": "https://cdn/pic.png"}]})]
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="hi", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["urls"], ["https://cdn/pic.png"])
+            # Posts to the exact user-provided URL — no path appended.
+            self.assertEqual(http_client.posts[0][0], "https://my-proxy.example.com/api/v2/img")
+
+
 class AsyncRelayProviderTests(TestCase):
     def test_submit_then_poll_upstream_until_completed(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

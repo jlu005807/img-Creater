@@ -203,6 +203,8 @@ class ImageService:
     ) -> tuple[list[str], Any]:
         if provider.get("api_type") == "async":
             return self._run_async_provider(provider, payload, operation, deadline)
+        if provider.get("api_type") == "custom":
+            return self._run_custom_provider(provider, payload, operation, deadline)
         return self._run_openai_provider(provider, payload, operation, deadline)
 
     def _remaining(self, deadline: float | None) -> float:
@@ -506,6 +508,46 @@ class ImageService:
             "error": str(exc),
             "details": details,
         }
+
+    # ------------------------------------------------------- custom direct URL
+
+    def _run_custom_provider(
+        self, provider: dict[str, Any], payload: dict[str, Any], operation: str, deadline: float | None = None
+    ) -> tuple[list[str], Any]:
+        """POST directly to the exact ``base_url`` the user provided — no
+        path construction, no /v1/images prefix, no /async/images relay.
+        The response is parsed the same way as the OpenAI-compatible path
+        (``data[].b64_json`` / ``data[].url``)."""
+        model = provider.get("model") or DEFAULT_MODEL
+        timeout = self._remaining(deadline)
+        body: dict[str, Any] = {
+            "model": model,
+            "prompt": payload["prompt"],
+            "n": payload["n"],
+        }
+        if payload["size"] != "auto":
+            body["size"] = payload["size"]
+        if payload.get("quality"):
+            body["quality"] = payload["quality"]
+
+        # Local edits: send image + mask inline as data URLs (same as async relay).
+        if operation == "edit":
+            body["image"] = payload["image"]
+            body["mask"] = payload["mask"]
+            body["edit_mode"] = payload.get("edit_mode", "mask")
+            if payload.get("selection") is not None:
+                body["selection"] = payload["selection"]
+
+        url = provider["base_url"].rstrip("/")
+        response = self.http_client.post(
+            url,
+            headers=self._auth_headers(provider, json_content=True),
+            json=body,
+            timeout=timeout,
+        )
+        data = self._parse_response_json(response, provider)
+        self._ensure_success_status(response, data, provider)
+        return self._extract_openai_images(data, provider), None
 
     # --------------------------------------------------------------- normalize
 
