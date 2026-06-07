@@ -1,19 +1,23 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { Crop, Delete, EditPen, RefreshLeft, Remove, Upload } from '@element-plus/icons-vue'
+import { Crop, Delete, EditPen, FullScreen, Hide, RefreshLeft, Remove, Upload, View } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { useTheme } from '../../composables/useTheme'
 
 const emit = defineEmits(['mask-change'])
 
-const CANVAS_WIDTH = 720
-const CANVAS_HEIGHT = 520
+const PANEL_WIDTH = 400 // canvas fills the panel
+const PANEL_HEIGHT = 360
+const ZOOM_CANVAS = 900
+const ZOOM_HEIGHT = 640
 const UNDO_LIMIT = 25
+const OVERLAY_ALPHA = 0.4
 
 const { theme } = useTheme()
 
 const canvasRef = ref(null)
 const fileInputRef = ref(null)
+const zoomCanvasRef = ref(null)
 const fileName = ref('')
 const tool = ref('brush')
 const brushSize = ref(42)
@@ -21,9 +25,10 @@ const imageDataUrl = ref('')
 const hasMask = ref(false)
 const canUndo = ref(false)
 const isDragOver = ref(false)
+const maskVisible = ref(true) // toggle mask overlay
+const zoomOpen = ref(false)
 
 let imageElement = null
-let imageBox = null
 let maskCanvas = null
 let maskContext = null
 let drawing = false
@@ -32,15 +37,15 @@ let lastPoint = null
 let previewRect = null
 let hoverPoint = null
 let undoStack = []
+// Pixel scale: 1 canvas px = how many image px
+let canvasScale = 1
 
 const cursorStyle = computed(() => {
   if (!imageDataUrl.value) return 'default'
   return tool.value === 'rect' ? 'crosshair' : 'none'
 })
 
-function openFilePicker() {
-  fileInputRef.value?.click()
-}
+function openFilePicker() { fileInputRef.value?.click() }
 
 function loadImage(event) {
   readImageFile(event.target.files?.[0])
@@ -54,11 +59,7 @@ function onDrop(event) {
 
 function readImageFile(file) {
   if (!file) return
-  if (!file.type.startsWith('image/')) {
-    ElMessage.warning('请选择图片文件')
-    return
-  }
-
+  if (!file.type.startsWith('image/')) { ElMessage.warning('请选择图片文件'); return }
   const reader = new FileReader()
   reader.onload = () => {
     const img = new Image()
@@ -78,10 +79,11 @@ function readImageFile(file) {
 
 function initMaskCanvas() {
   maskCanvas = document.createElement('canvas')
-  maskCanvas.width = CANVAS_WIDTH
-  maskCanvas.height = CANVAS_HEIGHT
+  maskCanvas.width = PANEL_WIDTH
+  maskCanvas.height = PANEL_HEIGHT
   maskContext = maskCanvas.getContext('2d')
-  maskContext.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
+  maskContext.clearRect(0, 0, PANEL_WIDTH, PANEL_HEIGHT)
+  canvasScale = 1
   hasMask.value = false
   undoStack = []
   canUndo.value = false
@@ -90,53 +92,57 @@ function initMaskCanvas() {
 function drawScene() {
   const canvas = canvasRef.value
   if (!canvas) return
-  canvas.width = CANVAS_WIDTH
-  canvas.height = CANVAS_HEIGHT
+  canvas.width = PANEL_WIDTH
+  canvas.height = PANEL_HEIGHT
   const ctx = canvas.getContext('2d')
   const styles = getComputedStyle(canvas)
-  const canvasBg = styles.getPropertyValue('--studio-canvas').trim() || '#f6f2ea'
-  const mutedColor = styles.getPropertyValue('--studio-muted').trim() || '#6f777f'
-  const teal = styles.getPropertyValue('--studio-teal').trim() || '#0f8f8c'
-  const coral = styles.getPropertyValue('--studio-coral').trim() || '#d96b4d'
+  const ink = styles.getPropertyValue('--studio-ink').trim() || '#172126'
 
-  ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
-  ctx.fillStyle = canvasBg
-  ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
+  ctx.clearRect(0, 0, PANEL_WIDTH, PANEL_HEIGHT)
 
   if (!imageElement) {
-    ctx.fillStyle = mutedColor
-    ctx.font = '600 18px Aptos, sans-serif'
+    ctx.fillStyle = 'rgba(127,127,127,0.15)'
+    ctx.font = '600 15px Aptos, sans-serif'
     ctx.textAlign = 'center'
-    ctx.fillText('上传或拖拽一张需要局部修改的图片', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2)
+    ctx.fillText('上传或拖拽一张图片到此处', PANEL_WIDTH / 2, PANEL_HEIGHT / 2)
     return
   }
 
-  const scale = Math.min(CANVAS_WIDTH / imageElement.width, CANVAS_HEIGHT / imageElement.height)
-  const width = imageElement.width * scale
-  const height = imageElement.height * scale
-  const x = (CANVAS_WIDTH - width) / 2
-  const y = (CANVAS_HEIGHT - height) / 2
-  imageBox = { x, y, width, height }
+  // Fit image into the panel.
+  const scale = Math.min(PANEL_WIDTH / imageElement.width, PANEL_HEIGHT / imageElement.height)
+  canvasScale = scale
+  const dw = imageElement.width * scale
+  const dh = imageElement.height * scale
+  const dx = (PANEL_WIDTH - dw) / 2
+  const dy = (PANEL_HEIGHT - dh) / 2
 
-  ctx.drawImage(imageElement, x, y, width, height)
-  ctx.save()
-  ctx.globalAlpha = 0.45
-  ctx.drawImage(maskCanvas, 0, 0)
-  ctx.globalCompositeOperation = 'source-atop'
-  ctx.fillStyle = teal
-  ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
-  ctx.restore()
+  // Image.
+  ctx.drawImage(imageElement, dx, dy, dw, dh)
 
+  // Semi-transparent mask overlay (colored teal tint).
+  if (maskVisible.value) {
+    ctx.save()
+    ctx.globalAlpha = OVERLAY_ALPHA
+    ctx.drawImage(maskCanvas, 0, 0)
+    ctx.globalCompositeOperation = 'source-atop'
+    const teal = styles.getPropertyValue('--studio-teal').trim() || '#0f8f8c'
+    ctx.fillStyle = teal
+    ctx.fillRect(0, 0, PANEL_WIDTH, PANEL_HEIGHT)
+    ctx.restore()
+  }
+
+  // Selection preview (rect drag outline).
   if (previewRect) {
     ctx.save()
+    const coral = styles.getPropertyValue('--studio-coral').trim() || '#d96b4d'
     ctx.strokeStyle = coral
     ctx.lineWidth = 2
-    ctx.setLineDash([8, 5])
+    ctx.setLineDash([6, 4])
     ctx.strokeRect(previewRect.x, previewRect.y, previewRect.width, previewRect.height)
     ctx.restore()
   }
 
-  // Brush / eraser cursor ring (canvas hides the native cursor for these tools).
+  // Brush / eraser cursor ring.
   if (hoverPoint && tool.value !== 'rect') {
     const radius = brushSize.value / 2
     ctx.save()
@@ -149,8 +155,35 @@ function drawScene() {
     ctx.arc(hoverPoint.x, hoverPoint.y, radius, 0, Math.PI * 2)
     ctx.lineWidth = 1
     ctx.setLineDash([4, 3])
-    ctx.strokeStyle = tool.value === 'eraser' ? coral : teal
+    ctx.strokeStyle = tool.value === 'eraser' ? '#d96b4d' : '#0f8f8c'
     ctx.stroke()
+    ctx.restore()
+  }
+}
+
+function drawZoomScene() {
+  const canvas = zoomCanvasRef.value
+  if (!canvas || !imageElement) return
+  const scale = Math.min(ZOOM_CANVAS / imageElement.width, ZOOM_HEIGHT / imageElement.height)
+  canvas.width = ZOOM_CANVAS
+  canvas.height = ZOOM_HEIGHT
+  const ctx = canvas.getContext('2d')
+  const dw = imageElement.width * scale
+  const dh = imageElement.height * scale
+  const dx = (ZOOM_CANVAS - dw) / 2
+  const dy = (ZOOM_HEIGHT - dh) / 2
+
+  ctx.clearRect(0, 0, ZOOM_CANVAS, ZOOM_HEIGHT)
+  ctx.drawImage(imageElement, dx, dy, dw, dh)
+
+  // Draw the mask scaled up.
+  if (maskVisible.value && maskCanvas) {
+    ctx.save()
+    ctx.globalAlpha = OVERLAY_ALPHA
+    ctx.drawImage(maskCanvas, 0, 0, maskCanvas.width, maskCanvas.height, dx, dy, dw, dh)
+    ctx.globalCompositeOperation = 'source-atop'
+    ctx.fillStyle = '#0f8f8c'
+    ctx.fillRect(dx, dy, dw, dh)
     ctx.restore()
   }
 }
@@ -158,14 +191,30 @@ function drawScene() {
 function getCanvasPoint(event) {
   const rect = canvasRef.value.getBoundingClientRect()
   return {
-    x: ((event.clientX - rect.left) * CANVAS_WIDTH) / rect.width,
-    y: ((event.clientY - rect.top) * CANVAS_HEIGHT) / rect.height,
+    x: ((event.clientX - rect.left) * PANEL_WIDTH) / rect.width,
+    y: ((event.clientY - rect.top) * PANEL_HEIGHT) / rect.height,
   }
+}
+
+function getZoomPoint(event) {
+  const rect = zoomCanvasRef.value.getBoundingClientRect()
+  return {
+    x: ((event.clientX - rect.left) * ZOOM_CANVAS) / rect.width,
+    y: ((event.clientY - rect.top) * ZOOM_HEIGHT) / rect.height,
+  }
+}
+
+// Map zoom canvas coords to panel coords.
+function zoomToPanel(pt) {
+  if (!imageElement || !canvasScale) return pt
+  const zScale = Math.min(ZOOM_CANVAS / imageElement.width, ZOOM_HEIGHT / imageElement.height)
+  const scale = zScale > canvasScale ? zScale / canvasScale : 1
+  return { x: pt.x / scale, y: pt.y / scale }
 }
 
 function pushUndo() {
   if (!maskContext) return
-  undoStack.push(maskContext.getImageData(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT))
+  undoStack.push(maskContext.getImageData(0, 0, PANEL_WIDTH, PANEL_HEIGHT))
   if (undoStack.length > UNDO_LIMIT) undoStack.shift()
   canUndo.value = true
 }
@@ -181,46 +230,42 @@ function undo() {
   emitMaskState()
 }
 
-function pointerDown(event) {
+function pointerDown(event, isZoom = false) {
   if (!imageElement) return
-  canvasRef.value.setPointerCapture?.(event.pointerId)
+  ;(isZoom ? zoomCanvasRef : canvasRef).value?.setPointerCapture?.(event.pointerId)
   pushUndo()
   drawing = true
-  startPoint = getCanvasPoint(event)
-  lastPoint = startPoint
-  hoverPoint = startPoint
-  if (tool.value === 'brush' || tool.value === 'eraser') {
-    paintLine(startPoint, startPoint)
-  }
+  const pt = isZoom ? zoomToPanel(getZoomPoint(event)) : getCanvasPoint(event)
+  startPoint = pt
+  lastPoint = pt
+  if (tool.value === 'brush' || tool.value === 'eraser') paintLine(pt, pt)
   drawScene()
 }
 
-function pointerMove(event) {
+function pointerMove(event, isZoom = false) {
   if (!imageElement) return
-  const point = getCanvasPoint(event)
-  hoverPoint = point
+  const raw = isZoom ? zoomToPanel(getZoomPoint(event)) : getCanvasPoint(event)
+  hoverPoint = raw
   if (drawing) {
     if (tool.value === 'rect') {
-      previewRect = normalizeRect(startPoint, point)
+      previewRect = normalizeRect(startPoint, raw)
     } else {
-      paintLine(lastPoint, point)
-      lastPoint = point
+      paintLine(lastPoint, raw)
+      lastPoint = raw
     }
   }
   drawScene()
 }
 
-function pointerUp() {
+function pointerUp(isZoom = false) {
   if (drawing && imageElement && tool.value === 'rect' && previewRect) {
-    if (previewRect.width > 4 && previewRect.height > 4) {
+    if (previewRect.width > 3 && previewRect.height > 3) {
       maskContext.fillStyle = 'rgba(255,255,255,1)'
       maskContext.fillRect(previewRect.x, previewRect.y, previewRect.width, previewRect.height)
       hasMask.value = true
     }
   }
-  if (drawing && tool.value === 'eraser') {
-    recomputeHasMask()
-  }
+  if (drawing && tool.value === 'eraser') recomputeHasMask()
   drawing = false
   startPoint = null
   lastPoint = null
@@ -237,9 +282,7 @@ function pointerLeave() {
 
 function paintLine(from, to) {
   maskContext.save()
-  if (tool.value === 'eraser') {
-    maskContext.globalCompositeOperation = 'destination-out'
-  }
+  if (tool.value === 'eraser') maskContext.globalCompositeOperation = 'destination-out'
   maskContext.strokeStyle = 'rgba(255,255,255,1)'
   maskContext.lineWidth = brushSize.value
   maskContext.lineCap = 'round'
@@ -253,11 +296,9 @@ function paintLine(from, to) {
 }
 
 function normalizeRect(from, to) {
-  const x = Math.min(from.x, to.x)
-  const y = Math.min(from.y, to.y)
   return {
-    x,
-    y,
+    x: Math.min(from.x, to.x),
+    y: Math.min(from.y, to.y),
     width: Math.abs(to.x - from.x),
     height: Math.abs(to.y - from.y),
   }
@@ -266,16 +307,14 @@ function normalizeRect(from, to) {
 function clearMask() {
   if (!maskContext) return
   pushUndo()
-  maskContext.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
+  maskContext.clearRect(0, 0, PANEL_WIDTH, PANEL_HEIGHT)
   hasMask.value = false
   previewRect = null
   drawScene()
   emitMaskState()
 }
 
-function recomputeHasMask() {
-  hasMask.value = Boolean(getMaskBoundingBox())
-}
+function recomputeHasMask() { hasMask.value = Boolean(getMaskBoundingBox()) }
 
 function emitMaskState() {
   emit('mask-change', { hasImage: Boolean(imageDataUrl.value), hasMask: hasMask.value })
@@ -283,46 +322,49 @@ function emitMaskState() {
 
 function getMaskBoundingBox() {
   if (!maskContext) return null
-  const pixels = maskContext.getImageData(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT).data
-  let minX = CANVAS_WIDTH
-  let minY = CANVAS_HEIGHT
-  let maxX = 0
-  let maxY = 0
-
-  for (let y = 0; y < CANVAS_HEIGHT; y += 1) {
-    for (let x = 0; x < CANVAS_WIDTH; x += 1) {
-      const alpha = pixels[(y * CANVAS_WIDTH + x) * 4 + 3]
-      if (alpha > 0) {
-        minX = Math.min(minX, x)
-        minY = Math.min(minY, y)
-        maxX = Math.max(maxX, x)
-        maxY = Math.max(maxY, y)
+  const pixels = maskContext.getImageData(0, 0, PANEL_WIDTH, PANEL_HEIGHT).data
+  let minX = PANEL_WIDTH, minY = PANEL_HEIGHT, maxX = 0, maxY = 0
+  for (let y = 0; y < PANEL_HEIGHT; y++) {
+    for (let x = 0; x < PANEL_WIDTH; x++) {
+      if (pixels[(y * PANEL_WIDTH + x) * 4 + 3] > 0) {
+        minX = Math.min(minX, x); minY = Math.min(minY, y)
+        maxX = Math.max(maxX, x); maxY = Math.max(maxY, y)
       }
     }
   }
-
-  if (minX === CANVAS_WIDTH) return null
+  if (minX === PANEL_WIDTH) return null
   return { x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1 }
 }
 
+// Export mask scaled to source image dimensions.
 function exportPayload() {
-  if (!imageDataUrl.value || !maskCanvas || !hasMask.value) return null
+  if (!imageDataUrl.value || !maskCanvas || !maskContext || !hasMask.value) return null
+  // Build a mask at source-image resolution.
+  const offscreen = document.createElement('canvas')
+  offscreen.width = imageElement.width
+  offscreen.height = imageElement.height
+  const octx = offscreen.getContext('2d')
+  octx.drawImage(maskCanvas, 0, 0, imageElement.width, imageElement.height)
+
+  // Compute the letterbox rect of the image inside the panel.
+  const scale = Math.min(PANEL_WIDTH / imageElement.width, PANEL_HEIGHT / imageElement.height)
+  const dw = imageElement.width * scale
+  const dh = imageElement.height * scale
+  const dx = (PANEL_WIDTH - dw) / 2
+  const dy = (PANEL_HEIGHT - dh) / 2
+
   return {
     image: imageDataUrl.value,
-    mask: maskCanvas.toDataURL('image/png'),
+    mask: offscreen.toDataURL('image/png'),
     selection: {
       type: tool.value,
-      canvas: { width: CANVAS_WIDTH, height: CANVAS_HEIGHT },
-      // Letterbox rect of the image inside the canvas, so the backend can crop
-      // the canvas-sized mask back to the source image and align it pixel-wise.
-      box: imageBox
-        ? {
-            x: Math.round(imageBox.x),
-            y: Math.round(imageBox.y),
-            width: Math.round(imageBox.width),
-            height: Math.round(imageBox.height),
-          }
-        : null,
+      canvas: { width: PANEL_WIDTH, height: PANEL_HEIGHT },
+      box: {
+        x: Math.round(dx),
+        y: Math.round(dy),
+        width: Math.round(dw),
+        height: Math.round(dh),
+      },
       bbox: getMaskBoundingBox(),
     },
   }
@@ -335,17 +377,13 @@ function onCanvasKeydown(event) {
   }
 }
 
-// Redraw when the theme flips so canvas colors follow the active palette.
-watch(theme, () => drawScene())
-onMounted(() => {
-  drawScene()
-  // A fresh editor mounts empty (mode toggles unmount/remount it via v-if); emit
-  // the cleared state so the parent's status cards don't show stale 已上传/已选择.
-  emitMaskState()
+// Zoom popup: draw once when opened.
+watch(zoomOpen, (val) => {
+  if (val) nextTick(drawZoomScene)
 })
-onBeforeUnmount(() => {
-  undoStack = []
-})
+watch(theme, () => { drawScene(); if (zoomOpen.value) drawZoomScene() })
+onMounted(drawScene)
+onBeforeUnmount(() => { undoStack = [] })
 
 defineExpose({ exportPayload, clearMask })
 </script>
@@ -357,38 +395,49 @@ defineExpose({ exportPayload, clearMask })
         <p class="text-xs font-bold uppercase tracking-[0.16em] text-[var(--studio-teal)]">Region Edit</p>
         <h3 class="mt-1 text-lg font-black">局部修改蒙版</h3>
       </div>
-      <input ref="fileInputRef" class="hidden" type="file" accept="image/*" @change="loadImage" />
-      <el-button :icon="Upload" @click="openFilePicker">上传原图</el-button>
-    </div>
-
-    <div class="mb-3 flex flex-wrap items-center justify-between gap-3">
-      <div class="min-w-0 flex-1 truncate text-sm text-[var(--studio-muted)]">{{ fileName || '未选择图片' }}</div>
       <div class="flex items-center gap-2">
-        <el-button-group>
-          <el-button :type="tool === 'brush' ? 'primary' : 'default'" :icon="EditPen" title="涂抹" @click="tool = 'brush'">涂抹</el-button>
-          <el-button :type="tool === 'rect' ? 'primary' : 'default'" :icon="Crop" title="框选" @click="tool = 'rect'">框选</el-button>
-          <el-button :type="tool === 'eraser' ? 'primary' : 'default'" :icon="Remove" title="擦除" @click="tool = 'eraser'">擦除</el-button>
-        </el-button-group>
-        <el-button :icon="RefreshLeft" :disabled="!canUndo" title="撤销 (Ctrl+Z)" @click="undo">撤销</el-button>
-        <el-button :icon="Delete" title="清除" @click="clearMask">清除</el-button>
+        <input ref="fileInputRef" class="hidden" type="file" accept="image/*" @change="loadImage" />
+        <el-button :icon="Upload" size="small" @click="openFilePicker">上传</el-button>
+        <el-button
+          :icon="maskVisible ? View : Hide"
+          size="small"
+          :title="maskVisible ? '隐藏蒙版' : '显示蒙版'"
+          @click="maskVisible = !maskVisible"
+        >
+          {{ maskVisible ? '蒙版' : '隐藏' }}
+        </el-button>
+        <el-button :icon="FullScreen" size="small" :disabled="!imageDataUrl" title="放大编辑" @click="zoomOpen = true">放大</el-button>
       </div>
     </div>
 
-    <div class="mb-3 grid grid-cols-[84px_1fr_52px] items-center gap-2 text-sm">
-      <span class="font-semibold">画笔大小</span>
+    <div class="mb-3 flex flex-wrap items-center justify-between gap-3">
+      <div class="min-w-0 flex-1 truncate text-sm text-[var(--studio-muted)]">{{ fileName || '未选择图片（可拖拽上传）' }}</div>
+      <div class="flex items-center gap-2">
+        <el-button-group>
+          <el-button :type="tool === 'brush' ? 'primary' : 'default'" :icon="EditPen" size="small" title="涂抹" @click="tool = 'brush'" />
+          <el-button :type="tool === 'rect' ? 'primary' : 'default'" :icon="Crop" size="small" title="框选" @click="tool = 'rect'" />
+          <el-button :type="tool === 'eraser' ? 'primary' : 'default'" :icon="Remove" size="small" title="擦除" @click="tool = 'eraser'" />
+        </el-button-group>
+        <el-button :icon="RefreshLeft" :disabled="!canUndo" size="small" title="撤销 (Ctrl+Z)" @click="undo" />
+        <el-button :icon="Delete" size="small" title="清除蒙版" @click="clearMask" />
+      </div>
+    </div>
+
+    <div class="mb-3 grid grid-cols-[72px_1fr_48px] items-center gap-2 text-sm">
+      <span class="font-semibold">画笔</span>
       <el-slider v-model="brushSize" :min="8" :max="120" :step="2" :disabled="tool === 'rect'" />
-      <span class="text-right text-[var(--studio-muted)]">{{ brushSize }}px</span>
+      <span class="text-right text-[var(--studio-muted)]">{{ brushSize }}</span>
     </div>
 
     <canvas
       ref="canvasRef"
       tabindex="0"
-      class="aspect-[720/520] w-full rounded-md border bg-[var(--studio-canvas)] outline-none transition-colors"
+      class="aspect-[400/360] w-full rounded-md border bg-[var(--studio-canvas)] outline-none transition-colors"
       :class="isDragOver ? 'border-[var(--studio-coral)]' : 'border-[var(--studio-line)]'"
       :style="{ cursor: cursorStyle }"
-      @pointerdown.prevent="pointerDown"
-      @pointermove.prevent="pointerMove"
-      @pointerup.prevent="pointerUp"
+      @pointerdown.prevent="(e) => pointerDown(e, false)"
+      @pointermove.prevent="(e) => pointerMove(e, false)"
+      @pointerup.prevent="() => pointerUp(false)"
       @pointerleave.prevent="pointerLeave"
       @keydown="onCanvasKeydown"
       @dragover.prevent="isDragOver = true"
@@ -396,8 +445,25 @@ defineExpose({ exportPayload, clearMask })
       @drop.prevent="onDrop"
     />
 
-    <p class="mt-3 text-xs leading-5 text-[var(--studio-muted)]">
-      用涂抹/框选标记修改区域，擦除可去掉多余部分，<span class="font-semibold text-[var(--studio-ink)]">Ctrl+Z</span> 撤销。蒙版会随原图提交，OpenAI 兼容节点会自动对齐并反转透明区域。
+    <p class="mt-2 text-xs leading-5 text-[var(--studio-muted)]">
+      <span v-if="!imageDataUrl">上传图片后可直接在图上涂抹或框选修改区域。</span>
+      <span v-else>涂抹选中 — 半透明<span class="text-[var(--studio-teal)] font-semibold"> 青色 </span>区域为蒙版；Ctrl+Z 撤销。</span>
     </p>
+
+    <!-- Zoom modal -->
+    <el-dialog v-model="zoomOpen" title="放大编辑" width="960px" destroy-on-close @opened="drawZoomScene">
+      <canvas
+        ref="zoomCanvasRef"
+        tabindex="0"
+        class="w-full rounded-md border border-[var(--studio-line)] bg-[var(--studio-canvas)] outline-none"
+        :style="{ cursor: cursorStyle }"
+        @pointerdown.prevent="(e) => pointerDown(e, true)"
+        @pointermove.prevent="(e) => pointerMove(e, true)"
+        @pointerup.prevent="() => pointerUp(true)"
+      />
+      <template #footer>
+        <el-button @click="zoomOpen = false">关闭</el-button>
+      </template>
+    </el-dialog>
   </section>
 </template>
