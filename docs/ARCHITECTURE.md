@@ -260,18 +260,38 @@ User uploads image
 
 因为状态保存在后端 `TaskStore` 中，前端只用 `task_id` 查询，无需在轮询阶段绑定具体节点。
 
-## 8. 局部编辑的遮罩模型
+## 8. 局部编辑的遮罩模型与数据流
 
-前端局部编辑器内部维护一张独立的遮罩画布：
+用户**无需手动制作蒙版**：上传原图后直接在图上涂抹/框选，标记区域以半透明青色实时叠加显示。前端局部编辑器内部维护一张独立的遮罩画布：
 
 - 背景透明
-- 用户涂抹或框选时写入白色不透明区域
-- 提交前导出为 PNG `data URL`，并附带图片在画布中的 letterbox 矩形 `selection.box`
+- 用户涂抹（画笔/橡皮擦）或框选时写入白色不透明区域
+- 提交前自动导出三样东西（PNG `data URL`）：
+  - `image`：原图
+  - `mask`：原图分辨率的遮罩（标记区域为不透明白）
+  - `composite`：**原图 + 半透明遮罩叠加合成的一张混合图**，可被需要单图的上游直接使用
+  - 并附带图片在画布中的 letterbox 矩形 `selection.box`
+
+完整数据流：
+
+```text
+上传原图 + 涂抹/框选 → 生成遮罩 + 合成半透明混合图(composite)
+  → 连同 prompt 提交 /api/edit
+  → 后端按协议处理并提交上游 → 输出修改后的图片
+```
 
 后端处理因协议而异：
 
 - `openai`：用 Pillow 把画布尺寸的遮罩按 `selection.box` 裁回原图区域、缩放到原图尺寸，并**反转 alpha**（OpenAI 约定：透明处即编辑区）后作为 `mask` 文件上传
-- `async`：只校验格式，原样把 `image`/`mask`/`selection` 透传给上游
+- `async` / `custom`：原样把 `image`/`mask`/`composite`/`selection` 透传给上游
+
+## 8.1 参考图（文生图）
+
+文生图可附带最多 N 张参考图（上限在设置中可配置，默认 3；后端硬上限 8）。前端以 `reference_images`（data URL 数组）提交，后端按协议转发：
+
+- `openai`：走 `/v1/images/edits`，参考图作为多个 `image[]` 文件上传
+- `chat`：作为 `image_url` 内容块加入 `messages`
+- `custom` / `async`：内联到 JSON 请求体的 `reference_images` 字段
 
 ## 9. 错误处理策略
 
