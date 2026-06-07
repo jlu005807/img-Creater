@@ -20,12 +20,35 @@ const form = reactive({
 const mode = ref('generate')
 const maskState = ref({ hasImage: false, hasMask: false })
 const regionEditorRef = ref(null)
-const sizeOptions = [
-  { value: 'auto', label: '自动 (auto)' },
-  { value: '1024x1024', label: '1024 × 1024 · 方形' },
-  { value: '1536x1024', label: '1536 × 1024 · 横向' },
-  { value: '1024x1536', label: '1024 × 1536 · 纵向' },
+
+// ---- size controls ----
+const ratioPresets = [
+  { label: '1:1', w: 1024, h: 1024 },
+  { label: '4:3', w: 1360, h: 1024 },
+  { label: '3:4', w: 1024, h: 1360 },
+  { label: '16:9', w: 1536, h: 864 },
+  { label: '9:16', w: 864, h: 1536 },
 ]
+const sizeW = ref(1024)
+const sizeH = ref(1024)
+
+function parseSize(str) {
+  const parts = (str || '1024x1024').split('x')
+  sizeW.value = parseInt(parts[0], 10) || 1024
+  sizeH.value = parseInt(parts[1], 10) || 1024
+  return { w: sizeW.value, h: sizeH.value }
+}
+
+function applyRatio(preset) {
+  sizeW.value = preset.w
+  sizeH.value = preset.h
+}
+
+watch([sizeW, sizeH], () => {
+  form.size = `${sizeW.value}x${sizeH.value}`
+})
+
+// ---- rest of state ----
 
 const loading = ref(false)
 const status = ref('idle')
@@ -305,7 +328,7 @@ async function downloadOne(url, index) {
 // ---- history actions ----
 function recallHistory(entry) {
   form.prompt = entry.prompt || ''
-  if (entry.size) form.size = entry.size
+  if (entry.size) parseSize(entry.size)
   if (entry.mode) mode.value = entry.mode
   images.value = entry.urls || []
   status.value = entry._status === 'completed' ? 'completed' : 'idle'
@@ -324,7 +347,7 @@ function restoreDraft() {
     const draft = JSON.parse(window.localStorage.getItem(DRAFT_KEY))
     if (draft && typeof draft === 'object') {
       form.prompt = draft.prompt || ''
-      if (draft.size) form.size = draft.size
+      if (draft.size) parseSize(draft.size)
       if (draft.mode) mode.value = draft.mode
     }
   } catch {
@@ -450,12 +473,28 @@ onBeforeUnmount(clearTimers)
           </label>
 
           <div class="mt-4">
-            <label class="block">
-              <span class="mb-2 block text-sm font-semibold">尺寸</span>
-              <el-select v-model="form.size" class="w-full">
-                <el-option v-for="size in sizeOptions" :key="size.value" :label="size.label" :value="size.value" />
-              </el-select>
-            </label>
+            <span class="mb-2 block text-sm font-semibold">尺寸</span>
+            <div class="mb-3 flex flex-wrap gap-1.5">
+              <button
+                v-for="preset in ratioPresets"
+                :key="preset.label"
+                type="button"
+                class="rounded-md border border-[var(--studio-line)] px-3 py-1.5 text-xs font-bold transition hover:border-[var(--studio-teal)] hover:text-[var(--studio-teal)]"
+                @click="applyRatio(preset)"
+              >
+                {{ preset.label }}
+              </button>
+            </div>
+            <div class="grid grid-cols-2 gap-2">
+              <label class="block">
+                <span class="mb-1 block text-xs text-[var(--studio-muted)]">宽 (px)</span>
+                <el-input-number v-model="sizeW" :min="64" :max="4096" :step="64" controls-position="right" class="w-full" />
+              </label>
+              <label class="block">
+                <span class="mb-1 block text-xs text-[var(--studio-muted)]">高 (px)</span>
+                <el-input-number v-model="sizeH" :min="64" :max="4096" :step="64" controls-position="right" class="w-full" />
+              </label>
+            </div>
           </div>
 
           <div v-if="mode === 'edit'" class="mt-4 grid grid-cols-2 gap-3 text-sm">
