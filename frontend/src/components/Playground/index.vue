@@ -48,6 +48,61 @@ watch([sizeW, sizeH], () => {
   form.size = `${sizeW.value}x${sizeH.value}`
 })
 
+// ---- example prompt library ----
+const promptCategories = [
+  {
+    label: '写实摄影',
+    items: [
+      { text: '一位年轻女子在雨夜的东京街头，霓虹灯倒映在潮湿的路面上，35mm胶片拍摄风格' },
+      { text: '壮丽的日落海岸线，长曝光波浪模糊成雾，电影级暖色调' },
+      { text: '一杯咖啡放在窗边，清晨柔和的自然光，浅景深，氛围感' },
+    ],
+  },
+  {
+    label: '动漫插画',
+    items: [
+      { text: '吉卜力工作室风格，一座漂浮在云海之上的飞行城堡，金色夕阳光照，细节丰富' },
+      { text: '一位少女在樱花树下阅读，新海诚风格，细腻光影，梦幻氛围' },
+      { text: '宫崎骏风格，森林中的小木屋，温暖灯光，手绘质感' },
+    ],
+  },
+  {
+    label: '产品海报',
+    items: [
+      { text: '极简产品摄影，一副无线耳机放在大理石台面上，柔和工作室打光，干净背景' },
+      { text: '香水瓶特写，金色调，奢华质感，柔和侧光' },
+    ],
+  },
+  {
+    label: '水彩艺术',
+    items: [
+      { text: '一只可爱的蜂鸟吸食花蜜，水彩画风格，柔和的粉彩色调，白色背景' },
+      { text: '盛开的花园，印象派水彩风格，明亮色彩，湿润笔触' },
+    ],
+  },
+  {
+    label: '赛博朋克',
+    items: [
+      { text: '赛博朋克城市景观，高耸的摩天大楼布满全息广告，飞行载具穿梭，紫青色霓虹色调' },
+      { text: '雨中霓虹街道的义体人，科幻氛围，暗夜都市' },
+    ],
+  },
+  {
+    label: '局部编辑',
+    items: [
+      { text: '将背景替换为星空夜景，保持主体不变' },
+      { text: '将汽车颜色改为金属红，只修改车身部分' },
+      { text: '给照片中的人物加上一副墨镜，写实风格' },
+    ],
+  },
+]
+const promptLibOpen = ref(false)
+
+function fillPrompt(text) {
+  form.prompt = text
+  promptLibOpen.value = false
+}
+
 // ---- rest of state ----
 
 const loading = ref(false)
@@ -471,6 +526,35 @@ onBeforeUnmount(clearTimers)
               @keydown.meta.enter.prevent="submitTask"
             />
           </label>
+
+          <!-- Example prompt library -->
+          <div class="mt-2">
+            <button
+              type="button"
+              class="flex items-center gap-1.5 text-xs font-semibold text-[var(--studio-muted)] transition hover:text-[var(--studio-teal)]"
+              @click="promptLibOpen = !promptLibOpen"
+            >
+              <span>{{ promptLibOpen ? '▾' : '▸' }}</span>
+              <span>示例提示词</span>
+            </button>
+            <div v-if="promptLibOpen" class="mt-2 space-y-3">
+              <div v-for="cat in promptCategories" :key="cat.label">
+                <p class="mb-1.5 text-xs font-bold text-[var(--studio-ink)]">{{ cat.label }}</p>
+                <div class="flex flex-wrap gap-1.5">
+                  <button
+                    v-for="item in cat.items"
+                    :key="item.text"
+                    type="button"
+                    class="rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface)] px-2.5 py-1 text-left text-xs leading-relaxed text-[var(--studio-ink)] transition hover:border-[var(--studio-teal)] hover:bg-[var(--studio-surface-soft)]"
+                    :title="item.text"
+                    @click="fillPrompt(item.text)"
+                  >
+                    {{ item.text.slice(0, 28) }}{{ item.text.length > 28 ? '…' : '' }}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
 
           <div class="mt-4">
             <span class="mb-2 block text-sm font-semibold">尺寸</span>
