@@ -21,10 +21,12 @@ $backend = $null
 $frontend = $null
 
 # Stop child processes when this script exits (Ctrl+C or normal end).
+# npm.cmd is a wrapper whose PID is the shim, not the node/vite worker it spawns,
+# so use taskkill /T to terminate the whole process tree (frees port 5173).
 $cleanup = {
   foreach ($p in @($script:backend, $script:frontend)) {
     if ($p -and -not $p.HasExited) {
-      try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } catch {}
+      try { taskkill /PID $p.Id /T /F 2>$null | Out-Null } catch {}
     }
   }
 }

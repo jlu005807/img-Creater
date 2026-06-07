@@ -18,9 +18,17 @@ fi
 
 BACKEND_PID=""
 FRONTEND_PID=""
+FRONTEND_PGID=""
+# Kill the frontend's whole process group when possible: `npm run dev` forks
+# node/vite as a grandchild, so signaling only the launcher leaves vite holding
+# port 5173. setsid (Linux) puts it in its own group; otherwise fall back to PID.
 cleanup() {
   [ -n "$BACKEND_PID" ] && kill "$BACKEND_PID" 2>/dev/null || true
-  [ -n "$FRONTEND_PID" ] && kill "$FRONTEND_PID" 2>/dev/null || true
+  if [ -n "$FRONTEND_PGID" ]; then
+    kill -- -"$FRONTEND_PGID" 2>/dev/null || true
+  elif [ -n "$FRONTEND_PID" ]; then
+    kill "$FRONTEND_PID" 2>/dev/null || true
+  fi
   printf '\nStopped.\n'
 }
 trap cleanup EXIT INT TERM
@@ -37,8 +45,15 @@ printf '==> Starting backend (Flask) on http://127.0.0.1:5000\n'
 BACKEND_PID=$!
 
 printf '==> Starting frontend (Vite) on http://127.0.0.1:5173\n'
-( cd frontend && npm run dev ) &
-FRONTEND_PID=$!
+if command -v setsid >/dev/null 2>&1; then
+  # Own session/group so cleanup can kill node/vite grandchildren too.
+  setsid sh -c 'cd frontend && exec npm run dev' &
+  FRONTEND_PID=$!
+  FRONTEND_PGID=$FRONTEND_PID
+else
+  ( cd frontend && npm run dev ) &
+  FRONTEND_PID=$!
+fi
 
 sleep 3
 printf '==> Opening http://127.0.0.1:5173\n'
