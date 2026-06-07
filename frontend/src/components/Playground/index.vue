@@ -174,6 +174,9 @@ async function pollStatusOnce() {
       apiId: task.value.apiId,
       taskId: task.value.taskId,
     })
+    // The elapsed timer may have fired stopWithTimeout() during the await;
+    // don't clobber that terminal state with a late response.
+    if (!loading.value) return
     status.value = result.status
 
     // 节点与尝试记录在 worker 完成后才确定，这里随状态一起回填到任务监视器。
@@ -273,10 +276,16 @@ function viewHistory(entry) {
     ElMessage.info('该记录的图片未在本地保存（base64 结果仅当前会话可见），可复用参数重新生成')
     return
   }
+  // Stop any in-flight run and clear unrelated run state before showing history.
+  clearTimers()
+  loading.value = false
+  attempts.value = []
+  expiresAt.value = null
   images.value = entry.urls
   status.value = 'completed'
   errorMessage.value = ''
   historyOpen.value = false
+  ElMessage.info('正在查看历史结果；保存的远程链接可能已过期，如无法显示请复用参数重新生成')
 }
 
 function goSettings() {
@@ -478,7 +487,15 @@ onBeforeUnmount(clearTimers)
               fit="cover"
               loading="lazy"
               class="block aspect-square h-full w-full cursor-zoom-in"
-            />
+            >
+              <template #error>
+                <div class="flex aspect-square h-full w-full flex-col items-center justify-center gap-1 bg-[var(--studio-surface-soft)] text-center text-xs text-[var(--studio-muted)]">
+                  <el-icon class="text-2xl"><Picture /></el-icon>
+                  <span>图片无法加载</span>
+                  <span>（链接可能已过期）</span>
+                </div>
+              </template>
+            </el-image>
             <figcaption class="pointer-events-none absolute inset-x-0 bottom-0 flex translate-y-full items-center justify-between bg-[rgba(23,33,38,0.86)] px-3 py-2 text-sm text-white transition group-hover:translate-y-0">
               <span>Image {{ index + 1 }}</span>
               <button

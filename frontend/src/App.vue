@@ -60,8 +60,10 @@ const navItems = [
       </aside>
 
       <main class="min-w-0 flex-1">
-        <Playground v-if="activeTab === 'playground'" @go-settings="activeTab = 'settings'" />
-        <APIConfig v-else />
+        <!-- v-show (not v-if) so an in-flight generation keeps polling when the
+             user visits 设置 and comes back; both stay mounted. -->
+        <Playground v-show="activeTab === 'playground'" @go-settings="activeTab = 'settings'" />
+        <APIConfig v-show="activeTab === 'settings'" />
       </main>
     </div>
   </div>
