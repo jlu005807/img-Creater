@@ -339,23 +339,43 @@ function getMaskBoundingBox() {
 // Export mask scaled to source image dimensions.
 function exportPayload() {
   if (!imageDataUrl.value || !maskCanvas || !maskContext || !hasMask.value) return null
+  const iw = imageElement.width
+  const ih = imageElement.height
+
   // Build a mask at source-image resolution.
   const offscreen = document.createElement('canvas')
-  offscreen.width = imageElement.width
-  offscreen.height = imageElement.height
+  offscreen.width = iw
+  offscreen.height = ih
   const octx = offscreen.getContext('2d')
-  octx.drawImage(maskCanvas, 0, 0, imageElement.width, imageElement.height)
+  octx.drawImage(maskCanvas, 0, 0, iw, ih)
+
+  // Auto-compose a blended image: original + a semi-transparent teal overlay
+  // over the marked region — a single image the user can submit directly
+  // (no manual masking step). See docs/ARCHITECTURE.md §8 for the data flow.
+  const composite = document.createElement('canvas')
+  composite.width = iw
+  composite.height = ih
+  const cctx = composite.getContext('2d')
+  cctx.drawImage(imageElement, 0, 0, iw, ih)
+  cctx.save()
+  cctx.globalAlpha = OVERLAY_ALPHA
+  cctx.drawImage(maskCanvas, 0, 0, iw, ih)
+  cctx.globalCompositeOperation = 'source-atop'
+  cctx.fillStyle = '#0f8f8c'
+  cctx.fillRect(0, 0, iw, ih)
+  cctx.restore()
 
   // Compute the letterbox rect of the image inside the panel.
-  const scale = Math.min(PANEL_WIDTH / imageElement.width, PANEL_HEIGHT / imageElement.height)
-  const dw = imageElement.width * scale
-  const dh = imageElement.height * scale
+  const scale = Math.min(PANEL_WIDTH / iw, PANEL_HEIGHT / ih)
+  const dw = iw * scale
+  const dh = ih * scale
   const dx = (PANEL_WIDTH - dw) / 2
   const dy = (PANEL_HEIGHT - dh) / 2
 
   return {
     image: imageDataUrl.value,
     mask: offscreen.toDataURL('image/png'),
+    composite: composite.toDataURL('image/png'),
     selection: {
       type: tool.value,
       canvas: { width: PANEL_WIDTH, height: PANEL_HEIGHT },
