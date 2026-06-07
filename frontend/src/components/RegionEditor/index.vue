@@ -1,12 +1,16 @@
 <script setup>
-import { nextTick, ref } from 'vue'
-import { Crop, Delete, EditPen, Upload } from '@element-plus/icons-vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { Crop, Delete, EditPen, RefreshLeft, Remove, Upload } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
+import { useTheme } from '../../composables/useTheme'
 
 const emit = defineEmits(['mask-change'])
 
 const CANVAS_WIDTH = 720
 const CANVAS_HEIGHT = 520
+const UNDO_LIMIT = 25
+
+const { theme } = useTheme()
 
 const canvasRef = ref(null)
 const fileInputRef = ref(null)
@@ -15,6 +19,8 @@ const tool = ref('brush')
 const brushSize = ref(42)
 const imageDataUrl = ref('')
 const hasMask = ref(false)
+const canUndo = ref(false)
+const isDragOver = ref(false)
 
 let imageElement = null
 let imageBox = null
@@ -24,13 +30,29 @@ let drawing = false
 let startPoint = null
 let lastPoint = null
 let previewRect = null
+let hoverPoint = null
+let undoStack = []
+
+const cursorStyle = computed(() => {
+  if (!imageDataUrl.value) return 'default'
+  return tool.value === 'rect' ? 'crosshair' : 'none'
+})
 
 function openFilePicker() {
   fileInputRef.value?.click()
 }
 
 function loadImage(event) {
-  const file = event.target.files?.[0]
+  readImageFile(event.target.files?.[0])
+  event.target.value = ''
+}
+
+function onDrop(event) {
+  isDragOver.value = false
+  readImageFile(event.dataTransfer?.files?.[0])
+}
+
+function readImageFile(file) {
   if (!file) return
   if (!file.type.startsWith('image/')) {
     ElMessage.warning('请选择图片文件')
@@ -52,7 +74,6 @@ function loadImage(event) {
     img.src = reader.result
   }
   reader.readAsDataURL(file)
-  event.target.value = ''
 }
 
 function initMaskCanvas() {
@@ -62,6 +83,8 @@ function initMaskCanvas() {
   maskContext = maskCanvas.getContext('2d')
   maskContext.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
   hasMask.value = false
+  undoStack = []
+  canUndo.value = false
 }
 
 function drawScene() {
@@ -73,6 +96,9 @@ function drawScene() {
   const styles = getComputedStyle(canvas)
   const canvasBg = styles.getPropertyValue('--studio-canvas').trim() || '#f6f2ea'
   const mutedColor = styles.getPropertyValue('--studio-muted').trim() || '#6f777f'
+  const teal = styles.getPropertyValue('--studio-teal').trim() || '#0f8f8c'
+  const coral = styles.getPropertyValue('--studio-coral').trim() || '#d96b4d'
+
   ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
   ctx.fillStyle = canvasBg
   ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
@@ -81,7 +107,7 @@ function drawScene() {
     ctx.fillStyle = mutedColor
     ctx.font = '600 18px Aptos, sans-serif'
     ctx.textAlign = 'center'
-    ctx.fillText('上传一张需要局部修改的图片', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2)
+    ctx.fillText('上传或拖拽一张需要局部修改的图片', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2)
     return
   }
 
@@ -97,16 +123,34 @@ function drawScene() {
   ctx.globalAlpha = 0.45
   ctx.drawImage(maskCanvas, 0, 0)
   ctx.globalCompositeOperation = 'source-atop'
-  ctx.fillStyle = '#0f8f8c'
+  ctx.fillStyle = teal
   ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
   ctx.restore()
 
   if (previewRect) {
     ctx.save()
-    ctx.strokeStyle = '#d96b4d'
+    ctx.strokeStyle = coral
     ctx.lineWidth = 2
     ctx.setLineDash([8, 5])
     ctx.strokeRect(previewRect.x, previewRect.y, previewRect.width, previewRect.height)
+    ctx.restore()
+  }
+
+  // Brush / eraser cursor ring (canvas hides the native cursor for these tools).
+  if (hoverPoint && tool.value !== 'rect') {
+    const radius = brushSize.value / 2
+    ctx.save()
+    ctx.beginPath()
+    ctx.arc(hoverPoint.x, hoverPoint.y, radius, 0, Math.PI * 2)
+    ctx.lineWidth = 2
+    ctx.strokeStyle = 'rgba(255,255,255,0.9)'
+    ctx.stroke()
+    ctx.beginPath()
+    ctx.arc(hoverPoint.x, hoverPoint.y, radius, 0, Math.PI * 2)
+    ctx.lineWidth = 1
+    ctx.setLineDash([4, 3])
+    ctx.strokeStyle = tool.value === 'eraser' ? coral : teal
+    ctx.stroke()
     ctx.restore()
   }
 }
@@ -119,42 +163,63 @@ function getCanvasPoint(event) {
   }
 }
 
+function pushUndo() {
+  if (!maskContext) return
+  undoStack.push(maskContext.getImageData(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT))
+  if (undoStack.length > UNDO_LIMIT) undoStack.shift()
+  canUndo.value = true
+}
+
+function undo() {
+  if (!maskContext || !undoStack.length) return
+  const snapshot = undoStack.pop()
+  maskContext.putImageData(snapshot, 0, 0)
+  canUndo.value = undoStack.length > 0
+  recomputeHasMask()
+  previewRect = null
+  drawScene()
+  emitMaskState()
+}
+
 function pointerDown(event) {
   if (!imageElement) return
   canvasRef.value.setPointerCapture?.(event.pointerId)
+  pushUndo()
   drawing = true
   startPoint = getCanvasPoint(event)
   lastPoint = startPoint
-
-  if (tool.value === 'brush') {
+  hoverPoint = startPoint
+  if (tool.value === 'brush' || tool.value === 'eraser') {
     paintLine(startPoint, startPoint)
   }
-}
-
-function pointerMove(event) {
-  if (!drawing || !imageElement) return
-  const point = getCanvasPoint(event)
-  if (tool.value === 'brush') {
-    paintLine(lastPoint, point)
-    lastPoint = point
-    drawScene()
-    return
-  }
-
-  previewRect = normalizeRect(startPoint, point)
   drawScene()
 }
 
-function pointerUp(event) {
-  if (!drawing || !imageElement) return
+function pointerMove(event) {
+  if (!imageElement) return
   const point = getCanvasPoint(event)
-  if (tool.value === 'rect') {
-    const rect = normalizeRect(startPoint, point)
-    if (rect.width > 4 && rect.height > 4) {
+  hoverPoint = point
+  if (drawing) {
+    if (tool.value === 'rect') {
+      previewRect = normalizeRect(startPoint, point)
+    } else {
+      paintLine(lastPoint, point)
+      lastPoint = point
+    }
+  }
+  drawScene()
+}
+
+function pointerUp() {
+  if (drawing && imageElement && tool.value === 'rect' && previewRect) {
+    if (previewRect.width > 4 && previewRect.height > 4) {
       maskContext.fillStyle = 'rgba(255,255,255,1)'
-      maskContext.fillRect(rect.x, rect.y, rect.width, rect.height)
+      maskContext.fillRect(previewRect.x, previewRect.y, previewRect.width, previewRect.height)
       hasMask.value = true
     }
+  }
+  if (drawing && tool.value === 'eraser') {
+    recomputeHasMask()
   }
   drawing = false
   startPoint = null
@@ -164,8 +229,17 @@ function pointerUp(event) {
   emitMaskState()
 }
 
+function pointerLeave() {
+  pointerUp()
+  hoverPoint = null
+  drawScene()
+}
+
 function paintLine(from, to) {
   maskContext.save()
+  if (tool.value === 'eraser') {
+    maskContext.globalCompositeOperation = 'destination-out'
+  }
   maskContext.strokeStyle = 'rgba(255,255,255,1)'
   maskContext.lineWidth = brushSize.value
   maskContext.lineCap = 'round'
@@ -175,7 +249,7 @@ function paintLine(from, to) {
   maskContext.lineTo(to.x, to.y)
   maskContext.stroke()
   maskContext.restore()
-  hasMask.value = true
+  if (tool.value !== 'eraser') hasMask.value = true
 }
 
 function normalizeRect(from, to) {
@@ -191,6 +265,7 @@ function normalizeRect(from, to) {
 
 function clearMask() {
   if (!maskContext) return
+  pushUndo()
   maskContext.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
   hasMask.value = false
   previewRect = null
@@ -198,12 +273,16 @@ function clearMask() {
   emitMaskState()
 }
 
+function recomputeHasMask() {
+  hasMask.value = Boolean(getMaskBoundingBox())
+}
+
 function emitMaskState() {
   emit('mask-change', { hasImage: Boolean(imageDataUrl.value), hasMask: hasMask.value })
 }
 
 function getMaskBoundingBox() {
-  if (!maskContext || !hasMask.value) return null
+  if (!maskContext) return null
   const pixels = maskContext.getImageData(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT).data
   let minX = CANVAS_WIDTH
   let minY = CANVAS_HEIGHT
@@ -249,6 +328,20 @@ function exportPayload() {
   }
 }
 
+function onCanvasKeydown(event) {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
+    event.preventDefault()
+    undo()
+  }
+}
+
+// Redraw when the theme flips so canvas colors follow the active palette.
+watch(theme, () => drawScene())
+onMounted(() => drawScene())
+onBeforeUnmount(() => {
+  undoStack = []
+})
+
 defineExpose({ exportPayload, clearMask })
 </script>
 
@@ -263,32 +356,43 @@ defineExpose({ exportPayload, clearMask })
       <el-button :icon="Upload" @click="openFilePicker">上传原图</el-button>
     </div>
 
-    <div class="mb-3 grid grid-cols-[1fr_auto_auto] items-center gap-3">
-      <div class="truncate text-sm text-[var(--studio-muted)]">{{ fileName || '未选择图片' }}</div>
-      <el-button-group>
-        <el-button :type="tool === 'brush' ? 'primary' : 'default'" :icon="EditPen" @click="tool = 'brush'">涂抹</el-button>
-        <el-button :type="tool === 'rect' ? 'primary' : 'default'" :icon="Crop" @click="tool = 'rect'">框选</el-button>
-      </el-button-group>
-      <el-button :icon="Delete" @click="clearMask">清除</el-button>
+    <div class="mb-3 flex flex-wrap items-center justify-between gap-3">
+      <div class="min-w-0 flex-1 truncate text-sm text-[var(--studio-muted)]">{{ fileName || '未选择图片' }}</div>
+      <div class="flex items-center gap-2">
+        <el-button-group>
+          <el-button :type="tool === 'brush' ? 'primary' : 'default'" :icon="EditPen" title="涂抹" @click="tool = 'brush'">涂抹</el-button>
+          <el-button :type="tool === 'rect' ? 'primary' : 'default'" :icon="Crop" title="框选" @click="tool = 'rect'">框选</el-button>
+          <el-button :type="tool === 'eraser' ? 'primary' : 'default'" :icon="Remove" title="擦除" @click="tool = 'eraser'">擦除</el-button>
+        </el-button-group>
+        <el-button :icon="RefreshLeft" :disabled="!canUndo" title="撤销 (Ctrl+Z)" @click="undo">撤销</el-button>
+        <el-button :icon="Delete" title="清除" @click="clearMask">清除</el-button>
+      </div>
     </div>
 
     <div class="mb-3 grid grid-cols-[84px_1fr_52px] items-center gap-2 text-sm">
       <span class="font-semibold">画笔大小</span>
-      <el-slider v-model="brushSize" :min="8" :max="120" :step="2" :disabled="tool !== 'brush'" />
+      <el-slider v-model="brushSize" :min="8" :max="120" :step="2" :disabled="tool === 'rect'" />
       <span class="text-right text-[var(--studio-muted)]">{{ brushSize }}px</span>
     </div>
 
     <canvas
       ref="canvasRef"
-      class="h-[520px] w-full rounded-md border border-[var(--studio-line)] bg-[var(--studio-canvas)]"
+      tabindex="0"
+      class="aspect-[720/520] w-full rounded-md border bg-[var(--studio-canvas)] outline-none transition-colors"
+      :class="isDragOver ? 'border-[var(--studio-coral)]' : 'border-[var(--studio-line)]'"
+      :style="{ cursor: cursorStyle }"
       @pointerdown.prevent="pointerDown"
       @pointermove.prevent="pointerMove"
       @pointerup.prevent="pointerUp"
-      @pointerleave.prevent="pointerUp"
+      @pointerleave.prevent="pointerLeave"
+      @keydown="onCanvasKeydown"
+      @dragover.prevent="isDragOver = true"
+      @dragleave.prevent="isDragOver = false"
+      @drop.prevent="onDrop"
     />
 
     <p class="mt-3 text-xs leading-5 text-[var(--studio-muted)]">
-      蒙版区域会作为 <span class="font-semibold text-[var(--studio-ink)]">mask</span> 随原图一起提交给后端，后端继续按 API 节点优先级进行容灾提交。
+      用涂抹/框选标记修改区域，擦除可去掉多余部分，<span class="font-semibold text-[var(--studio-ink)]">Ctrl+Z</span> 撤销。蒙版会随原图提交，OpenAI 兼容节点会自动对齐并反转透明区域。
     </p>
   </section>
 </template>
