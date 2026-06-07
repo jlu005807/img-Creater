@@ -337,7 +337,12 @@ function onCanvasKeydown(event) {
 
 // Redraw when the theme flips so canvas colors follow the active palette.
 watch(theme, () => drawScene())
-onMounted(() => drawScene())
+onMounted(() => {
+  drawScene()
+  // A fresh editor mounts empty (mode toggles unmount/remount it via v-if); emit
+  // the cleared state so the parent's status cards don't show stale 已上传/已选择.
+  emitMaskState()
+})
 onBeforeUnmount(() => {
   undoStack = []
 })

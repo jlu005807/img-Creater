@@ -74,9 +74,10 @@ class ConfigService:
 
     def update_config(self, config_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         payload = dict(payload or {})
-        # A blank api_key on update means "keep the existing key" — the frontend
-        # never receives the real key back, so it can't resend it.
-        if "api_key" in payload and not str(payload["api_key"]).strip():
+        # A blank/null api_key on update means "keep the existing key" — the
+        # frontend never receives the real key back, so it can't resend it.
+        # Note `str(None)` is "None" (truthy), so guard the None case explicitly.
+        if "api_key" in payload and not str(payload.get("api_key") or "").strip():
             payload.pop("api_key")
         with self._lock:
             store = self._read_store()

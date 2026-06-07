@@ -121,6 +121,10 @@ class ConfigServiceTests(TestCase):
             self.assertEqual(updated["api_key"], "sk-secret-1234")
             self.assertEqual(updated["name"], "Renamed")
 
+            # A JSON null api_key must also keep the key, not persist "None".
+            updated_null = service.update_config(created["id"], {"api_key": None})
+            self.assertEqual(updated_null["api_key"], "sk-secret-1234")
+
 
 class OpenAIProviderTests(TestCase):
     def _config_service(self, tmp_dir, configs):

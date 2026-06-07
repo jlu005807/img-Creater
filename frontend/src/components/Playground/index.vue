@@ -96,6 +96,7 @@ function resetRun() {
 }
 
 async function submitTask() {
+  if (loading.value) return
   if (!form.prompt.trim()) {
     ElMessage.warning('请输入 Prompt')
     return
