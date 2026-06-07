@@ -28,19 +28,22 @@ Write-Ok "Node: $(node --version)  npm: $(npm --version)"
 
 # --- Backend: venv + deps -------------------------------------------------
 Write-Step 'Setting up Python virtual environment (.venv)'
-if (-not (Test-Path '.venv')) {
+$venvPython = Join-Path $root '.venv\Scripts\python.exe'
+if (-not (Test-Path $venvPython)) {
+  if (Test-Path '.venv') {
+    Write-Host "  .venv exists but the interpreter is missing — recreating" -ForegroundColor Yellow
+    Remove-Item -Recurse -Force .venv
+  }
   & $python -m venv .venv
   if ($LASTEXITCODE -ne 0) { Fail 'Failed to create virtual environment.' }
   Write-Ok 'Created .venv'
 } else {
   Write-Ok '.venv already exists'
 }
-
-$venvPython = Join-Path $root '.venv\Scripts\python.exe'
 if (-not (Test-Path $venvPython)) { Fail "venv python not found at $venvPython" }
 
 Write-Step 'Installing backend dependencies'
-& $venvPython -m pip install --upgrade pip
+& $venvPython -m pip install --upgrade pip 2>$null
 & $venvPython -m pip install -r backend\requirements.txt
 if ($LASTEXITCODE -ne 0) { Fail 'Backend dependency installation failed.' }
 Write-Ok 'Backend dependencies installed'

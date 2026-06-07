@@ -22,18 +22,21 @@ command -v npm >/dev/null 2>&1 || fail 'npm not found. Install Node.js 18+ and r
 ok "Node: $(node --version)  npm: $(npm --version)"
 
 step 'Setting up Python virtual environment (.venv)'
-if [ ! -d .venv ]; then
+VENV_PYTHON=".venv/bin/python"
+if [ ! -x "$VENV_PYTHON" ]; then
+  if [ -d .venv ]; then
+    printf '  .venv exists but the interpreter is missing — recreating\n'
+    rm -rf .venv
+  fi
   "$PYTHON" -m venv .venv
   ok 'Created .venv'
 else
   ok '.venv already exists'
 fi
-
-VENV_PYTHON=".venv/bin/python"
 [ -x "$VENV_PYTHON" ] || fail "venv python not found at $VENV_PYTHON"
 
 step 'Installing backend dependencies'
-"$VENV_PYTHON" -m pip install --upgrade pip
+"$VENV_PYTHON" -m pip install --upgrade pip || true  # non-critical
 "$VENV_PYTHON" -m pip install -r backend/requirements.txt
 ok 'Backend dependencies installed'
 

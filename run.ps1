@@ -41,8 +41,18 @@ try {
   $frontend = Start-Process -FilePath $npmCmd -ArgumentList 'run', 'dev' `
     -WorkingDirectory (Join-Path $root 'frontend') -PassThru -NoNewWindow
 
-  # Give Vite a moment to bind, then open the browser.
-  Start-Sleep -Seconds 3
+  Write-Host "==> Waiting for Vite to be ready on http://127.0.0.1:5173" -ForegroundColor Cyan
+  $maxWait = 30
+  for ($i = 0; $i -lt $maxWait; $i++) {
+    Start-Sleep -Seconds 1
+    try {
+      $null = (Invoke-WebRequest -Uri 'http://127.0.0.1:5173' -TimeoutSec 2 -UseBasicParsing).StatusCode
+      break
+    } catch {}
+  }
+  if ($i -ge $maxWait) {
+    Write-Host "  Vite didn't respond in ${maxWait}s — opening browser anyway" -ForegroundColor Yellow
+  }
   Write-Host "==> Opening http://127.0.0.1:5173" -ForegroundColor Green
   Start-Process 'http://127.0.0.1:5173'
 

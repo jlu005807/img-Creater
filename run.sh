@@ -55,7 +55,11 @@ else
   FRONTEND_PID=$!
 fi
 
-sleep 3
+printf '==> Waiting for Vite to be ready on http://127.0.0.1:5173\n'
+for i in $(seq 1 30); do
+  if curl -sf http://127.0.0.1:5173 >/dev/null 2>&1; then break; fi
+  sleep 1
+done
 printf '==> Opening http://127.0.0.1:5173\n'
 open_browser 'http://127.0.0.1:5173'
 

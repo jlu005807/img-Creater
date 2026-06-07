@@ -9,6 +9,9 @@ frontend/dist/
 *.log
 frontend-smoke*.png
 
+# Claude Code session/workflow artifacts
+.claude/
+
 # Local provider config holds real API keys — keep it out of git.
 # A template (configs.example.json) is committed; the backend auto-creates
 # backend/data/configs.json on first run.
