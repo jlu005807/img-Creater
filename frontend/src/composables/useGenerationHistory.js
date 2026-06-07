@@ -43,11 +43,20 @@ export function useGenerationHistory() {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       time: Date.now(),
       imageCount: urls.length,
+      _status: 'queued',
       ...entry,
     }
     history.value = [item, ...history.value].slice(0, MAX_ENTRIES)
     persist()
     return item
+  }
+
+  function updateEntry(id, fields) {
+    const idx = history.value.findIndex((e) => e.id === id)
+    if (idx >= 0) {
+      history.value[idx] = { ...history.value[idx], ...fields }
+      persist()
+    }
   }
 
   function removeEntry(id) {
@@ -60,5 +69,5 @@ export function useGenerationHistory() {
     persist()
   }
 
-  return { history, addEntry, removeEntry, clearHistory }
+  return { history, addEntry, updateEntry, removeEntry, clearHistory }
 }
