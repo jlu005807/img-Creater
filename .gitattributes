@@ -1,0 +1,17 @@
+# Normalize line endings so scripts work regardless of the cloner's autocrlf.
+* text=auto
+
+# Shell scripts MUST be LF — a CRLF shebang breaks `#!/usr/bin/env bash`
+# on Linux/macOS (bad interpreter: ...^M).
+*.sh text eol=lf
+
+# PowerShell is fine with either, but keep it consistent.
+*.ps1 text eol=crlf
+
+# Vue/JS/CSS/Python: LF in the repo.
+*.vue text eol=lf
+*.js text eol=lf
+*.css text eol=lf
+*.py text eol=lf
+*.json text eol=lf
+*.md text eol=lf
