@@ -1,8 +1,9 @@
 <script setup>
 import { computed, onBeforeUnmount, reactive, ref } from 'vue'
-import { Download, MagicStick, Picture, RefreshLeft } from '@element-plus/icons-vue'
+import { Download, MagicStick, Picture, RefreshLeft, ZoomIn } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { editImage, generateImages, getGenerationStatus } from '../../api/generation'
+import { downloadImage } from '../../utils/download'
 import RegionEditor from '../RegionEditor/index.vue'
 
 const MAX_WAIT_SECONDS = 300
@@ -219,6 +220,13 @@ function onMaskChange(nextState) {
   maskState.value = nextState
 }
 
+async function downloadOne(url, index) {
+  const ok = await downloadImage(url, `gpt-img2-${index + 1}`)
+  if (!ok) {
+    ElMessage.info('图片为跨域链接，已在新标签页打开，可右键另存为')
+  }
+}
+
 onBeforeUnmount(clearTimers)
 </script>
 
@@ -365,13 +373,32 @@ onBeforeUnmount(clearTimers)
 
         <div v-else-if="images.length" class="gallery-grid">
           <figure v-for="(url, index) in images" :key="url" class="group relative overflow-hidden rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface)]">
-            <img :src="url" :alt="`生成图片 ${index + 1}`" class="aspect-square h-full w-full object-cover" loading="lazy" />
-            <figcaption class="absolute inset-x-0 bottom-0 flex translate-y-full items-center justify-between bg-[rgba(23,33,38,0.86)] px-3 py-2 text-sm text-white transition group-hover:translate-y-0">
+            <el-image
+              :src="url"
+              :alt="`生成图片 ${index + 1}`"
+              :preview-src-list="images"
+              :initial-index="index"
+              preview-teleported
+              hide-on-click-modal
+              fit="cover"
+              loading="lazy"
+              class="block aspect-square h-full w-full cursor-zoom-in"
+            />
+            <figcaption class="pointer-events-none absolute inset-x-0 bottom-0 flex translate-y-full items-center justify-between bg-[rgba(23,33,38,0.86)] px-3 py-2 text-sm text-white transition group-hover:translate-y-0">
               <span>Image {{ index + 1 }}</span>
-              <a :href="url" download target="_blank" rel="noreferrer" class="inline-flex h-8 w-8 items-center justify-center rounded-md bg-white text-[#172126]" title="下载图片">
+              <button
+                type="button"
+                class="pointer-events-auto inline-flex h-8 w-8 items-center justify-center rounded-md bg-white text-[#172126] transition hover:bg-[var(--studio-coral)] hover:text-white"
+                title="下载图片"
+                :aria-label="`下载第 ${index + 1} 张图片`"
+                @click="downloadOne(url, index)"
+              >
                 <el-icon><Download /></el-icon>
-              </a>
+              </button>
             </figcaption>
+            <span class="pointer-events-none absolute right-2 top-2 flex h-7 w-7 items-center justify-center rounded-md bg-[rgba(23,33,38,0.7)] text-white opacity-0 transition group-hover:opacity-100">
+              <el-icon><ZoomIn /></el-icon>
+            </span>
           </figure>
         </div>
 
