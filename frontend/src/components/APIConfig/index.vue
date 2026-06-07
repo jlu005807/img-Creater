@@ -240,7 +240,7 @@ onMounted(loadConfigs)
           暂无 API 节点
         </div>
 
-        <div v-else class="thin-scrollbar max-h-[620px] space-y-3 overflow-auto pr-1">
+        <div v-else class="thin-scrollbar grid max-h-[620px] grid-cols-1 gap-3 overflow-auto pr-1 xl:grid-cols-2">
           <article
             v-for="(item, index) in configs"
             :key="item.id"
