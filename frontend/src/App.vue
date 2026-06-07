@@ -1,7 +1,7 @@
 <script setup>
 import { computed, ref } from 'vue'
 import { Moon, Setting, Sunny } from '@element-plus/icons-vue'
-import APIConfig from './components/APIConfig/index.vue'
+import Settings from './components/Settings/index.vue'
 import Playground from './components/Playground/index.vue'
 import { useTheme } from './composables/useTheme'
 
@@ -42,8 +42,8 @@ const isDark = computed(() => theme.value === 'dark')
     </header>
 
     <!-- Settings modal -->
-    <el-dialog v-model="settingsOpen" title="设置" width="680px" destroy-on-close>
-      <APIConfig />
+    <el-dialog v-model="settingsOpen" title="设置" width="1040px" top="6vh" destroy-on-close>
+      <Settings @close="settingsOpen = false" />
       <template #footer>
         <el-button @click="settingsOpen = false">关闭</el-button>
       </template>
