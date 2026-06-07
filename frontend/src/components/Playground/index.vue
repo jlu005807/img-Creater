@@ -1,11 +1,25 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { Delete, Download, MagicStick, Picture, RefreshLeft, ZoomIn } from '@element-plus/icons-vue'
+import { Delete, Download, FullScreen, MagicStick, Picture, Plus, Refresh, RefreshLeft, ZoomIn } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { editImage, generateImages, getGenerationStatus } from '../../api/generation'
 import { downloadImage } from '../../utils/download'
 import { useGenerationHistory } from '../../composables/useGenerationHistory'
+import { useSettings } from '../../composables/useSettings'
+import { usePromptTemplates } from '../../composables/usePromptTemplates'
 import RegionEditor from '../RegionEditor/index.vue'
+
+const { settings } = useSettings()
+const { pendingFill } = usePromptTemplates()
+const promptZoomOpen = ref(false)
+
+// A template chosen in Settings fills the prompt here.
+watch(pendingFill, (val) => {
+  if (val && val.text != null) {
+    form.prompt = val.text
+    mode.value = 'generate'
+  }
+})
 
 const MAX_WAIT_SECONDS = 300
 const POLL_INTERVAL_MS = 4000
@@ -16,6 +30,43 @@ const form = reactive({
   prompt: '',
   size: '1024x1024',
 })
+
+const promptChars = computed(() => form.prompt.length)
+
+// ---- reference images (generate mode) ----
+const referenceImages = ref([]) // array of data URLs
+const refInputRef = ref(null)
+
+function openRefPicker() {
+  refInputRef.value?.click()
+}
+
+function addReferenceFiles(fileList) {
+  const files = Array.from(fileList || [])
+  for (const file of files) {
+    if (!file.type.startsWith('image/')) continue
+    if (referenceImages.value.length >= settings.maxReferenceImages) {
+      ElMessage.warning(`最多上传 ${settings.maxReferenceImages} 张参考图（可在设置中调整）`)
+      break
+    }
+    const reader = new FileReader()
+    reader.onload = () => {
+      if (referenceImages.value.length < settings.maxReferenceImages) {
+        referenceImages.value.push(reader.result)
+      }
+    }
+    reader.readAsDataURL(file)
+  }
+}
+
+function onRefInput(event) {
+  addReferenceFiles(event.target.files)
+  event.target.value = ''
+}
+
+function removeReference(index) {
+  referenceImages.value.splice(index, 1)
+}
 
 const mode = ref('generate')
 const maskState = ref({ hasImage: false, hasMask: false })
@@ -103,6 +154,15 @@ function fillPrompt(text) {
   promptLibOpen.value = false
 }
 
+// Pick a random example across all categories.
+function randomPrompt() {
+  const all = promptCategories.flatMap((c) => c.items)
+  if (!all.length) return
+  const pick = all[Math.floor(Math.random() * all.length)]
+  form.prompt = pick.text
+  ElMessage.success('已随机填入一条示例')
+}
+
 // ---- rest of state ----
 
 const loading = ref(false)
@@ -152,16 +212,53 @@ const buttonText = computed(() => {
 const showSkeleton = computed(() => loading.value && !images.value.length)
 const operationLabel = computed(() => (mode.value === 'edit' ? '局部编辑' : '文生图'))
 
-// ---- history items with live status ----
-const historyItems = computed(() =>
-  history.value.map((entry) => {
-    let ist = entry._status || 'completed'
-    if (entry.id === activeHistoryId.value && loading.value) {
-      ist = status.value === 'idle' || status.value === 'submitting' ? 'queued' : status.value
-    }
-    return { ...entry, _status: ist }
-  }),
-)
+// ---- history search + time filter ----
+const historyQuery = ref('')
+const historyTimeFilter = ref('all') // all | today | week | month
+const historyTimeOptions = [
+  { value: 'all', label: '全部' },
+  { value: 'today', label: '今天' },
+  { value: 'week', label: '本周' },
+  { value: 'month', label: '本月' },
+]
+
+function withinTimeFilter(ts) {
+  if (historyTimeFilter.value === 'all') return true
+  const now = new Date()
+  const d = new Date(ts)
+  if (historyTimeFilter.value === 'today') {
+    return d.toDateString() === now.toDateString()
+  }
+  if (historyTimeFilter.value === 'week') {
+    const start = new Date(now)
+    const day = (now.getDay() + 6) % 7 // Monday = 0
+    start.setHours(0, 0, 0, 0)
+    start.setDate(now.getDate() - day)
+    return d >= start
+  }
+  if (historyTimeFilter.value === 'month') {
+    return d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth()
+  }
+  return true
+}
+
+// ---- history items with live status + filtering ----
+const historyItems = computed(() => {
+  const q = historyQuery.value.trim().toLowerCase()
+  return history.value
+    .filter((entry) => {
+      if (!withinTimeFilter(entry.time)) return false
+      if (q && !(entry.prompt || '').toLowerCase().includes(q)) return false
+      return true
+    })
+    .map((entry) => {
+      let ist = entry._status || 'completed'
+      if (entry.id === activeHistoryId.value && loading.value) {
+        ist = status.value === 'idle' || status.value === 'submitting' ? 'queued' : status.value
+      }
+      return { ...entry, _status: ist }
+    })
+})
 
 function historyStatusIcon(item) {
   if (item._status === 'completed') return '✓'
@@ -211,7 +308,7 @@ function resetRun() {
 }
 
 // ---- submit + poll ----
-async function submitTask() {
+async function submitTask(reuseId = null) {
   if (loading.value) return
   if (!form.prompt.trim()) {
     ElMessage.warning('请输入 Prompt')
@@ -232,16 +329,30 @@ async function submitTask() {
   loading.value = true
   status.value = 'submitting'
 
-  // Create a history entry immediately.
-  const entry = addEntry({
-    prompt: form.prompt.trim(),
-    mode: mode.value,
-    size: form.size,
-    urls: [],
-    apiName: '',
-    _status: 'queued',
-  })
-  activeHistoryId.value = entry.id
+  // Reuse an existing history entry on retry (overwrite), else create a new one.
+  if (reuseId && history.value.some((e) => e.id === reuseId)) {
+    updateEntry(reuseId, {
+      prompt: form.prompt.trim(),
+      mode: mode.value,
+      size: form.size,
+      urls: [],
+      apiName: '',
+      imageCount: 0,
+      time: Date.now(),
+      _status: 'queued',
+    })
+    activeHistoryId.value = reuseId
+  } else {
+    const entry = addEntry({
+      prompt: form.prompt.trim(),
+      mode: mode.value,
+      size: form.size,
+      urls: [],
+      apiName: '',
+      _status: 'queued',
+    })
+    activeHistoryId.value = entry.id
+  }
 
   elapsedTimer = window.setInterval(() => {
     elapsedSeconds.value += 1
@@ -262,10 +373,14 @@ async function submitTask() {
             ...basePayload,
             image: editPayload.image,
             mask: editPayload.mask,
+            composite: editPayload.composite,
             edit_mode: 'mask',
             selection: editPayload.selection,
           })
-        : await generateImages(basePayload)
+        : await generateImages({
+            ...basePayload,
+            ...(referenceImages.value.length ? { reference_images: referenceImages.value } : {}),
+          })
 
     task.value = {
       apiId: result.api_id,
@@ -396,6 +511,19 @@ function deleteHistory(entry) {
   if (activeHistoryId.value === entry.id) activeHistoryId.value = null
 }
 
+// Retry a failed entry with the same params and overwrite it (no new entry).
+// Note: edit-mode retries reuse whatever is currently drawn in the editor.
+function retryHistory(entry) {
+  if (loading.value) {
+    ElMessage.warning('有任务正在进行，请稍候')
+    return
+  }
+  form.prompt = entry.prompt || ''
+  if (entry.size) parseSize(entry.size)
+  if (entry.mode) mode.value = entry.mode
+  submitTask(entry.id)
+}
+
 // ---- draft ----
 function restoreDraft() {
   try {
@@ -444,38 +572,73 @@ onBeforeUnmount(clearTimers)
           @click="clearHistory"
         />
       </div>
+
+      <!-- Search + time filter -->
+      <div v-if="history.length" class="space-y-2 border-b border-[var(--studio-line)] px-3 py-2">
+        <el-input v-model="historyQuery" size="small" clearable placeholder="搜索提示词…" />
+        <div class="flex gap-1">
+          <button
+            v-for="opt in historyTimeOptions"
+            :key="opt.value"
+            type="button"
+            class="flex-1 rounded border px-1 py-1 text-xs font-semibold transition"
+            :class="historyTimeFilter === opt.value
+              ? 'border-[var(--studio-teal)] bg-[var(--studio-teal)] text-white'
+              : 'border-[var(--studio-line)] text-[var(--studio-muted)] hover:border-[var(--studio-teal)]'"
+            @click="historyTimeFilter = opt.value"
+          >
+            {{ opt.label }}
+          </button>
+        </div>
+      </div>
+
       <div class="thin-scrollbar flex-1 overflow-auto">
         <div v-if="!history.length" class="flex min-h-[120px] items-center justify-center px-4 text-xs text-[var(--studio-muted)]">
           暂无历史记录，提交一次生成后出现
         </div>
+        <div v-else-if="!historyItems.length" class="flex min-h-[120px] items-center justify-center px-4 text-center text-xs text-[var(--studio-muted)]">
+          没有匹配的记录
+        </div>
         <div v-else class="flex flex-col">
-          <button
+          <div
             v-for="item in historyItems"
             :key="item.id"
-            type="button"
-            class="group flex items-center gap-3 border-b border-[var(--studio-line)] px-4 py-3 text-left transition hover:bg-[var(--studio-surface-soft)]"
-            @click="recallHistory(item)"
+            class="group flex items-center gap-3 border-b border-[var(--studio-line)] px-4 py-3 transition hover:bg-[var(--studio-surface-soft)]"
           >
-            <span class="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-xs font-bold" :class="historyStatusClass(item)">
-              {{ historyStatusIcon(item) }}
-            </span>
-            <div class="min-w-0 flex-1">
-              <p class="truncate text-sm font-semibold text-[var(--studio-ink)]">{{ historyPreview(item.prompt) }}</p>
-              <div class="mt-0.5 flex items-center gap-2 text-xs text-[var(--studio-muted)]">
-                <span>{{ historyTime(item.time) }}</span>
-                <span>{{ item.mode === 'edit' ? '编辑' : '生成' }}</span>
+            <button type="button" class="flex min-w-0 flex-1 items-center gap-3 text-left" @click="recallHistory(item)">
+              <span class="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-xs font-bold" :class="historyStatusClass(item)">
+                {{ historyStatusIcon(item) }}
+              </span>
+              <div class="min-w-0 flex-1">
+                <p class="truncate text-sm font-semibold text-[var(--studio-ink)]">{{ historyPreview(item.prompt) }}</p>
+                <div class="mt-0.5 flex items-center gap-2 text-xs text-[var(--studio-muted)]">
+                  <span>{{ historyTime(item.time) }}</span>
+                  <span>{{ item.mode === 'edit' ? '编辑' : '生成' }}</span>
+                </div>
               </div>
-            </div>
-            <button
-              type="button"
-              class="shrink-0 opacity-0 transition group-hover:opacity-100"
-              :aria-label="`删除该历史记录`"
-              title="删除"
-              @click.stop="deleteHistory(item)"
-            >
-              <el-icon class="text-sm text-[var(--studio-muted)] hover:text-[var(--studio-coral)]"><Delete /></el-icon>
             </button>
-          </button>
+            <div class="flex shrink-0 items-center gap-1">
+              <button
+                v-if="item._status === 'failed' || item._status === 'timeout'"
+                type="button"
+                class="opacity-0 transition group-hover:opacity-100"
+                title="重新生成并覆盖此记录"
+                aria-label="重新生成并覆盖此记录"
+                @click.stop="retryHistory(item)"
+              >
+                <el-icon class="text-sm text-[var(--studio-muted)] hover:text-[var(--studio-teal)]"><Refresh /></el-icon>
+              </button>
+              <button
+                type="button"
+                class="opacity-0 transition group-hover:opacity-100"
+                aria-label="删除该历史记录"
+                title="删除"
+                @click.stop="deleteHistory(item)"
+              >
+                <el-icon class="text-sm text-[var(--studio-muted)] hover:text-[var(--studio-coral)]"><Delete /></el-icon>
+              </button>
+            </div>
+          </div>
         </div>
       </div>
     </aside>
@@ -512,31 +675,53 @@ onBeforeUnmount(clearTimers)
             </button>
           </div>
 
-          <label class="block">
-            <span class="mb-2 block text-sm font-semibold">Prompt</span>
+          <div class="block">
+            <div class="mb-2 flex items-center justify-between">
+              <span class="text-sm font-semibold">Prompt</span>
+              <button
+                type="button"
+                class="flex items-center gap-1 text-xs text-[var(--studio-muted)] transition hover:text-[var(--studio-teal)]"
+                title="放大编辑"
+                @click="promptZoomOpen = true"
+              >
+                <el-icon><FullScreen /></el-icon>
+                <span>放大</span>
+              </button>
+            </div>
             <el-input
               v-model="form.prompt"
               type="textarea"
               :rows="mode === 'edit' ? 7 : 10"
               resize="none"
-              maxlength="3000"
-              show-word-limit
+              :maxlength="settings.maxPromptChars"
               placeholder="描述要生成或修改的画面…（Ctrl/⌘ + Enter 提交）"
               @keydown.ctrl.enter.prevent="submitTask"
               @keydown.meta.enter.prevent="submitTask"
             />
-          </label>
+            <p class="mt-1 text-right text-xs text-[var(--studio-muted)]">{{ promptChars }} / {{ settings.maxPromptChars }}</p>
+          </div>
 
           <!-- Example prompt library -->
           <div class="mt-2">
-            <button
-              type="button"
-              class="flex items-center gap-1.5 text-xs font-semibold text-[var(--studio-muted)] transition hover:text-[var(--studio-teal)]"
-              @click="promptLibOpen = !promptLibOpen"
-            >
-              <span>{{ promptLibOpen ? '▾' : '▸' }}</span>
-              <span>示例提示词</span>
-            </button>
+            <div class="flex items-center justify-between">
+              <button
+                type="button"
+                class="flex items-center gap-1.5 text-xs font-semibold text-[var(--studio-muted)] transition hover:text-[var(--studio-teal)]"
+                @click="promptLibOpen = !promptLibOpen"
+              >
+                <span>{{ promptLibOpen ? '▾' : '▸' }}</span>
+                <span>示例提示词</span>
+              </button>
+              <button
+                type="button"
+                class="flex items-center gap-1 text-xs font-semibold text-[var(--studio-muted)] transition hover:text-[var(--studio-coral)]"
+                title="随机填入一条示例"
+                @click="randomPrompt"
+              >
+                <el-icon><Refresh /></el-icon>
+                <span>随机</span>
+              </button>
+            </div>
             <div v-if="promptLibOpen" class="mt-2 space-y-3">
               <div v-for="cat in promptCategories" :key="cat.label">
                 <p class="mb-1.5 text-xs font-bold text-[var(--studio-ink)]">{{ cat.label }}</p>
@@ -553,6 +738,43 @@ onBeforeUnmount(clearTimers)
                   </button>
                 </div>
               </div>
+            </div>
+          </div>
+
+          <!-- Reference images (generate mode) -->
+          <div v-if="mode === 'generate'" class="mt-4">
+            <div class="mb-2 flex items-center justify-between">
+              <span class="text-sm font-semibold">参考图（可选）</span>
+              <span class="text-xs text-[var(--studio-muted)]">{{ referenceImages.length }} / {{ settings.maxReferenceImages }}</span>
+            </div>
+            <input ref="refInputRef" class="hidden" type="file" accept="image/*" multiple @change="onRefInput" />
+            <div class="flex flex-wrap gap-2">
+              <div
+                v-for="(ref, i) in referenceImages"
+                :key="i"
+                class="group relative h-16 w-16 overflow-hidden rounded-md border border-[var(--studio-line)]"
+              >
+                <img :src="ref" alt="" class="h-full w-full object-cover" />
+                <button
+                  type="button"
+                  class="absolute right-0.5 top-0.5 flex h-5 w-5 items-center justify-center rounded bg-[rgba(23,33,38,0.75)] text-white opacity-0 transition group-hover:opacity-100"
+                  :aria-label="`移除参考图 ${i + 1}`"
+                  title="移除"
+                  @click="removeReference(i)"
+                >
+                  <el-icon class="text-xs"><Delete /></el-icon>
+                </button>
+              </div>
+              <button
+                v-if="referenceImages.length < settings.maxReferenceImages"
+                type="button"
+                class="flex h-16 w-16 flex-col items-center justify-center gap-0.5 rounded-md border border-dashed border-[var(--studio-line)] text-[var(--studio-muted)] transition hover:border-[var(--studio-teal)] hover:text-[var(--studio-teal)]"
+                title="添加参考图"
+                @click="openRefPicker"
+              >
+                <el-icon><Plus /></el-icon>
+                <span class="text-[10px]">添加</span>
+              </button>
             </div>
           </div>
 
@@ -598,6 +820,15 @@ onBeforeUnmount(clearTimers)
         </form>
 
         <RegionEditor v-show="mode === 'edit'" ref="regionEditorRef" @mask-change="onMaskChange" />
+
+        <!-- Generate-mode tip card fills the column so it aligns with the edit
+             module height instead of leaving a large gap. -->
+        <div v-if="mode === 'generate'" class="studio-panel rounded-lg p-4 text-sm leading-6 text-[var(--studio-muted)]">
+          <p class="mb-1 text-xs font-bold uppercase tracking-[0.16em] text-[var(--studio-amber)]">Tips</p>
+          <p>· 用 <span class="font-semibold text-[var(--studio-ink)]">Ctrl/⌘ + Enter</span> 快速提交。</p>
+          <p>· 切换到「局部编辑」可在原图上直接涂抹/框选修改区域。</p>
+          <p>· 生成的临时链接通常 1 小时内有效，请及时下载保存。</p>
+        </div>
       </div>
 
       <!-- Right column: task monitor + gallery -->
@@ -672,7 +903,7 @@ onBeforeUnmount(clearTimers)
           </div>
 
           <div v-else-if="images.length" class="gallery-grid">
-            <figure v-for="(url, index) in images" :key="url" class="group relative overflow-hidden rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface)]">
+            <figure v-for="(url, index) in images" :key="url" class="group relative overflow-hidden rounded-md border border-[var(--studio-line)] bg-[var(--studio-canvas)]">
               <el-image
                 :src="url"
                 :alt="`生成图片 ${index + 1}`"
@@ -680,12 +911,12 @@ onBeforeUnmount(clearTimers)
                 :initial-index="index"
                 preview-teleported
                 hide-on-click-modal
-                fit="cover"
+                fit="contain"
                 loading="lazy"
-                class="block aspect-square h-full w-full cursor-zoom-in"
+                class="block h-[280px] w-full cursor-zoom-in"
               >
                 <template #error>
-                  <div class="flex aspect-square h-full w-full flex-col items-center justify-center gap-1 bg-[var(--studio-surface-soft)] text-center text-xs text-[var(--studio-muted)]">
+                  <div class="flex h-[280px] w-full flex-col items-center justify-center gap-1 bg-[var(--studio-surface-soft)] text-center text-xs text-[var(--studio-muted)]">
                     <el-icon class="text-2xl"><Picture /></el-icon>
                     <span>图片无法加载</span>
                     <span>（链接可能已过期）</span>
@@ -720,6 +951,22 @@ onBeforeUnmount(clearTimers)
         </div>
       </div>
     </div>
+
+    <!-- Prompt zoom editor -->
+    <el-dialog v-model="promptZoomOpen" title="编辑 Prompt" width="760px" top="8vh">
+      <el-input
+        v-model="form.prompt"
+        type="textarea"
+        :rows="18"
+        resize="none"
+        :maxlength="settings.maxPromptChars"
+        placeholder="描述要生成或修改的画面…"
+      />
+      <p class="mt-1 text-right text-xs text-[var(--studio-muted)]">{{ promptChars }} / {{ settings.maxPromptChars }}</p>
+      <template #footer>
+        <el-button @click="promptZoomOpen = false">完成</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
