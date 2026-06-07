@@ -8,9 +8,20 @@ def create_app() -> Flask:
     app = Flask(__name__)
     CORS(app, resources={r"/api/*": {"origins": "*"}})
 
+    # Cap request bodies so oversized base64 image/mask uploads can't exhaust
+    # memory; edits carry the original image + mask inline.
+    app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
+
     @app.get("/api/health")
     def health_check():
         return jsonify({"ok": True, "service": "gpt-img2-creater-backend"})
+
+    @app.errorhandler(413)
+    def request_too_large(_error):
+        return (
+            jsonify({"success": False, "error": {"message": "上传内容过大（上限 25MB）", "details": {}}}),
+            413,
+        )
 
     _register_blueprints(app)
     return app

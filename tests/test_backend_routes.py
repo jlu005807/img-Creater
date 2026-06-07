@@ -106,6 +106,23 @@ class BackendRouteTests(TestCase):
         final_list_response = self.client.get("/api/configs")
         self.assertEqual([item["id"] for item in final_list_response.get_json()["data"]], [primary["id"]])
 
+    def test_config_list_masks_api_key(self):
+        self.client.post(
+            "/api/configs",
+            json={
+                "name": "Primary",
+                "base_url": "https://api.openai.com",
+                "api_key": "sk-secret-1234",
+                "model": "gpt-image-2",
+                "status": True,
+            },
+        )
+        data = self.client.get("/api/configs").get_json()["data"]
+        self.assertEqual(len(data), 1)
+        self.assertNotIn("api_key", data[0])
+        self.assertEqual(data[0]["api_key_preview"], "••••1234")
+        self.assertTrue(data[0]["has_api_key"])
+
     def test_generation_routes_submit_and_poll_via_image_service(self):
         generate_response = self.client.post(
             "/api/generate",

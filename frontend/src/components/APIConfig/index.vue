@@ -20,6 +20,7 @@ const emptyForm = {
 }
 
 const form = reactive({ ...emptyForm })
+const editingKeyPreview = ref('')
 
 const apiTypeOptions = [
   { value: 'openai', label: 'OpenAI 兼容', hint: '标准 /v1/images 接口（推荐，gpt-image-2 默认）' },
@@ -40,6 +41,7 @@ const endpointHint = computed(() => {
 function resetForm() {
   Object.assign(form, emptyForm)
   editingId.value = null
+  editingKeyPreview.value = ''
 }
 
 async function loadConfigs() {
@@ -54,9 +56,18 @@ async function loadConfigs() {
 }
 
 async function submitForm() {
+  if (!editingId.value && !form.api_key.trim()) {
+    ElMessage.warning('请填写 API Key')
+    return
+  }
   saving.value = true
   try {
     const payload = { ...form }
+    // The real key is never sent back to the browser, so on edit a blank key
+    // means "keep the existing one" — omit it instead of sending an empty value.
+    if (editingId.value && !payload.api_key.trim()) {
+      delete payload.api_key
+    }
     if (editingId.value) {
       const updated = await updateConfig(editingId.value, payload)
       configs.value = configs.value.map((item) => (item.id === updated.id ? updated : item))
@@ -76,10 +87,11 @@ async function submitForm() {
 
 function editConfig(item) {
   editingId.value = item.id
+  editingKeyPreview.value = item.api_key_preview || ''
   Object.assign(form, {
     name: item.name,
     base_url: item.base_url,
-    api_key: item.api_key,
+    api_key: '', // never prefilled — the backend only returns a masked preview
     model: item.model || 'gpt-image-2',
     api_type: item.api_type || 'openai',
     status: Boolean(item.status),
@@ -170,7 +182,14 @@ onMounted(loadConfigs)
           </label>
           <label class="block">
             <span class="mb-1 block text-sm font-semibold">API Key</span>
-            <el-input v-model="form.api_key" show-password placeholder="sk-..." />
+            <el-input
+              v-model="form.api_key"
+              show-password
+              :placeholder="editingId ? '留空表示不修改' : 'sk-...'"
+            />
+            <p v-if="editingId && editingKeyPreview" class="mt-1 text-xs text-[var(--studio-muted)]">
+              当前密钥：{{ editingKeyPreview }}（留空则不修改）
+            </p>
           </label>
           <label class="block">
             <span class="mb-1 block text-sm font-semibold">模型</span>

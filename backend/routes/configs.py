@@ -19,7 +19,8 @@ configs_bp = Blueprint("configs", __name__)
 @configs_bp.get("/")
 def list_configs():
     try:
-        return _success(_config_service().list_configs())
+        configs = _config_service().list_configs()
+        return _success([ConfigService.public_config(item) for item in configs])
     except Exception as exc:
         return _config_error(exc)
 
@@ -30,7 +31,7 @@ def create_config():
     try:
         payload = _json_payload()
         config = _config_service().create_config(payload)
-        return _success(config, status=201)
+        return _success(ConfigService.public_config(config), status=201)
     except Exception as exc:
         return _config_error(exc)
 
@@ -40,7 +41,7 @@ def update_config(config_id: str):
     try:
         payload = _json_payload()
         config = _config_service().update_config(config_id, payload)
-        return _success(config)
+        return _success(ConfigService.public_config(config))
     except Exception as exc:
         return _config_error(exc)
 
@@ -61,7 +62,8 @@ def reorder_configs():
         ordered_ids = payload.get("ordered_ids")
         if not isinstance(ordered_ids, list) or not all(isinstance(item, str) for item in ordered_ids):
             raise ConfigValidationError("ordered_ids 必须是字符串数组")
-        return _success(_config_service().reorder_configs(ordered_ids))
+        configs = _config_service().reorder_configs(ordered_ids)
+        return _success([ConfigService.public_config(item) for item in configs])
     except Exception as exc:
         return _config_error(exc)
 

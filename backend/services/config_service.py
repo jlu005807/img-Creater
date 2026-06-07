@@ -73,6 +73,11 @@ class ConfigService:
             return dict(config)
 
     def update_config(self, config_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(payload or {})
+        # A blank api_key on update means "keep the existing key" — the frontend
+        # never receives the real key back, so it can't resend it.
+        if "api_key" in payload and not str(payload["api_key"]).strip():
+            payload.pop("api_key")
         with self._lock:
             store = self._read_store()
             for index, current in enumerate(store["configs"]):
@@ -112,6 +117,21 @@ class ConfigService:
             store["configs"] = [current_by_id[config_id] for config_id in ordered_ids]
             self._write_store(store)
             return [dict(item) for item in store["configs"]]
+
+    @staticmethod
+    def public_config(config: dict[str, Any]) -> dict[str, Any]:
+        """A config view safe to send to the browser: the real api_key is
+        dropped and replaced by a masked preview (last 4 chars)."""
+        data = {key: value for key, value in config.items() if key != "api_key"}
+        raw_key = str(config.get("api_key") or "")
+        data["has_api_key"] = bool(raw_key)
+        if len(raw_key) >= 4:
+            data["api_key_preview"] = f"••••{raw_key[-4:]}"
+        elif raw_key:
+            data["api_key_preview"] = "••••"
+        else:
+            data["api_key_preview"] = ""
+        return data
 
     @staticmethod
     def is_enabled(config: dict[str, Any]) -> bool:

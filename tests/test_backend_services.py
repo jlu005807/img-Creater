@@ -98,6 +98,29 @@ class ConfigServiceTests(TestCase):
             reloaded = ConfigService(config_path=config_path)
             self.assertEqual([item["id"] for item in reloaded.list_configs()], [second["id"], first["id"]])
 
+    def test_public_config_masks_key_and_blank_update_keeps_key(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            created = service.create_config(
+                {
+                    "name": "Primary",
+                    "base_url": "https://api.openai.com",
+                    "api_key": "sk-secret-1234",
+                    "model": "gpt-image-2",
+                    "status": True,
+                }
+            )
+
+            public = ConfigService.public_config(created)
+            self.assertNotIn("api_key", public)
+            self.assertEqual(public["api_key_preview"], "••••1234")
+            self.assertTrue(public["has_api_key"])
+
+            # A blank api_key on update keeps the existing key.
+            updated = service.update_config(created["id"], {"api_key": "   ", "name": "Renamed"})
+            self.assertEqual(updated["api_key"], "sk-secret-1234")
+            self.assertEqual(updated["name"], "Renamed")
+
 
 class OpenAIProviderTests(TestCase):
     def _config_service(self, tmp_dir, configs):

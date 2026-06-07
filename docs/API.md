@@ -52,6 +52,11 @@ GET /api/configs
 
 返回值为节点数组，数组顺序就是提交任务时的优先级顺序。
 
+> 出于安全考虑，所有返回节点的接口都**不会回传完整 `api_key`**，而是返回掩码字段：
+>
+> - `api_key_preview`: 形如 `••••1234`（末 4 位）
+> - `has_api_key`: 是否已设置密钥
+
 ### 2.2 创建节点
 
 ```http
@@ -97,6 +102,8 @@ Content-Type: application/json
   "status": false
 }
 ```
+
+更新时若 `api_key` 留空（空字符串或纯空格），后端会**保留原有密钥**，因此前端无需也无法拿回完整密钥再回填。
 
 ### 2.4 删除节点
 
@@ -308,6 +315,10 @@ GET /api/status?task_id={task_id}
 
 - 查询或修改了不存在的配置项
 - 轮询时提供了不存在或已过期的 `task_id`
+
+### 413 Payload Too Large
+
+- 请求体超过 `25MB`（局部编辑会内联原图 + 遮罩的 base64，注意原图大小）
 
 ### 502 Bad Gateway
 
