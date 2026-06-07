@@ -241,7 +241,7 @@ onMounted(loadConfigs)
             @dragover.prevent
             @drop="onDrop(index)"
           >
-            <button class="flex h-9 w-9 cursor-grab items-center justify-center rounded-md border border-[var(--studio-line)] text-[var(--studio-muted)]" type="button" title="拖拽排序">
+            <button class="flex h-9 w-9 cursor-grab items-center justify-center rounded-md border border-[var(--studio-line)] text-[var(--studio-muted)]" type="button" title="拖拽排序" aria-label="拖拽排序">
               <el-icon><Rank /></el-icon>
             </button>
 
@@ -257,8 +257,8 @@ onMounted(loadConfigs)
 
             <div class="flex items-center gap-2">
               <el-switch v-model="item.status" :active-icon="SwitchButton" @change="toggleStatus(item)" />
-              <el-button :icon="Edit" circle title="编辑" @click="editConfig(item)" />
-              <el-button :icon="Delete" circle title="删除" type="danger" @click="removeConfig(item)" />
+              <el-button :icon="Edit" circle title="编辑" :aria-label="`编辑节点 ${item.name}`" @click="editConfig(item)" />
+              <el-button :icon="Delete" circle title="删除" type="danger" :aria-label="`删除节点 ${item.name}`" @click="removeConfig(item)" />
             </div>
           </article>
         </div>

@@ -7,12 +7,14 @@
 ## 当前能力
 
 - 文生图：提交 `prompt`、尺寸和生成张数，由后台任务完成生成。
-- 局部编辑：上传原图后，可用矩形框选或画笔涂抹生成 `mask`，再把原图和遮罩提交给 AI 修改。
+- 局部编辑：上传/拖拽原图后，可用矩形框选、画笔涂抹、橡皮擦生成 `mask`，支持撤销（Ctrl+Z）与画笔光标预览。
 - 多接入协议：每个节点可选 **OpenAI 兼容**（标准 `/v1/images` 接口，gpt-image-2 默认）或 **异步中转**（自定义 `/async/images`）。
-- 多 API 节点：支持新增、编辑、删除、启用/禁用和拖拽排序。
+- 多 API 节点：支持新增、编辑、删除、启用/禁用和拖拽排序；返回时 `api_key` 自动脱敏。
 - Fallback 容灾：后台 worker 按节点优先级依次尝试，直到某个节点成功产出图片。
 - 状态轮询：前端每 4 秒轮询一次任务状态，最长轮询 5 分钟。
-- 结果画廊：生成完成后直接展示图片结果，并支持下载。
+- 结果画廊：生成完成后展示结果，支持全屏灯箱预览与可靠的跨域下载。
+- 生成历史：最近记录保存在本地，可复用参数、回看结果（`Ctrl/⌘ + Enter` 快捷提交，输入草稿刷新后保留）。
+- 主题：浅色 / 深色双主题（首启跟随系统，可手动切换并记忆）。
 - PC-only：当前不做移动端适配，页面最小宽度为 `1280px`。
 
 ## 技术栈
@@ -25,6 +27,9 @@
 ## 目录结构
 
 ```text
+install.ps1 / install.sh   # 一键安装脚本
+run.ps1 / run.sh           # 一键运行脚本
+
 backend/
   app.py
   data/configs.json
@@ -34,6 +39,7 @@ backend/
   services/
     config_service.py
     image_service.py
+    task_store.py
 
 frontend/
   src/
@@ -42,12 +48,18 @@ frontend/
       APIConfig/
       Playground/
       RegionEditor/
+    composables/
+      useTheme.js
+      useGenerationHistory.js
+    utils/
+      download.js
     App.vue
     styles.css
 
 docs/
   API.md
   ARCHITECTURE.md
+  ROADMAP.md
 
 tests/
   test_backend_routes.py
@@ -63,7 +75,32 @@ tests/
 
 ## 快速开始
 
-### 1. 安装后端依赖
+### 方式一：一键脚本（推荐）
+
+脚本会检查环境、创建虚拟环境、安装前后端依赖，然后同时启动前后端并自动打开浏览器。
+
+Windows（PowerShell，在项目根目录）：
+
+```powershell
+.\install.ps1   # 一键安装：建 venv + 装后端/前端依赖
+.\run.ps1       # 一键运行：启动 Flask + Vite，并打开 http://127.0.0.1:5173
+```
+
+> 若提示脚本被禁止运行，可先执行：`Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`
+
+Linux / macOS：
+
+```bash
+chmod +x install.sh run.sh   # 首次需要赋予执行权限
+./install.sh                  # 一键安装
+./run.sh                      # 一键运行（Ctrl+C 同时停止前后端）
+```
+
+安装脚本会校验 Python `3.10+` 与 Node.js `18+`，缺失时给出明确提示。
+
+### 方式二：手动步骤
+
+#### 1. 安装后端依赖
 
 如果项目还没有虚拟环境，可以先创建并且激活(linux也类似，但是激活命令不一样)
 
@@ -80,7 +117,7 @@ python -m venv .venv
 python -m pip install -r backend\requirements.txt
 ```
 
-### 2. 启动后端
+#### 2. 启动后端
 
 ```powershell
 python -m backend.app
@@ -91,14 +128,14 @@ python -m backend.app
 - API: `http://127.0.0.1:5000`
 - 健康检查: `http://127.0.0.1:5000/api/health`
 
-### 3. 安装前端依赖
+#### 3. 安装前端依赖
 
 ```powershell
 cd frontend
 npm install
 ```
 
-### 4. 启动前端
+#### 4. 启动前端
 
 ```powershell
 npm run dev

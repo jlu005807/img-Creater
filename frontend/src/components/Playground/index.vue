@@ -22,7 +22,12 @@ const form = reactive({
 const mode = ref('generate')
 const maskState = ref({ hasImage: false, hasMask: false })
 const regionEditorRef = ref(null)
-const sizeOptions = ['1024x1024', '1024x1536', '1536x1024']
+const sizeOptions = [
+  { value: 'auto', label: '自动 (auto)' },
+  { value: '1024x1024', label: '1024 × 1024 · 方形' },
+  { value: '1536x1024', label: '1536 × 1024 · 横向' },
+  { value: '1024x1536', label: '1024 × 1536 · 纵向' },
+]
 
 const loading = ref(false)
 const status = ref('idle')
@@ -357,7 +362,7 @@ onBeforeUnmount(clearTimers)
           <label class="block">
             <span class="mb-2 block text-sm font-semibold">尺寸</span>
             <el-select v-model="form.size" class="w-full">
-              <el-option v-for="size in sizeOptions" :key="size" :label="size" :value="size" />
+              <el-option v-for="size in sizeOptions" :key="size.value" :label="size.label" :value="size.value" />
             </el-select>
           </label>
 
@@ -540,7 +545,7 @@ onBeforeUnmount(clearTimers)
           <div class="mt-3 flex items-center gap-2">
             <el-button size="small" :icon="RefreshLeft" @click="reuseHistory(entry)">复用参数</el-button>
             <el-button size="small" type="primary" :icon="Picture" @click="viewHistory(entry)">查看结果</el-button>
-            <el-button size="small" text type="danger" :icon="Delete" @click="removeEntry(entry.id)" />
+            <el-button size="small" text type="danger" :icon="Delete" aria-label="删除该历史记录" @click="removeEntry(entry.id)" />
           </div>
         </article>
       </div>

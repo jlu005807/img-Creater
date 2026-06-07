@@ -126,6 +126,13 @@ textarea {
   font: inherit;
 }
 
+/* Visible keyboard focus for custom controls (only on keyboard navigation). */
+:where(button, a, [tabindex], summary):focus-visible {
+  outline: 2px solid var(--studio-coral);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
 .studio-panel {
   border: 1px solid var(--studio-panel-border);
   background: var(--studio-panel);
