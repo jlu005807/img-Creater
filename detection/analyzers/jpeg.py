@@ -8,9 +8,10 @@ Signals:
     standard Annex-K table (custom encoders / re-saves drift).
   - Recompression consistency: re-encode at several qualities and look at how
     the error stabilizes. An image already JPEG-compressed shows a
-    characteristic error dip near its original quality; a fresh/PNG image
-    decays smoothly — low "multi-compression" evidence => more AI-like.
+    characteristic error dip near its original quality.
 
+Only runs on JPEG input. For non-JPEG (PNG / lossless) the analyzer emits no
+signal — "no JPEG history" is expected there and is not evidence of AI.
 Needs numpy + Pillow.
 """
 
@@ -48,10 +49,17 @@ def analyze(image_bytes: bytes, cfg: dict[str, Any]) -> dict[str, Any]:
         return {"score": None, "signals": {}, "evidence": [], "error": str(exc)}
 
     signals: dict[str, Any] = {"format": fmt}
-    qtable_score = None
-    if fmt in ("JPEG", "JPG"):
-        qtable_score = _qtable_distance_score(np, img, jcfg)
-        signals["qtable_distance_score"] = None if qtable_score is None else round(qtable_score, 4)
+
+    # JPEG compression-history is only meaningful for an actual JPEG. On a
+    # PNG / lossless-WebP / BMP input the absence of a recompression dip is
+    # expected — it is NOT evidence of AI — so emit no signal (excluded from
+    # fusion) instead of a misleading high score.
+    if fmt not in ("JPEG", "JPG"):
+        signals["skipped"] = "non-jpeg input"
+        return {"score": None, "signals": signals, "evidence": [], "error": None}
+
+    qtable_score = _qtable_distance_score(np, img, jcfg)
+    signals["qtable_distance_score"] = None if qtable_score is None else round(qtable_score, 4)
 
     recompress_evidence = _recompression_consistency(np, Image, rgb, jcfg)
     signals.update(recompress_evidence)
