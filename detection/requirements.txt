@@ -1,0 +1,9 @@
+# Optional dependencies for the AI-image detection module (beta).
+# The main app runs fine without these; the /api/detect endpoint reports
+# "unavailable" until they are installed:
+#   pip install -r detection/requirements.txt
+numpy>=1.24
+scipy>=1.10
+Pillow>=10.0.0
+PyWavelets>=1.4
+invisible-watermark>=0.2.0
