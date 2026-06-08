@@ -27,7 +27,7 @@ function guessExtension(url) {
  * @returns {Promise<boolean>} true if a real download was triggered, false if
  *   it fell back to opening a new tab.
  */
-export async function downloadImage(url, baseName = 'gpt-img2') {
+export async function downloadImage(url, baseName = 'img-Creater') {
   const filename = `${baseName}.${guessExtension(url)}`
 
   if (url.startsWith('data:')) {

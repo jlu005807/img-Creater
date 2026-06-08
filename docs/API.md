@@ -38,7 +38,7 @@ GET /api/health
 ```json
 {
   "ok": true,
-  "service": "gpt-img2-creater-backend"
+  "service": "img-Creater-backend"
 }
 ```
 
@@ -56,6 +56,8 @@ GET /api/configs
 >
 > - `api_key_preview`: 形如 `••••1234`（末 4 位）
 > - `has_api_key`: 是否已设置密钥
+>
+> 完整 Key 只在用户查看或编辑节点时通过 `GET /api/configs/{id}/secret` 临时读取。
 
 ### 2.2 创建节点
 
@@ -83,7 +85,7 @@ Content-Type: application/json
 - `base_url`: 上游服务根地址，必须以 `http://` 或 `https://` 开头
 - `api_key`: 节点访问密钥
 - `model`: 默认模型名
-- `api_type`: 接入协议，`openai`（OpenAI 兼容，默认）或 `async`（自定义异步中转）
+- `api_type`: 接入协议，`openai`（OpenAI 兼容，默认）/ `chat` / `custom` / `async`
 - `status`: 是否启用
 
 成功时返回 `201 Created`。
@@ -143,6 +145,23 @@ Content-Type: application/json
 - `ordered_ids` 必须完整覆盖当前全部配置 ID
 - 顺序会被持久化到 `backend/data/configs.json`
 - 后端提交任务时会按这个顺序依次尝试
+
+### 2.6 查看节点 API Key
+
+```http
+GET /api/configs/{id}/secret
+```
+
+返回：
+
+```json
+{
+  "id": "config-id",
+  "api_key": "sk-xxx"
+}
+```
+
+前端只在用户选中节点或点击显示按钮时调用该接口；列表接口不会返回明文 Key。
 
 ## 3. 文生图
 
@@ -295,9 +314,40 @@ GET /api/status?task_id={task_id}
 - `api_id`/`api_name` 表示 worker 最终命中（或正在尝试）的节点，可能为 `null`（任务刚入队时）。
 - `attempts` 记录每个被尝试节点是否成功，便于排查容灾路径。
 - `urls` 只在 `completed` 时有意义；OpenAI 兼容节点通常是 `data:` URL，异步中转节点通常是远程 URL。
+- `max_wait_seconds` 表示前端本次轮询可等待的秒数，来自当前节点或模式的 `timeout_seconds`。
 - 任务不存在或已过期返回 `404`。
 
-## 6. 常见错误
+## 6. 会话、草稿与作品集
+
+### 6.1 查询已完成会话
+
+```http
+GET /api/sessions
+```
+
+读取后端 `history/<会话ID>/session.json`，返回所有已完成且有图片的会话。作品集页面使用该接口渲染照片墙。
+
+### 6.2 局部编辑草稿
+
+```http
+GET /api/edit-drafts/{history_id}
+PUT /api/edit-drafts/{history_id}
+```
+
+草稿保存到对应会话目录下的 `edit-draft.json`，包含上传原图、蒙版、工具状态和画笔参数。切回局部编辑历史节点时前端会恢复这些痕迹。
+
+### 6.3 提示词模板
+
+```http
+GET    /api/prompt-templates
+POST   /api/prompt-templates
+PUT    /api/prompt-templates/{id}
+DELETE /api/prompt-templates/{id}
+```
+
+提示词模板保存到 `backend/data/prompt_templates.json`。前端「示例」按钮会从该模板列表随机选择一条；当前输入非空时会确认是否覆盖。
+
+## 7. 常见错误
 
 ### 400 Bad Request
 
@@ -329,9 +379,9 @@ GET /api/status?task_id={task_id}
 - 上游返回了非 JSON 响应
 - 上游返回了 4xx/5xx，或响应缺少图片数据（OpenAI 的 `data[].b64_json`/`url`，或异步中转的 `task_id`）
 
-## 7. 上游图片服务契约
+## 8. 上游图片服务契约
 
-### 7.1 OpenAI 兼容（`api_type = openai`，默认）
+### 8.1 OpenAI 兼容（`api_type = openai`，默认）
 
 ```text
 POST {base_url}/v1/images/generations   # JSON
@@ -362,7 +412,7 @@ POST {base_url}/v1/images/edits         # multipart/form-data
 
 后端会把 `b64_json` 转成 `data:image/...;base64,...`，或直接透传 `url`。
 
-### 7.2 自定义异步中转（`api_type = async`）
+### 8.2 自定义异步中转（`api_type = async`）
 
 ```text
 POST {base_url}/async/images

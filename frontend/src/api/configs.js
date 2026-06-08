@@ -12,6 +12,10 @@ export function updateConfig(id, payload) {
   return apiClient.put(`/configs/${id}`, payload)
 }
 
+export function getConfigSecret(id) {
+  return apiClient.get(`/configs/${id}/secret`)
+}
+
 export function deleteConfig(id) {
   return apiClient.delete(`/configs/${id}`)
 }
@@ -19,4 +23,3 @@ export function deleteConfig(id) {
 export function reorderConfigs(orderedIds) {
   return apiClient.post('/configs/reorder', { ordered_ids: orderedIds })
 }
-

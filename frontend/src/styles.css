@@ -145,9 +145,8 @@ textarea {
 }
 
 .gallery-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
-  gap: 18px;
+  display: block;
+  width: 100%;
 }
 
 .el-button {

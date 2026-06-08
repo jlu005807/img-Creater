@@ -16,3 +16,7 @@ frontend-smoke*.png
 # A template (configs.example.json) is committed; the backend auto-creates
 # backend/data/configs.json on first run.
 backend/data/configs.json
+
+# Local generated images and per-session artifacts.
+history/
+backend/data/results/

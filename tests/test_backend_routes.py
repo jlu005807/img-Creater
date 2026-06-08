@@ -10,10 +10,18 @@ class FakeImageService:
     def __init__(self):
         self.submit_calls = []
         self.status_calls = []
+        self.result_dir = None
 
-    def submit_generation(self, prompt, size="1024x1024", n=1, quality=None, reference_images=None):
+    def submit_generation(self, prompt, size="1024x1024", n=1, quality=None, reference_images=None, history_id=None):
         self.submit_calls.append(
-            {"prompt": prompt, "size": size, "n": n, "quality": quality, "reference_images": reference_images}
+            {
+                "prompt": prompt,
+                "size": size,
+                "n": n,
+                "quality": quality,
+                "reference_images": reference_images,
+                "history_id": history_id,
+            }
         )
         return {"task_id": "task-123", "status": "queued", "operation": "generate"}
 
@@ -28,6 +36,7 @@ class FakeImageService:
         selection=None,
         quality=None,
         composite=None,
+        history_id=None,
     ):
         self.submit_calls.append(
             {
@@ -40,6 +49,7 @@ class FakeImageService:
                 "selection": selection,
                 "quality": quality,
                 "composite": composite,
+                "history_id": history_id,
             }
         )
         return {"task_id": "edit-task-123", "status": "queued", "operation": "edit"}
@@ -135,6 +145,23 @@ class BackendRouteTests(TestCase):
         self.assertEqual(data[0]["api_key_preview"], "••••1234")
         self.assertTrue(data[0]["has_api_key"])
 
+    def test_config_secret_route_returns_raw_key(self):
+        created = self.client.post(
+            "/api/configs",
+            json={
+                "name": "Primary",
+                "base_url": "https://api.openai.com",
+                "api_key": "sk-secret-1234",
+                "model": "gpt-image-2",
+                "status": True,
+            },
+        ).get_json()["data"]
+
+        secret = self.client.get(f"/api/configs/{created['id']}/secret")
+
+        self.assertEqual(secret.status_code, 200)
+        self.assertEqual(secret.get_json()["data"]["api_key"], "sk-secret-1234")
+
     def test_generation_routes_submit_and_poll_via_image_service(self):
         generate_response = self.client.post(
             "/api/generate",
@@ -144,7 +171,16 @@ class BackendRouteTests(TestCase):
         self.assertEqual(generate_response.get_json()["data"]["task_id"], "task-123")
         self.assertEqual(
             self.image_service.submit_calls,
-            [{"prompt": "a red house", "size": "1024x1024", "n": 1, "quality": None, "reference_images": None}],
+            [
+                {
+                    "prompt": "a red house",
+                    "size": "1024x1024",
+                    "n": 1,
+                    "quality": None,
+                    "reference_images": None,
+                    "history_id": None,
+                }
+            ],
         )
 
         status_response = self.client.get("/api/status", query_string={"api_id": "api-1", "task_id": "task-123"})
@@ -180,8 +216,114 @@ class BackendRouteTests(TestCase):
                 "selection": {"type": "rect", "bbox": {"x": 8, "y": 9, "width": 100, "height": 120}},
                 "quality": None,
                 "composite": None,
+                "history_id": None,
             },
         )
+
+    def test_edit_draft_routes_persist_and_read_history_draft(self):
+        self.image_service.result_dir = Path(self.tmp_dir.name) / "history"
+        draft = {
+            "fileName": "source.png",
+            "image": "data:image/png;base64,aW1hZ2U=",
+            "mask": "data:image/png;base64,bWFzaw==",
+            "tool": "rect",
+            "brushSize": 42,
+        }
+
+        save_response = self.client.put("/api/edit-drafts/history-1", json=draft)
+
+        self.assertEqual(save_response.status_code, 200)
+        self.assertEqual(save_response.get_json()["data"]["history_id"], "history-1")
+        draft_path = self.image_service.result_dir / "history-1" / "edit-draft.json"
+        self.assertTrue(draft_path.exists())
+
+        read_response = self.client.get("/api/edit-drafts/history-1")
+
+        self.assertEqual(read_response.status_code, 200)
+        self.assertEqual(read_response.get_json()["data"], draft)
+
+    def test_missing_edit_draft_returns_null(self):
+        self.image_service.result_dir = Path(self.tmp_dir.name) / "history"
+
+        response = self.client.get("/api/edit-drafts/missing")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.get_json()["data"])
+
+    def test_prompt_template_routes_persist_update_and_delete_templates(self):
+        templates_path = Path(self.tmp_dir.name) / "prompt_templates.json"
+        self.app.config["PROMPT_TEMPLATE_PATH"] = templates_path
+
+        create_response = self.client.post(
+            "/api/prompt-templates",
+            json={"title": "Product", "text": "clean product photo"},
+        )
+
+        self.assertEqual(create_response.status_code, 201)
+        created = create_response.get_json()["data"]
+        self.assertEqual(created["title"], "Product")
+        self.assertEqual(created["text"], "clean product photo")
+        self.assertTrue(templates_path.exists())
+
+        list_response = self.client.get("/api/prompt-templates")
+        self.assertEqual(list_response.status_code, 200)
+        listed = list_response.get_json()["data"]
+        self.assertEqual(listed[0]["id"], created["id"])
+
+        update_response = self.client.put(
+            f"/api/prompt-templates/{created['id']}",
+            json={"title": "Updated", "text": "updated prompt"},
+        )
+        self.assertEqual(update_response.status_code, 200)
+        self.assertEqual(update_response.get_json()["data"]["title"], "Updated")
+
+        delete_response = self.client.delete(f"/api/prompt-templates/{created['id']}")
+        self.assertEqual(delete_response.status_code, 200)
+        final_list = self.client.get("/api/prompt-templates").get_json()["data"]
+        self.assertNotIn(created["id"], [item["id"] for item in final_list])
+
+    def test_sessions_route_lists_persisted_completed_images(self):
+        result_dir = Path(self.tmp_dir.name) / "history"
+        self.image_service.result_dir = result_dir
+        session_dir = result_dir / "history-1"
+        session_dir.mkdir(parents=True)
+        (session_dir / "image.png").write_bytes(b"image")
+        (session_dir / "session.json").write_text(
+            (
+                '{"id":"history-1","prompt":"a red house","mode":"generate",'
+                '"size":"1024x1024","status":"completed","urls":["/api/results/history-1/image.png"],'
+                '"created_at":"2026-06-08T00:00:00Z","updated_at":"2026-06-08T00:00:01Z"}'
+            ),
+            encoding="utf-8",
+        )
+
+        response = self.client.get("/api/sessions")
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()["data"]
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["id"], "history-1")
+        self.assertEqual(data[0]["images"][0]["url"], "/api/results/history-1/image.png")
+        self.assertEqual(data[0]["prompt"], "a red house")
+
+    def test_delete_session_routes_remove_persisted_history_dirs(self):
+        result_dir = Path(self.tmp_dir.name) / "history"
+        self.image_service.result_dir = result_dir
+        for name in ["history-1", "history-2"]:
+            session_dir = result_dir / name
+            session_dir.mkdir(parents=True)
+            (session_dir / "session.json").write_text('{"status":"completed","urls":["/x.png"]}', encoding="utf-8")
+
+        single_response = self.client.delete("/api/sessions/history-1")
+
+        self.assertEqual(single_response.status_code, 200)
+        self.assertFalse((result_dir / "history-1").exists())
+        self.assertTrue((result_dir / "history-2").exists())
+
+        all_response = self.client.delete("/api/sessions")
+
+        self.assertEqual(all_response.status_code, 200)
+        self.assertFalse((result_dir / "history-2").exists())
 
 
 if __name__ == "__main__":

@@ -16,3 +16,23 @@ export function getGenerationStatus({ apiId, taskId }) {
     },
   })
 }
+
+export function saveEditDraft(historyId, payload) {
+  return apiClient.put(`/edit-drafts/${historyId}`, payload)
+}
+
+export function getEditDraft(historyId) {
+  return apiClient.get(`/edit-drafts/${historyId}`)
+}
+
+export function listSessions() {
+  return apiClient.get('/sessions')
+}
+
+export function deleteSession(historyId) {
+  return apiClient.delete(`/sessions/${historyId}`)
+}
+
+export function deleteSessions() {
+  return apiClient.delete('/sessions')
+}

@@ -1,25 +1,46 @@
 <script setup>
 import { computed, onMounted, reactive, ref } from 'vue'
-import { Delete, Edit, Plus, Rank, Refresh, SwitchButton } from '@element-plus/icons-vue'
+import { Delete, Edit, Hide, Plus, Rank, Refresh, SwitchButton, View } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { createConfig, deleteConfig, listConfigs, reorderConfigs, updateConfig } from '../../api/configs'
+import { createConfig, deleteConfig, getConfigSecret, listConfigs, reorderConfigs, updateConfig } from '../../api/configs'
 
 const configs = ref([])
 const loading = ref(false)
 const saving = ref(false)
 const dragIndex = ref(null)
 const editingId = ref(null)
+const secretLoadingId = ref(null)
+const editingSecretVisible = ref(false)
+const revealedKeys = reactive({})
 
-const emptyForm = {
-  name: '',
-  base_url: '',
-  api_key: '',
-  model: 'gpt-image-2',
-  api_type: 'openai',
-  status: true,
+function createMode() {
+  return {
+    name: '',
+    api_type: 'openai',
+    base_url: '',
+    model: '',
+    timeout_seconds: null,
+    retry_count: null,
+  }
 }
 
-const form = reactive({ ...emptyForm })
+function newEmptyForm() {
+  return {
+    name: '',
+    base_url: '',
+    api_key: '',
+    model: 'gpt-image-2',
+    api_type: 'openai',
+    status: true,
+    auto_mode: true,
+    internal_auto_mode: false,
+    timeout_seconds: 30,
+    retry_count: 0,
+    modes: [],
+  }
+}
+
+const form = reactive(newEmptyForm())
 const editingKeyPreview = ref('')
 
 const apiTypeOptions = [
@@ -48,9 +69,10 @@ const endpointHint = computed(() => {
 })
 
 function resetForm() {
-  Object.assign(form, emptyForm)
+  Object.assign(form, newEmptyForm())
   editingId.value = null
   editingKeyPreview.value = ''
+  editingSecretVisible.value = false
 }
 
 async function loadConfigs() {
@@ -71,7 +93,7 @@ async function submitForm() {
   }
   saving.value = true
   try {
-    const payload = { ...form }
+    const payload = buildPayload()
     // The real key is never sent back to the browser, so on edit a blank key
     // means "keep the existing one" — omit it instead of sending an empty value.
     if (editingId.value && !payload.api_key.trim()) {
@@ -80,6 +102,7 @@ async function submitForm() {
     if (editingId.value) {
       const updated = await updateConfig(editingId.value, payload)
       configs.value = configs.value.map((item) => (item.id === updated.id ? updated : item))
+      delete revealedKeys[updated.id]
       ElMessage.success('配置已更新')
     } else {
       const created = await createConfig(payload)
@@ -94,9 +117,38 @@ async function submitForm() {
   }
 }
 
+function buildPayload() {
+  return {
+    name: form.name,
+    base_url: form.base_url,
+    api_key: form.api_key,
+    model: form.model,
+    api_type: form.api_type,
+    status: form.status,
+    auto_mode: form.auto_mode,
+    internal_auto_mode: form.internal_auto_mode,
+    timeout_seconds: form.timeout_seconds,
+    retry_count: form.retry_count,
+    modes: form.internal_auto_mode
+      ? form.modes.map((mode, index) => {
+          const item = {
+            name: mode.name?.trim() || `mode-${index + 1}`,
+            api_type: mode.api_type || form.api_type,
+          }
+          if (mode.base_url?.trim()) item.base_url = mode.base_url.trim()
+          if (mode.model?.trim()) item.model = mode.model.trim()
+          if (mode.timeout_seconds !== null && mode.timeout_seconds !== '') item.timeout_seconds = mode.timeout_seconds
+          if (mode.retry_count !== null && mode.retry_count !== '') item.retry_count = mode.retry_count
+          return item
+        })
+      : [],
+  }
+}
+
 function editConfig(item) {
   editingId.value = item.id
   editingKeyPreview.value = item.api_key_preview || ''
+  editingSecretVisible.value = false
   Object.assign(form, {
     name: item.name,
     base_url: item.base_url,
@@ -104,7 +156,86 @@ function editConfig(item) {
     model: item.model || 'gpt-image-2',
     api_type: item.api_type || 'openai',
     status: Boolean(item.status),
+    auto_mode: item.auto_mode !== false,
+    internal_auto_mode: Boolean(item.internal_auto_mode),
+    timeout_seconds: item.timeout_seconds || 30,
+    retry_count: item.retry_count || 0,
+    modes: Array.isArray(item.modes) ? item.modes.map((mode) => ({ ...createMode(), ...mode })) : [],
   })
+}
+
+async function selectConfig(item) {
+  if (editingId.value === item.id) {
+    resetForm()
+    return
+  }
+  editConfig(item)
+  await loadEditingKey({ visible: false })
+}
+
+function addMode() {
+  form.modes.push({ ...createMode(), api_type: form.api_type })
+}
+
+function removeMode(index) {
+  form.modes.splice(index, 1)
+}
+
+async function recoverMissingConfig(itemId) {
+  delete revealedKeys[itemId]
+  if (editingId.value === itemId) resetForm()
+  ElMessage.warning('该 API 节点不存在或服务未刷新，已重新加载节点列表')
+  await loadConfigs()
+}
+
+async function toggleSecret(item) {
+  if (revealedKeys[item.id]) {
+    delete revealedKeys[item.id]
+    return
+  }
+  secretLoadingId.value = item.id
+  try {
+    const secret = await getConfigSecret(item.id)
+    revealedKeys[item.id] = secret.api_key || ''
+  } catch (error) {
+    if (error.status === 404) {
+      await recoverMissingConfig(item.id)
+      return
+    }
+    ElMessage.error(error.message || '读取 API Key 失败')
+  } finally {
+    secretLoadingId.value = null
+  }
+}
+
+async function loadEditingKey({ visible }) {
+  if (!editingId.value) return
+  secretLoadingId.value = editingId.value
+  try {
+    const secret = await getConfigSecret(editingId.value)
+    form.api_key = secret.api_key || ''
+    editingSecretVisible.value = visible
+  } catch (error) {
+    if (error.status === 404) {
+      await recoverMissingConfig(editingId.value)
+      return
+    }
+    ElMessage.error(error.message || '读取 API Key 失败')
+  } finally {
+    secretLoadingId.value = null
+  }
+}
+
+async function revealEditingKey() {
+  if (form.api_key) {
+    editingSecretVisible.value = true
+    return
+  }
+  await loadEditingKey({ visible: true })
+}
+
+function hideEditingKey() {
+  editingSecretVisible.value = false
 }
 
 async function removeConfig(item) {
@@ -191,14 +322,38 @@ onMounted(loadConfigs)
           </label>
           <label class="block">
             <span class="mb-1 block text-sm font-semibold">API Key</span>
+            <template v-if="editingId">
+              <div class="rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface-soft)] p-3">
+                <div class="flex items-center justify-between gap-3">
+                  <div class="min-w-0">
+                    <p class="text-xs text-[var(--studio-muted)]">当前 Key</p>
+                    <p class="mt-1 truncate text-sm font-semibold text-[var(--studio-ink)]">
+                      {{ editingSecretVisible ? form.api_key : editingKeyPreview || '********' }}
+                    </p>
+                  </div>
+                  <el-button
+                    :icon="editingSecretVisible ? Hide : View"
+                    :loading="secretLoadingId === editingId"
+                    @click="editingSecretVisible ? hideEditingKey() : revealEditingKey()"
+                    circle
+                    :title="editingSecretVisible ? '隐藏 Key' : '显示 Key'"
+                    :aria-label="editingSecretVisible ? '隐藏 API Key' : '显示 API Key'"
+                  />
+                </div>
+                <el-input
+                  v-model="form.api_key"
+                  class="mt-3"
+                  :type="editingSecretVisible ? 'text' : 'password'"
+                  placeholder="输入新的 API Key；留空保存则不修改"
+                />
+              </div>
+            </template>
             <el-input
+              v-else
               v-model="form.api_key"
               show-password
-              :placeholder="editingId ? '留空表示不修改' : 'sk-...'"
+              placeholder="sk-..."
             />
-            <p v-if="editingId && editingKeyPreview" class="mt-1 text-xs text-[var(--studio-muted)]">
-              当前密钥：{{ editingKeyPreview }}（留空则不修改）
-            </p>
           </label>
           <label class="block">
             <span class="mb-1 block text-sm font-semibold">模型</span>
@@ -218,10 +373,55 @@ onMounted(loadConfigs)
             <span class="text-sm font-semibold">启用节点</span>
             <el-switch v-model="form.status" />
           </div>
+          <div class="flex items-center justify-between rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface-soft)] px-3 py-2">
+            <div>
+              <span class="text-sm font-semibold">自动模式</span>
+              <p class="text-xs text-[var(--studio-muted)]">失败后按优先级继续尝试后续节点</p>
+            </div>
+            <el-switch v-model="form.auto_mode" />
+          </div>
+          <div class="grid grid-cols-2 gap-3">
+            <label class="block">
+              <span class="mb-1 block text-sm font-semibold">超时时间（秒）</span>
+              <el-input-number v-model="form.timeout_seconds" :min="1" :step="1" step-strictly controls-position="right" class="w-full" />
+            </label>
+            <label class="block">
+              <span class="mb-1 block text-sm font-semibold">重试次数</span>
+              <el-input-number v-model="form.retry_count" :min="0" :step="1" controls-position="right" class="w-full" />
+            </label>
+          </div>
+          <div class="rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface-soft)] p-3">
+            <div class="flex items-center justify-between gap-3">
+              <div>
+                <span class="text-sm font-semibold">节点内部自动模式</span>
+                <p class="text-xs text-[var(--studio-muted)]">按下方模式顺序依次尝试，单个模式失败后再切换下一个。</p>
+              </div>
+              <el-switch v-model="form.internal_auto_mode" />
+            </div>
+
+            <div v-if="form.internal_auto_mode" class="mt-3 space-y-3">
+              <div
+                v-for="(modeItem, index) in form.modes"
+                :key="index"
+                class="grid grid-cols-[minmax(0,1fr)_110px_88px_88px_auto] gap-2 rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface)] p-2"
+              >
+                <el-input v-model="modeItem.name" placeholder="模式名" />
+                <el-select v-model="modeItem.api_type">
+                  <el-option v-for="opt in apiTypeOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
+                </el-select>
+                <el-input-number v-model="modeItem.timeout_seconds" :min="1" :step="1" step-strictly controls-position="right" placeholder="继承" />
+                <el-input-number v-model="modeItem.retry_count" :min="0" :step="1" controls-position="right" placeholder="继承" />
+                <el-button :icon="Delete" title="删除模式" @click="removeMode(index)" />
+                <el-input v-model="modeItem.base_url" class="col-span-2" placeholder="Base URL，留空继承节点" />
+                <el-input v-model="modeItem.model" class="col-span-3" placeholder="模型，留空继承节点" />
+              </div>
+              <el-button text type="primary" :icon="Plus" @click="addMode">添加请求模式</el-button>
+            </div>
+          </div>
         </div>
 
         <el-button class="mt-5 w-full" type="primary" native-type="submit" :loading="saving" :icon="editingId ? Edit : Plus">
-          {{ editingId ? '保存修改' : '添加节点' }}
+          保存节点
         </el-button>
       </form>
 
@@ -240,12 +440,14 @@ onMounted(loadConfigs)
           暂无 API 节点
         </div>
 
-        <div v-else class="thin-scrollbar grid max-h-[620px] grid-cols-1 gap-3 overflow-auto pr-1 xl:grid-cols-2">
+        <div v-else class="thin-scrollbar flex max-h-[620px] flex-col gap-2 overflow-auto pr-1">
           <article
             v-for="(item, index) in configs"
             :key="item.id"
             draggable="true"
-            class="grid grid-cols-[36px_minmax(0,1fr)_auto] gap-3 rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface)] p-3 transition hover:border-[var(--studio-teal)]"
+            class="grid cursor-pointer grid-cols-[36px_minmax(0,1fr)_auto] gap-3 rounded-md border bg-[var(--studio-surface)] p-3 transition hover:border-[var(--studio-teal)]"
+            :class="editingId === item.id ? 'border-[var(--studio-teal)] ring-1 ring-[var(--studio-teal)]' : 'border-[var(--studio-line)]'"
+            @click="selectConfig(item)"
             @dragstart="onDragStart(index)"
             @dragover.prevent
             @drop="onDrop(index)"
@@ -261,12 +463,26 @@ onMounted(loadConfigs)
                 <span class="text-xs font-semibold text-[var(--studio-amber)]">#{{ index + 1 }}</span>
               </div>
               <p class="mt-1 truncate text-sm text-[var(--studio-muted)]">{{ item.base_url }}</p>
+              <p class="mt-1 flex items-center gap-2 text-xs text-[var(--studio-muted)]">
+                <span>Key {{ revealedKeys[item.id] || item.api_key_preview || '********' }}</span>
+                <span v-if="item.internal_auto_mode">内部模式 {{ item.modes?.length || 0 }}</span>
+              </p>
               <p class="mt-1 text-xs text-[var(--studio-muted)]">{{ item.model }} · {{ apiTypeLabel(item.api_type) }}</p>
+              <p class="mt-1 text-xs text-[var(--studio-muted)]">
+                {{ item.auto_mode === false ? '单节点' : '自动容错' }} · {{ item.timeout_seconds || 30 }}s · 重试 {{ item.retry_count || 0 }}
+              </p>
             </div>
 
-            <div class="flex items-center gap-2">
+            <div class="flex items-center gap-2" @click.stop>
               <el-switch v-model="item.status" :active-icon="SwitchButton" @change="toggleStatus(item)" />
-              <el-button :icon="Edit" circle title="编辑" :aria-label="`编辑节点 ${item.name}`" @click="editConfig(item)" />
+              <el-button
+                :icon="revealedKeys[item.id] ? Hide : View"
+                circle
+                title="显示或隐藏 Key"
+                :loading="secretLoadingId === item.id"
+                @click="toggleSecret(item)"
+              />
+              <el-button :icon="Edit" circle title="编辑" :aria-label="`编辑节点 ${item.name}`" @click="selectConfig(item)" />
               <el-button :icon="Delete" circle title="删除" type="danger" :aria-label="`删除节点 ${item.name}`" @click="removeConfig(item)" />
             </div>
           </article>

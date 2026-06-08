@@ -1,6 +1,6 @@
 # 优化路线图（UI / 正确性 / 安全 / 体验）
 
-本文件记录对 `GPT Img2 Creater` 的分阶段优化计划。每个阶段都是一次独立、可验证、可回滚的提交。
+本文件记录对 `img-Creater` 的分阶段优化计划。每个阶段都是一次独立、可验证、可回滚的提交。
 设计灵感参考两个开源项目：
 
 - **CookSleep/gpt_image_playground**（React + Vite + Tailwind + Zustand）：本地生成历史（瀑布流 + 状态筛选 + 全屏预览 + 快速下载）、灯箱滑动切换、参考图拖拽上传、尺寸预设并自动对齐到 16 的倍数、"提交后清空/重启后保留输入"等习惯设置、蒙版编辑器自动预处理到分辨率上限。
@@ -73,7 +73,7 @@
 
 1. **蒙版对齐**：内部维护一张与原图**原生分辨率**一致的 mask 画布（而非展示画布）。绘制时把展示画布坐标按 `imageBox` 映射回原图像素坐标再落笔；`exportPayload` 导出原图尺寸的 mask，`selection.bbox` 用原图坐标。展示画布只做可视化叠加。
 2. **橡皮擦**：工具增加 `eraser`，用 `globalCompositeOperation = 'destination-out'` 擦除 mask；与 brush 共用画笔大小。
-3. **撤销栈**：每次落笔/框选/擦除前快照 mask 画布（`getImageData` 或离屏 canvas），支持 Ctrl+Z 撤销，限制栈深度（如 20）。
+3. **撤销栈**：每次落笔/框选/擦除前快照 mask 画布（`getImageData` 或离屏 canvas），支持按钮撤销，限制栈深度（如 20）。当前版本会拦截局部编辑区域的 Ctrl/⌘+Z，避免触发浏览器默认撤回。
 4. **画笔光标预览**：在展示画布上跟随指针绘制一个表示画笔半径的圆环。
 5. **拖拽上传**：画布支持把图片文件拖入加载（参考 gpt_image_playground 参考图拖拽）。
 6. 主题联动：监听主题变化重绘画布（阶段一已让 `drawScene` 读 CSS 变量，这里补一个 watch 触发重绘）。
@@ -112,12 +112,12 @@
 
 1. **生成历史**（localStorage）：新增 `composables/useGenerationHistory.js`，记录最近 N 条（prompt、mode、size、n、urls、节点、时间戳）；Playground 增加历史条/抽屉，点击可回看结果并回填 prompt/参数（参考 gpt_image_playground 历史 + 复用任务配置、AIWatch 提示词历史去重时间倒序）。
 2. **重启保留输入**：表单（prompt/size/n/mode）持久化到 localStorage，刷新后恢复（习惯设置可选）。
-3. **快捷键**：Ctrl/⌘+Enter 提交当前任务。
+3. **快捷键**：早期版本支持 Ctrl/⌘+Enter 提交；当前版本已移除该快捷提交，只通过按钮提交任务。
 4. **空节点引导**：当没有启用节点时，结果区/提交处显示行内 CTA "请先到『设置』添加并启用一个 API 节点"，点击切到设置，而不是抛原始错误。
 
 **涉及文件**：`src/composables/useGenerationHistory.js`（新增）、`src/components/Playground/index.vue`、`src/App.vue`（标签切换联动）
 
-**验收标准**：历史可记录/回看/复用；刷新后输入恢复；快捷键可提交；无节点时给出引导而非裸错误；`npm run build` 通过。
+**验收标准**：历史可记录/回看/复用；刷新后输入恢复；无节点时给出引导而非裸错误；`npm run build` 通过。
 
 ---
 

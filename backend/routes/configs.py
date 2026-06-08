@@ -46,6 +46,14 @@ def update_config(config_id: str):
         return _config_error(exc)
 
 
+@configs_bp.get("/<config_id>/secret")
+def get_config_secret(config_id: str):
+    try:
+        return _success(_config_service().get_secret(config_id))
+    except Exception as exc:
+        return _config_error(exc)
+
+
 @configs_bp.delete("/<config_id>")
 def delete_config(config_id: str):
     try:
@@ -101,4 +109,3 @@ def _config_error(exc: Exception):
 
 def _error(message: str, status: int, details: dict[str, Any] | None = None):
     return jsonify({"success": False, "error": {"message": message, "details": details or {}}}), status
-

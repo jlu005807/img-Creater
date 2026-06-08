@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import threading
 import time
+import uuid
+from pathlib import Path
 from typing import Any
 
 from .config_service import ConfigService, DEFAULT_MODEL
@@ -11,6 +14,7 @@ from .task_store import TaskStore, task_store as default_task_store
 
 
 _VALID_QUALITY = {"auto", "low", "medium", "high"}
+DEFAULT_RESULT_DIR = Path(__file__).resolve().parents[2] / "history"
 
 
 class ImageServiceError(Exception):
@@ -62,6 +66,8 @@ class ImageService:
         async_max_wait: int = 300,
         store: TaskStore | None = None,
         run_async: bool = True,
+        result_dir: str | Path | None = DEFAULT_RESULT_DIR,
+        persist_results: bool = True,
     ):
         self.config_service = config_service or ConfigService()
         if http_client is None:
@@ -76,6 +82,8 @@ class ImageService:
         self.store = store or default_task_store
         # When False the worker runs inline (used by tests for determinism).
         self.run_async = run_async
+        self.persist_results = persist_results
+        self.result_dir = Path(result_dir) if result_dir is not None else DEFAULT_RESULT_DIR
 
     # ------------------------------------------------------------------ submit
 
@@ -86,12 +94,16 @@ class ImageService:
         n: int = 1,
         quality: str | None = None,
         reference_images: list[str] | None = None,
+        history_id: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "prompt": self._normalize_prompt(prompt),
             "size": self._normalize_size(size),
             "n": self._normalize_image_count(n),
         }
+        normalized_history_id = self._normalize_history_id(history_id)
+        if normalized_history_id:
+            payload["history_id"] = normalized_history_id
         quality = self._normalize_quality(quality)
         if quality:
             payload["quality"] = quality
@@ -111,6 +123,7 @@ class ImageService:
         selection: dict[str, Any] | None = None,
         quality: str | None = None,
         composite: str | None = None,
+        history_id: str | None = None,
     ) -> dict[str, Any]:
         edit_mode = str(edit_mode or "mask").strip() or "mask"
         if edit_mode not in {"mask", "selection"}:
@@ -126,6 +139,9 @@ class ImageService:
             "mask": self._normalize_image_data_url(mask, "mask"),
             "edit_mode": edit_mode,
         }
+        normalized_history_id = self._normalize_history_id(history_id)
+        if normalized_history_id:
+            payload["history_id"] = normalized_history_id
         quality = self._normalize_quality(quality)
         if quality:
             payload["quality"] = quality
@@ -144,6 +160,13 @@ class ImageService:
             raise AllProvidersFailed("没有可用的 API 配置，请先启用至少一个节点", status_code=400)
 
         task_id = self.store.create(operation)
+        payload = dict(payload)
+        payload["_task_id"] = task_id
+        history_id = str(payload.get("history_id") or "").strip() or None
+        max_wait_seconds = self._initial_wait_seconds(providers)
+        self.store.update(task_id, max_wait_seconds=max_wait_seconds)
+        if history_id:
+            self.store.update(task_id, history_id=history_id)
         if self.run_async:
             thread = threading.Thread(
                 target=self._execute_task,
@@ -153,7 +176,13 @@ class ImageService:
             thread.start()
         else:
             self._execute_task(task_id, providers, payload, operation)
-        return {"task_id": task_id, "status": "queued", "operation": operation}
+        return {
+            "task_id": task_id,
+            "status": "queued",
+            "operation": operation,
+            "history_id": history_id,
+            "max_wait_seconds": max_wait_seconds,
+        }
 
     # ------------------------------------------------------------------ worker
 
@@ -164,25 +193,24 @@ class ImageService:
         payload: dict[str, Any],
         operation: str,
     ) -> None:
-        self.store.update(task_id, status="processing")
+        history_id = str(payload.get("history_id") or "").strip() or None
+        self.store.update(task_id, status="processing", history_id=history_id)
         attempts: list[dict[str, Any]] = []
-        # One aggregate budget for the whole task so cumulative work across
-        # providers can't exceed the client's wait (frontend MAX_WAIT ~300s).
-        deadline = time.monotonic() + self.generation_timeout
+        # Each provider/mode carries its own positive timeout. Do not cap it
+        # with a fixed global generation limit; user-configured timeouts are
+        # the source of truth.
+        deadline = None
         try:
             for provider in providers:
-                if time.monotonic() >= deadline:
-                    attempts.append(
-                        self._failed_attempt(provider, ProviderRequestError("任务总时长已超时", status_code=504))
-                    )
-                    self.store.update(task_id, attempts=list(attempts))
-                    break
                 self.store.update(task_id, api_id=provider["id"], api_name=provider["name"])
-                try:
-                    urls, expires_at = self._run_provider(provider, payload, operation, deadline)
-                except Exception as exc:  # noqa: BLE001 - record and fall back
-                    attempts.append(self._failed_attempt(provider, exc))
-                    self.store.update(task_id, attempts=list(attempts))
+                ok, urls, expires_at, provider_attempts = self._run_provider_plan(
+                    provider, payload, operation, deadline
+                )
+                attempts.extend(provider_attempts)
+                self.store.update(task_id, attempts=list(attempts))
+                if not ok:
+                    if not provider.get("auto_mode", True):
+                        break
                     continue
 
                 if not urls:
@@ -192,7 +220,19 @@ class ImageService:
                     self.store.update(task_id, attempts=list(attempts))
                     continue
 
-                attempts.append({"api_id": provider["id"], "api_name": provider["name"], "ok": True})
+                session_id = history_id or task_id
+                urls = self._persist_result_urls(provider, session_id, urls)
+                self._persist_session_manifest(
+                    session_id=session_id,
+                    payload=payload,
+                    operation=operation,
+                    status="completed",
+                    urls=urls,
+                    provider=provider,
+                    task_id=task_id,
+                    attempts=list(attempts),
+                    expires_at=expires_at,
+                )
                 self.store.update(
                     task_id,
                     status="completed",
@@ -200,6 +240,7 @@ class ImageService:
                     expires_at=expires_at,
                     attempts=list(attempts),
                     error=None,
+                    history_id=history_id,
                 )
                 return
 
@@ -212,6 +253,105 @@ class ImageService:
         except Exception as exc:  # noqa: BLE001 - never let the worker die silently
             self.store.update(task_id, status="failed", attempts=list(attempts), error=str(exc))
 
+    def _run_provider_plan(
+        self,
+        provider: dict[str, Any],
+        payload: dict[str, Any],
+        operation: str,
+        deadline: float | None = None,
+    ) -> tuple[bool, list[str], Any, list[dict[str, Any]]]:
+        attempts: list[dict[str, Any]] = []
+        for candidate in self._provider_mode_candidates(provider):
+            ok, urls, expires_at, error = self._run_candidate_with_retries(candidate, payload, operation, deadline)
+            if ok:
+                attempts.append(self._successful_attempt(provider, candidate))
+                return True, urls, expires_at, attempts
+            attempts.append(self._failed_attempt(provider, error or ProviderRequestError("provider failed"), candidate))
+        return False, [], None, attempts
+
+    def _run_candidate_with_retries(
+        self,
+        candidate: dict[str, Any],
+        payload: dict[str, Any],
+        operation: str,
+        deadline: float | None = None,
+    ) -> tuple[bool, list[str], Any, Exception | None]:
+        retries = self._provider_retry_count(candidate)
+        last_error: Exception | None = None
+        for attempt_index in range(retries + 1):
+            try:
+                self.store_timeout_hint(payload, candidate)
+                urls, expires_at = self._run_provider(candidate, payload, operation, deadline)
+                if not urls:
+                    raise ProviderRequestError("provider returned an empty image list")
+                return True, urls, expires_at, None
+            except Exception as exc:  # noqa: BLE001 - caller records the final failure
+                last_error = exc
+                if attempt_index >= retries:
+                    break
+        return False, [], None, last_error
+
+    def _provider_mode_candidates(self, provider: dict[str, Any]) -> list[dict[str, Any]]:
+        modes = provider.get("modes")
+        if provider.get("internal_auto_mode") and isinstance(modes, list) and modes:
+            selected_api_type = str(provider.get("api_type") or "openai").strip()
+            ordered_modes = [
+                mode for mode in modes if str(mode.get("api_type") or selected_api_type).strip() == selected_api_type
+            ]
+            ordered_modes.extend(
+                mode for mode in modes if str(mode.get("api_type") or selected_api_type).strip() != selected_api_type
+            )
+            return [self._candidate_from_mode(provider, mode, index) for index, mode in enumerate(ordered_modes)]
+        return [self._candidate_from_provider(provider)]
+
+    @staticmethod
+    def _candidate_from_provider(provider: dict[str, Any]) -> dict[str, Any]:
+        return dict(provider)
+
+    @staticmethod
+    def _candidate_from_mode(provider: dict[str, Any], mode: dict[str, Any], index: int) -> dict[str, Any]:
+        candidate = dict(provider)
+        candidate.update(mode)
+        candidate["id"] = provider["id"]
+        candidate["name"] = provider["name"]
+        candidate["api_key"] = provider["api_key"]
+        candidate["mode_name"] = str(mode.get("name") or f"mode-{index + 1}")
+        candidate["base_url"] = str(mode.get("base_url") or provider.get("base_url") or "").strip().rstrip("/")
+        candidate["model"] = str(mode.get("model") or provider.get("model") or DEFAULT_MODEL).strip()
+        candidate["api_type"] = str(mode.get("api_type") or provider.get("api_type") or "openai")
+        candidate["_internal_mode"] = True
+        if "timeout_seconds" not in mode:
+            candidate["timeout_seconds"] = provider.get("timeout_seconds")
+        if "retry_count" not in mode:
+            candidate["retry_count"] = provider.get("retry_count")
+        return candidate
+
+    @staticmethod
+    def _provider_retry_count(provider: dict[str, Any]) -> int:
+        try:
+            return max(0, int(provider.get("retry_count", 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    def _provider_timeout(self, provider: dict[str, Any]) -> float:
+        try:
+            return max(1.0, float(provider.get("timeout_seconds", self.request_timeout)))
+        except (TypeError, ValueError):
+            return float(self.request_timeout)
+
+    def _initial_wait_seconds(self, providers: list[dict[str, Any]]) -> int:
+        if not providers:
+            return int(self.request_timeout)
+        candidates = self._provider_mode_candidates(providers[0])
+        provider = candidates[0] if candidates else providers[0]
+        return int(self._provider_timeout(provider))
+
+    def store_timeout_hint(self, payload: dict[str, Any], provider: dict[str, Any]) -> None:
+        task_id = str(payload.get("_task_id") or "").strip()
+        if not task_id:
+            return
+        self.store.update(task_id, max_wait_seconds=int(self._provider_timeout(provider)))
+
     def _run_provider(
         self, provider: dict[str, Any], payload: dict[str, Any], operation: str, deadline: float | None = None
     ) -> tuple[list[str], Any]:
@@ -223,12 +363,13 @@ class ImageService:
             return self._run_chat_completions_provider(provider, payload, operation, deadline)
         return self._run_openai_provider(provider, payload, operation, deadline)
 
-    def _remaining(self, deadline: float | None) -> float:
-        """Seconds left in the task budget, capped at request_timeout; never
-        below 1s so a final attempt can still complete or fail cleanly."""
+    def _remaining(self, deadline: float | None, request_cap: float | None = None) -> float:
+        """Seconds left in the task budget, capped at the active provider
+        timeout; never below 1s so a final attempt can fail cleanly."""
+        cap = request_cap if request_cap is not None else self.request_timeout
         if deadline is None:
-            return self.generation_timeout
-        return max(1.0, min(self.generation_timeout, deadline - time.monotonic()))
+            return float(cap)
+        return max(1.0, min(float(cap), deadline - time.monotonic()))
 
     # --------------------------------------------------- OpenAI-compatible API
 
@@ -236,7 +377,7 @@ class ImageService:
         self, provider: dict[str, Any], payload: dict[str, Any], operation: str, deadline: float | None = None
     ) -> tuple[list[str], Any]:
         model = provider.get("model") or DEFAULT_MODEL
-        timeout = self._remaining(deadline)
+        timeout = self._remaining(deadline, self._provider_timeout(provider))
         if operation == "edit":
             url = self._openai_endpoint(provider["base_url"], "images/edits")
             image_bytes, image_mime = self._decode_data_url(payload["image"], "image")
@@ -413,16 +554,14 @@ class ImageService:
             if payload.get("selection") is not None:
                 body["selection"] = payload["selection"]
 
-        # Bound the whole submit+poll cycle by the task budget, not just a
-        # private async_max_wait, so it can't outlive the client's wait.
         if deadline is None:
-            deadline = time.monotonic() + min(self.async_max_wait, self.generation_timeout)
+            deadline = time.monotonic() + self._provider_timeout(provider)
 
         response = self.http_client.post(
             f"{base}/async/images",
             headers=self._auth_headers(provider, json_content=True),
             json=body,
-            timeout=self._remaining(deadline),
+            timeout=self._remaining(deadline, self._provider_timeout(provider)),
         )
         data = self._parse_response_json(response, provider)
         self._ensure_success_status(response, data, provider)
@@ -446,7 +585,7 @@ class ImageService:
             status_response = self.http_client.get(
                 poll_url,
                 headers=self._auth_headers(provider),
-                timeout=max(1.0, min(self.request_timeout, remaining)),
+                timeout=max(1.0, min(self._provider_timeout(provider), remaining)),
             )
             status_data = self._parse_response_json(status_response, provider)
             self._ensure_success_status(status_response, status_data, provider)
@@ -479,12 +618,14 @@ class ImageService:
         return {
             "api_id": task.get("api_id"),
             "api_name": task.get("api_name"),
+            "history_id": task.get("history_id"),
             "task_id": task_id,
             "operation": task.get("operation"),
             "status": task.get("status"),
             "urls": task.get("urls") or [],
             "attempts": task.get("attempts") or [],
             "expires_at": task.get("expires_at"),
+            "max_wait_seconds": task.get("max_wait_seconds"),
             "error": task.get("error"),
         }
 
@@ -539,15 +680,128 @@ class ImageService:
             },
         )
 
-    def _failed_attempt(self, provider: dict[str, Any], exc: Exception) -> dict[str, Any]:
+    def _successful_attempt(self, provider: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+        attempt = {
+            "api_id": provider["id"],
+            "api_name": provider["name"],
+            "ok": True,
+        }
+        if not candidate.get("_internal_mode"):
+            return attempt
+        mode_name = str(candidate.get("mode_name") or "").strip()
+        if mode_name:
+            attempt["mode_name"] = mode_name
+        mode_api_type = str(candidate.get("api_type") or "").strip()
+        if mode_api_type:
+            attempt["mode_api_type"] = mode_api_type
+        return attempt
+
+    def _failed_attempt(
+        self,
+        provider: dict[str, Any],
+        exc: Exception,
+        candidate: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         details = getattr(exc, "details", {}) if isinstance(exc, ImageServiceError) else {}
-        return {
+        attempt = {
             "api_id": provider["id"],
             "api_name": provider["name"],
             "ok": False,
             "error": str(exc),
             "details": details,
         }
+        active_candidate = candidate or provider
+        if not active_candidate.get("_internal_mode"):
+            return attempt
+        mode_name = str(active_candidate.get("mode_name") or "").strip()
+        if mode_name:
+            attempt["mode_name"] = mode_name
+        mode_api_type = str(active_candidate.get("api_type") or "").strip()
+        if mode_api_type:
+            attempt["mode_api_type"] = mode_api_type
+        return attempt
+
+    def _persist_result_urls(self, provider: dict[str, Any], history_id: str, urls: list[str]) -> list[str]:
+        if not self.persist_results:
+            return urls
+        persisted: list[str] = []
+        for index, url in enumerate(urls):
+            try:
+                saved = self._persist_one_result(provider, history_id, url, index)
+            except Exception:  # noqa: BLE001 - persistence must not turn success into failure
+                saved = url
+            persisted.append(saved)
+        return persisted
+
+    def _persist_one_result(self, provider: dict[str, Any], history_id: str, url: str, index: int) -> str:
+        raw: bytes
+        mime = "image/png"
+        if str(url).startswith("data:image/"):
+            raw, mime = self._decode_data_url(url, "result")
+        else:
+            response = self.http_client.get(str(url), timeout=self._provider_timeout(provider))
+            status_code = int(getattr(response, "status_code", 200) or 200)
+            if not 200 <= status_code < 300:
+                raise ProviderRequestError(f"result download failed: HTTP {status_code}")
+            raw = bytes(getattr(response, "content", b"") or b"")
+            if not raw:
+                raise ProviderRequestError("result download returned empty content")
+            mime = str(getattr(response, "headers", {}).get("Content-Type", "") or mime).split(";", 1)[0]
+
+        target_dir_id = str(history_id or provider["id"])
+        target_dir = self.result_dir / target_dir_id
+        target_dir.mkdir(parents=True, exist_ok=True)
+        ext = self._ext_for_mime(mime)
+        filename = f"{int(time.time() * 1000)}-{index}-{uuid.uuid4().hex[:8]}.{ext}"
+        (target_dir / filename).write_bytes(raw)
+        return f"/api/results/{target_dir_id}/{filename}"
+
+    def _persist_session_manifest(
+        self,
+        *,
+        session_id: str,
+        payload: dict[str, Any],
+        operation: str,
+        status: str,
+        urls: list[str],
+        provider: dict[str, Any],
+        task_id: str,
+        attempts: list[dict[str, Any]],
+        expires_at: Any,
+    ) -> None:
+        if not self.persist_results:
+            return
+        now = self._now()
+        target_dir = self.result_dir / str(session_id)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = target_dir / "session.json"
+        previous: dict[str, Any] = {}
+        if manifest_path.exists():
+            try:
+                loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    previous = loaded
+            except Exception:
+                previous = {}
+        manifest = {
+            "id": str(session_id),
+            "task_id": task_id,
+            "prompt": payload.get("prompt", ""),
+            "mode": operation,
+            "size": payload.get("size"),
+            "n": payload.get("n"),
+            "status": status,
+            "urls": urls,
+            "api_id": provider.get("id"),
+            "api_name": provider.get("name"),
+            "attempts": attempts,
+            "expires_at": expires_at,
+            "created_at": previous.get("created_at") or now,
+            "updated_at": now,
+        }
+        tmp_path = manifest_path.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tmp_path.replace(manifest_path)
 
     # ------------------------------------------------------- custom direct URL
 
@@ -559,7 +813,7 @@ class ImageService:
         The response is parsed the same way as the OpenAI-compatible path
         (``data[].b64_json`` / ``data[].url``)."""
         model = provider.get("model") or DEFAULT_MODEL
-        timeout = self._remaining(deadline)
+        timeout = self._remaining(deadline, self._provider_timeout(provider))
         body: dict[str, Any] = {
             "model": model,
             "prompt": payload["prompt"],
@@ -603,7 +857,7 @@ class ImageService:
         Parses ``data``, ``output``, and ``choices[].message.content`` for
         image urls/b64."""
         model = provider.get("model") or DEFAULT_MODEL
-        timeout = self._remaining(deadline)
+        timeout = self._remaining(deadline, self._provider_timeout(provider))
         url = self._openai_endpoint(provider["base_url"], "chat/completions")
         refs = payload.get("reference_images") or []
         if refs:
@@ -740,6 +994,17 @@ class ImageService:
                 raise GenerationValidationError("参考图必须是 data:image/*;base64 格式", status_code=400)
             refs.append(text)
         return refs
+
+    @staticmethod
+    def _normalize_history_id(value: Any) -> str | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in text)[:120] or None
+
+    @staticmethod
+    def _now() -> str:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     @staticmethod
     def _decode_data_url(value: str, field_name: str) -> tuple[bytes, str]:

@@ -8,7 +8,7 @@
 Vue 3 Desktop UI
   -> Axios /api
   -> Flask Routes
-  -> Service Layer (worker thread + in-process TaskStore)
+  -> Service Layer (worker thread + in-process TaskStore + JSON persistence)
   -> Upstream image API (OpenAI 兼容 /v1/images，或自定义 /async/images)
 ```
 
@@ -24,6 +24,7 @@ Vue 3 Desktop UI
 - 任务状态轮询节奏
 - 超时控制
 - 结果展示与下载
+- 作品集照片墙展示后端已完成会话
 
 ### 后端负责
 
@@ -31,6 +32,7 @@ Vue 3 Desktop UI
 - 校验请求参数
 - 在 worker 线程内按节点优先级执行容灾，并适配不同上游协议（OpenAI 兼容 / 异步中转）
 - 把任务生命周期与结果保存在进程内 `TaskStore`，供 `/status` 查询
+- 把成功图片、会话参数和局部编辑草稿保存到后端历史目录
 - 对前端统一返回结构化错误
 
 ### 上游服务负责
@@ -47,12 +49,20 @@ backend/
   routes/
     configs.py
     generation.py
+    prompt_templates.py
   services/
     config_service.py
     image_service.py
+    prompt_template_service.py
     task_store.py
   data/
     configs.json
+    prompt_templates.json
+history/
+  <session-id>/
+    session.json
+    edit-draft.json
+    *.png
 ```
 
 ### `app.py`
@@ -94,6 +104,9 @@ backend/
 - `POST /api/generate`
 - `POST /api/edit`
 - `GET /api/status`
+- `GET /api/sessions`
+- `GET /api/edit-drafts/{history_id}`
+- `PUT /api/edit-drafts/{history_id}`
 
 ### `services/config_service.py`
 
@@ -120,6 +133,7 @@ backend/
   - `openai`：`/v1/images/generations`（JSON）、`/v1/images/edits`（multipart），把 `b64_json`/`url` 规整为可展示链接；编辑时用 Pillow 对齐并反转遮罩
   - `async`：提交 `/async/images` 后在 worker 内轮询直至完成
 - 把状态/结果写入 `TaskStore`
+- 把完成结果与 `session.json` 写入 `history/<session-id>/`
 
 关键方法：
 
@@ -135,6 +149,14 @@ backend/
 - 记录 `status` / `urls` / `attempts` / `api_id` / `api_name` / `error` / `expires_at`
 - 按 TTL 自动回收，进程重启不保留
 
+### `services/prompt_template_service.py`
+
+职责：
+
+- 维护 `backend/data/prompt_templates.json`
+- 提供提示词模板的增删改查
+- 首次启动时写入默认模板
+
 ## 4. 前端结构
 
 ```text
@@ -145,8 +167,10 @@ frontend/src/
     generation.js
   components/
     APIConfig/index.vue
+    Gallery/index.vue
     Playground/index.vue
     RegionEditor/index.vue
+    Settings/index.vue
   App.vue
   styles.css
 ```
@@ -158,7 +182,8 @@ frontend/src/
 职责：
 
 - 渲染左侧导航
-- 在 `工作区` 和 `设置` 两个主视图之间切换
+- 在生成控制台与作品集之间切换
+- 打开设置和检测弹窗
 - 保持 PC-only 布局
 
 ### `components/APIConfig/index.vue`
@@ -187,8 +212,17 @@ frontend/src/
 - 发起 `/api/generate` 或 `/api/edit`
 - 每 4 秒轮询一次 `/api/status`
 - 维护任务信息、耗时、错误和结果图片列表
+- 启动时合并后端已完成会话，恢复本地历史索引
 
 这里是整个交互链路的中心组件。
+
+### `components/Gallery/index.vue`
+
+职责：
+
+- 调用 `GET /api/sessions`
+- 将所有成功图片以照片墙形式展示
+- 提供放大预览和下载
 
 ### `components/RegionEditor/index.vue`
 

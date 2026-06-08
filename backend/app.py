@@ -1,7 +1,7 @@
 import logging
 import os
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, send_from_directory
 from flask_cors import CORS
 
 
@@ -28,7 +28,17 @@ def create_app() -> Flask:
 
     @app.get("/api/health")
     def health_check():
-        return jsonify({"ok": True, "service": "gpt-img2-creater-backend"})
+        return jsonify({"ok": True, "service": "img-Creater-backend"})
+
+    @app.get("/api/results/<history_id>/<filename>")
+    def result_file(history_id: str, filename: str):
+        service = app.config.get("IMAGE_SERVICE")
+        result_dir = getattr(service, "result_dir", None)
+        if result_dir is None:
+            from .services.image_service import DEFAULT_RESULT_DIR
+
+            result_dir = DEFAULT_RESULT_DIR
+        return send_from_directory(result_dir / history_id, filename)
 
     @app.errorhandler(413)
     def request_too_large(_error):
@@ -58,6 +68,14 @@ def _register_blueprints(app: Flask) -> None:
             raise
     else:
         app.register_blueprint(generation_bp, url_prefix="/api")
+
+    try:
+        from .routes.prompt_templates import prompt_templates_bp
+    except ModuleNotFoundError as exc:
+        if exc.name != "backend.routes.prompt_templates":
+            raise
+    else:
+        app.register_blueprint(prompt_templates_bp, url_prefix="/api/prompt-templates")
 
     # Beta: decoupled AI-image detection. It must NEVER break app startup, so
     # ANY failure to import or register the optional route is caught and logged

@@ -1,8 +1,16 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { Delete, Download, FullScreen, MagicStick, Picture, Plus, Refresh, RefreshLeft, ZoomIn } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
-import { editImage, generateImages, getGenerationStatus } from '../../api/generation'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import {
+  deleteSession,
+  deleteSessions,
+  editImage,
+  generateImages,
+  getEditDraft,
+  getGenerationStatus,
+  saveEditDraft,
+} from '../../api/generation'
 import { downloadImage } from '../../utils/download'
 import { useGenerationHistory } from '../../composables/useGenerationHistory'
 import { useSettings } from '../../composables/useSettings'
@@ -10,18 +18,18 @@ import { usePromptTemplates } from '../../composables/usePromptTemplates'
 import RegionEditor from '../RegionEditor/index.vue'
 
 const { settings } = useSettings()
-const { pendingFill } = usePromptTemplates()
+const { templates, loadTemplates, pendingFill, requestRandomFill } = usePromptTemplates()
 const promptZoomOpen = ref(false)
 
 // A template chosen in Settings fills the prompt here.
 watch(pendingFill, (val) => {
   if (val && val.text != null) {
     form.prompt = val.text
-    mode.value = 'generate'
+    switchMode('generate')
   }
 })
 
-const MAX_WAIT_SECONDS = 300
+const DEFAULT_MAX_WAIT_SECONDS = 300
 const POLL_INTERVAL_MS = 4000
 const DRAFT_KEY = 'studio-form-draft'
 const HISTORY_WIDTH = '276px'
@@ -59,6 +67,27 @@ function addReferenceFiles(fileList) {
   }
 }
 
+function addPromptReferenceFiles(fileList) {
+  const files = Array.from(fileList || []).filter((file) => file.type?.startsWith('image/'))
+  if (!files.length) return false
+  switchMode('generate')
+  addReferenceFiles(files)
+  ElMessage.success('已添加为参考图')
+  return true
+}
+
+function onPromptPaste(event) {
+  if (addPromptReferenceFiles(event.clipboardData?.files)) {
+    event.preventDefault()
+  }
+}
+
+function onPromptDrop(event) {
+  if (addPromptReferenceFiles(event.dataTransfer?.files)) {
+    event.preventDefault()
+  }
+}
+
 function onRefInput(event) {
   addReferenceFiles(event.target.files)
   event.target.value = ''
@@ -71,6 +100,14 @@ function removeReference(index) {
 const mode = ref('generate')
 const maskState = ref({ hasImage: false, hasMask: false })
 const regionEditorRef = ref(null)
+const syncedEditImageRevision = ref(0)
+const restoringEditDraft = ref(false)
+
+function switchMode(nextMode) {
+  if (mode.value === nextMode) return
+  persistCurrentEditDraft()
+  mode.value = nextMode
+}
 
 // ---- size controls ----
 const ratioPresets = [
@@ -99,86 +136,56 @@ watch([sizeW, sizeH], () => {
   form.size = `${sizeW.value}x${sizeH.value}`
 })
 
-// ---- example prompt library ----
-const promptCategories = [
-  {
-    label: '写实摄影',
-    items: [
-      { text: '一位年轻女子在雨夜的东京街头，霓虹灯倒映在潮湿的路面上，35mm胶片拍摄风格' },
-      { text: '壮丽的日落海岸线，长曝光波浪模糊成雾，电影级暖色调' },
-      { text: '一杯咖啡放在窗边，清晨柔和的自然光，浅景深，氛围感' },
-    ],
-  },
-  {
-    label: '动漫插画',
-    items: [
-      { text: '吉卜力工作室风格，一座漂浮在云海之上的飞行城堡，金色夕阳光照，细节丰富' },
-      { text: '一位少女在樱花树下阅读，新海诚风格，细腻光影，梦幻氛围' },
-      { text: '宫崎骏风格，森林中的小木屋，温暖灯光，手绘质感' },
-    ],
-  },
-  {
-    label: '产品海报',
-    items: [
-      { text: '极简产品摄影，一副无线耳机放在大理石台面上，柔和工作室打光，干净背景' },
-      { text: '香水瓶特写，金色调，奢华质感，柔和侧光' },
-    ],
-  },
-  {
-    label: '水彩艺术',
-    items: [
-      { text: '一只可爱的蜂鸟吸食花蜜，水彩画风格，柔和的粉彩色调，白色背景' },
-      { text: '盛开的花园，印象派水彩风格，明亮色彩，湿润笔触' },
-    ],
-  },
-  {
-    label: '赛博朋克',
-    items: [
-      { text: '赛博朋克城市景观，高耸的摩天大楼布满全息广告，飞行载具穿梭，紫青色霓虹色调' },
-      { text: '雨中霓虹街道的义体人，科幻氛围，暗夜都市' },
-    ],
-  },
-  {
-    label: '局部编辑',
-    items: [
-      { text: '将背景替换为星空夜景，保持主体不变' },
-      { text: '将汽车颜色改为金属红，只修改车身部分' },
-      { text: '给照片中的人物加上一副墨镜，写实风格' },
-    ],
-  },
-]
-const promptLibOpen = ref(false)
-
-function fillPrompt(text) {
-  form.prompt = text
-  promptLibOpen.value = false
-}
-
-// Pick a random example across all categories.
-function randomPrompt() {
-  const all = promptCategories.flatMap((c) => c.items)
-  if (!all.length) return
-  const pick = all[Math.floor(Math.random() * all.length)]
-  form.prompt = pick.text
-  ElMessage.success('已随机填入一条示例')
-}
-
 // ---- rest of state ----
+const {
+  history,
+  addEntry,
+  updateEntry,
+  removeEntry,
+  clearHistory: clearStoredHistory,
+  loadPersistedSessions,
+} = useGenerationHistory()
+const displayHistoryId = ref(null)
+const clockNow = ref(Date.now())
 
-const loading = ref(false)
-const status = ref('idle')
-const elapsedSeconds = ref(0)
-const task = ref(null)
-const images = ref([])
-const errorMessage = ref('')
-const attempts = ref([])
-const expiresAt = ref(null)
-const needsProvider = ref(false)
-const { history, addEntry, updateEntry, removeEntry, clearHistory } = useGenerationHistory()
-const activeHistoryId = ref(null)
+const pollTimers = new Map()
+const draftSaveTimers = new Map()
+let clockTimer = null
 
-let elapsedTimer = null
-let pollTimer = null
+function isRunningStatus(value) {
+  return ['submitting', 'queued', 'processing'].includes(value)
+}
+
+function findHistoryEntry(id) {
+  return history.value.find((entry) => entry.id === id) || null
+}
+
+const activeEntry = computed(() => findHistoryEntry(displayHistoryId.value))
+const status = computed(() => activeEntry.value?._status || 'idle')
+const task = computed(() => activeEntry.value?.task || null)
+const images = computed(() => activeEntry.value?.urls || [])
+const currentImage = computed(() => images.value[0] || '')
+const attempts = computed(() => activeEntry.value?.attempts || [])
+const expiresAt = computed(() => activeEntry.value?.expiresAt ?? null)
+const errorMessage = computed(() => activeEntry.value?.errorMessage || '')
+const loading = computed(() => isRunningStatus(status.value))
+const needsProvider = computed(() => typeof errorMessage.value === 'string' && errorMessage.value.includes('API 配置'))
+const elapsedSeconds = computed(() => elapsedForEntry(activeEntry.value))
+const maxWaitSeconds = computed(() => Number(activeEntry.value?.maxWaitSeconds) || DEFAULT_MAX_WAIT_SECONDS)
+const monitorFloating = ref(false)
+const monitorPos = reactive({ x: 720, y: 96 })
+const monitorDrag = reactive({ active: false, dx: 0, dy: 0 })
+const monitorStyle = computed(() =>
+  monitorFloating.value
+    ? {
+        position: 'fixed',
+        left: `${monitorPos.x}px`,
+        top: `${monitorPos.y}px`,
+        width: '520px',
+        zIndex: 30,
+      }
+    : {},
+)
 
 const expiresLabel = computed(() => {
   const raw = Number(expiresAt.value)
@@ -205,21 +212,58 @@ const statusLabel = computed(() => {
 })
 
 const buttonText = computed(() => {
-  if (!loading.value) return mode.value === 'edit' ? '提交局部修改' : '生成图片'
-  return `${statusLabel.value} · ${elapsedSeconds.value}s`
+  return mode.value === 'edit' ? '提交局部修改' : '生成图片'
 })
 
 const showSkeleton = computed(() => loading.value && !images.value.length)
-const operationLabel = computed(() => (mode.value === 'edit' ? '局部编辑' : '文生图'))
+const operationLabel = computed(() => ((activeEntry.value?.mode || mode.value) === 'edit' ? '局部编辑' : '文生图'))
+
+function floatMonitor() {
+  monitorFloating.value = true
+}
+
+function resetMonitorPosition() {
+  monitorFloating.value = false
+  monitorDrag.active = false
+}
+
+function startMonitorDrag(event) {
+  if (!monitorFloating.value) return
+  monitorDrag.active = true
+  monitorDrag.dx = event.clientX - monitorPos.x
+  monitorDrag.dy = event.clientY - monitorPos.y
+  window.addEventListener('pointermove', moveMonitor)
+  window.addEventListener('pointerup', stopMonitorDrag, { once: true })
+}
+
+function moveMonitor(event) {
+  if (!monitorDrag.active) return
+  const maxX = Math.max(0, window.innerWidth - 540)
+  const maxY = Math.max(0, window.innerHeight - 260)
+  monitorPos.x = Math.min(maxX, Math.max(0, event.clientX - monitorDrag.dx))
+  monitorPos.y = Math.min(maxY, Math.max(0, event.clientY - monitorDrag.dy))
+}
+
+function stopMonitorDrag() {
+  monitorDrag.active = false
+  window.removeEventListener('pointermove', moveMonitor)
+}
 
 // ---- history search + time filter ----
 const historyQuery = ref('')
 const historyTimeFilter = ref('all') // all | today | week | month
+const historySort = ref('time_desc') // time_desc | time_asc | prompt_asc | prompt_desc
 const historyTimeOptions = [
   { value: 'all', label: '全部' },
   { value: 'today', label: '今天' },
   { value: 'week', label: '本周' },
   { value: 'month', label: '本月' },
+]
+const historySortOptions = [
+  { value: 'time_desc', label: '最新' },
+  { value: 'time_asc', label: '最早' },
+  { value: 'prompt_asc', label: '提示词 A-Z' },
+  { value: 'prompt_desc', label: '提示词 Z-A' },
 ]
 
 function withinTimeFilter(ts) {
@@ -251,12 +295,14 @@ const historyItems = computed(() => {
       if (q && !(entry.prompt || '').toLowerCase().includes(q)) return false
       return true
     })
+    .sort((a, b) => {
+      if (historySort.value === 'time_asc') return Number(a.time || 0) - Number(b.time || 0)
+      if (historySort.value === 'prompt_asc') return String(a.prompt || '').localeCompare(String(b.prompt || ''))
+      if (historySort.value === 'prompt_desc') return String(b.prompt || '').localeCompare(String(a.prompt || ''))
+      return Number(b.time || 0) - Number(a.time || 0)
+    })
     .map((entry) => {
-      let ist = entry._status || 'completed'
-      if (entry.id === activeHistoryId.value && loading.value) {
-        ist = status.value === 'idle' || status.value === 'submitting' ? 'queued' : status.value
-      }
-      return { ...entry, _status: ist }
+      return { ...entry, _status: entry._status || 'completed' }
     })
 })
 
@@ -288,48 +334,65 @@ function historyTime(ts) {
 
 // ---- timers ----
 function clearTimers() {
-  if (elapsedTimer) window.clearInterval(elapsedTimer)
-  if (pollTimer) window.clearTimeout(pollTimer)
-  elapsedTimer = null
-  pollTimer = null
+  pollTimers.forEach((timer) => window.clearTimeout(timer))
+  pollTimers.clear()
+  draftSaveTimers.forEach((timer) => window.clearTimeout(timer))
+  draftSaveTimers.clear()
+  if (clockTimer) window.clearInterval(clockTimer)
+  clockTimer = null
 }
 
-function resetRun() {
-  clearTimers()
-  loading.value = false
-  status.value = 'idle'
-  elapsedSeconds.value = 0
-  task.value = null
-  errorMessage.value = ''
-  attempts.value = []
-  expiresAt.value = null
-  needsProvider.value = false
-  activeHistoryId.value = null
+function clearPollTimer(entryId) {
+  const timer = pollTimers.get(entryId)
+  if (timer) window.clearTimeout(timer)
+  pollTimers.delete(entryId)
+}
+
+function clearDraftSaveTimer(entryId) {
+  const timer = draftSaveTimers.get(entryId)
+  if (timer) window.clearTimeout(timer)
+  draftSaveTimers.delete(entryId)
+}
+
+function startClock() {
+  if (clockTimer) return
+  clockTimer = window.setInterval(() => {
+    clockNow.value = Date.now()
+    if (!history.value.some((entry) => isRunningStatus(entry._status))) {
+      window.clearInterval(clockTimer)
+      clockTimer = null
+    }
+  }, 1000)
+}
+
+function elapsedForEntry(entry) {
+  if (!entry) return 0
+  if (isRunningStatus(entry._status) && entry.startedAt) {
+    return Math.max(0, Math.floor((clockNow.value - Number(entry.startedAt)) / 1000))
+  }
+  return Number(entry.elapsedSeconds || 0)
 }
 
 // ---- submit + poll ----
 async function submitTask(reuseId = null) {
-  if (loading.value) return
   if (!form.prompt.trim()) {
     ElMessage.warning('请输入 Prompt')
     return
   }
 
   let editPayload = null
+  let editDraft = null
   if (mode.value === 'edit') {
     editPayload = regionEditorRef.value?.exportPayload()
     if (!editPayload) {
       ElMessage.warning('请先上传原图并框选或涂抹需要修改的区域')
       return
     }
+    editDraft = regionEditorRef.value?.exportDraft?.()
   }
 
-  resetRun()
-  images.value = []
-  loading.value = true
-  status.value = 'submitting'
-
   // Reuse an existing history entry on retry (overwrite), else create a new one.
+  let entryId = reuseId
   if (reuseId && history.value.some((e) => e.id === reuseId)) {
     updateEntry(reuseId, {
       prompt: form.prompt.trim(),
@@ -339,9 +402,15 @@ async function submitTask(reuseId = null) {
       apiName: '',
       imageCount: 0,
       time: Date.now(),
-      _status: 'queued',
+      _status: 'submitting',
+      startedAt: Date.now(),
+      elapsedSeconds: 0,
+      task: null,
+      errorMessage: '',
+      attempts: [],
+      expiresAt: null,
+      editDraft,
     })
-    activeHistoryId.value = reuseId
   } else {
     const entry = addEntry({
       prompt: form.prompt.trim(),
@@ -349,23 +418,29 @@ async function submitTask(reuseId = null) {
       size: form.size,
       urls: [],
       apiName: '',
-      _status: 'queued',
+      _status: 'submitting',
+      startedAt: Date.now(),
+      elapsedSeconds: 0,
+      task: null,
+      errorMessage: '',
+      attempts: [],
+      expiresAt: null,
+      editDraft,
     })
-    activeHistoryId.value = entry.id
+    entryId = entry.id
   }
-
-  elapsedTimer = window.setInterval(() => {
-    elapsedSeconds.value += 1
-    if (elapsedSeconds.value >= MAX_WAIT_SECONDS) {
-      stopWithTimeout()
-    }
-  }, 1000)
+  displayHistoryId.value = entryId
+  if (editDraft) {
+    persistEditDraftNow(entryId, editDraft)
+  }
+  startClock()
 
   try {
     const basePayload = {
       prompt: form.prompt.trim(),
       size: form.size,
       n: 1,
+      history_id: entryId,
     }
     const result =
       mode.value === 'edit'
@@ -382,145 +457,322 @@ async function submitTask(reuseId = null) {
             ...(referenceImages.value.length ? { reference_images: referenceImages.value } : {}),
           })
 
-    task.value = {
+    const nextTask = {
       apiId: result.api_id,
       taskId: result.task_id,
       apiName: result.api_name,
       operation: result.operation || mode.value,
     }
-    attempts.value = result.attempts || []
-    status.value = result.status || 'queued'
-    schedulePoll()
+    updateEntry(entryId, {
+      task: nextTask,
+      attempts: result.attempts || [],
+      _status: result.status || 'queued',
+      maxWaitSeconds: result.max_wait_seconds ?? null,
+      errorMessage: '',
+    })
+    schedulePoll(entryId, nextTask)
   } catch (error) {
-    stopWithError(error.message || '提交任务失败')
+    stopWithError(entryId, error.message || '提交任务失败')
   }
 }
 
-function schedulePoll() {
-  if (!loading.value) return
-  pollTimer = window.setTimeout(pollStatusOnce, POLL_INTERVAL_MS)
+function schedulePoll(entryId, taskData = null, delay = POLL_INTERVAL_MS) {
+  const entry = findHistoryEntry(entryId)
+  const activeTask = taskData || entry?.task
+  if (!entry || !activeTask || !isRunningStatus(entry._status)) return
+  clearPollTimer(entryId)
+  pollTimers.set(entryId, window.setTimeout(() => pollStatusOnce(entryId), delay))
 }
 
-async function pollStatusOnce() {
-  if (!task.value || !loading.value) return
-  if (elapsedSeconds.value >= MAX_WAIT_SECONDS) {
-    stopWithTimeout()
+async function pollStatusOnce(entryId) {
+  const entry = findHistoryEntry(entryId)
+  const activeTask = entry?.task
+  if (!entry || !activeTask || !isRunningStatus(entry._status)) return
+  const waitLimit = Number(entry.maxWaitSeconds) || DEFAULT_MAX_WAIT_SECONDS
+  if (elapsedForEntry(entry) >= waitLimit) {
+    stopWithTimeout(entryId)
     return
   }
 
   try {
     const result = await getGenerationStatus({
-      apiId: task.value.apiId,
-      taskId: task.value.taskId,
+      apiId: activeTask.apiId,
+      taskId: activeTask.taskId,
     })
-    if (!loading.value) return
-    status.value = result.status
 
+    const nextTask = { ...activeTask }
     if (result.api_name || result.api_id) {
-      task.value = { ...task.value, apiId: result.api_id, apiName: result.api_name }
+      nextTask.apiId = result.api_id
+      nextTask.apiName = result.api_name
     }
     if (result.operation) {
-      task.value = { ...task.value, operation: result.operation }
+      nextTask.operation = result.operation
     }
-    if (Array.isArray(result.attempts) && result.attempts.length) {
-      attempts.value = result.attempts
-    }
+    const nextAttempts = Array.isArray(result.attempts) ? result.attempts : entry.attempts || []
 
     if (result.status === 'completed') {
-      images.value = result.urls || []
-      expiresAt.value = result.expires_at ?? null
-      loading.value = false
-      clearTimers()
-      if (images.value.length) {
-        updateEntry(activeHistoryId.value, {
-          urls: images.value,
-          apiName: task.value?.apiName || result.api_name || '',
-          imageCount: images.value.length,
+      const urls = result.urls || []
+      clearPollTimer(entryId)
+      if (urls.length) {
+        updateEntry(entryId, {
+          task: nextTask,
+          urls,
+          apiName: nextTask.apiName || result.api_name || '',
+          imageCount: urls.length,
           _status: 'completed',
+          attempts: nextAttempts,
+          expiresAt: result.expires_at ?? null,
+          maxWaitSeconds: result.max_wait_seconds ?? entry.maxWaitSeconds ?? null,
+          elapsedSeconds: elapsedForEntry(entry),
         })
       } else {
-        errorMessage.value = '任务完成但未返回图片 URL'
+        updateEntry(entryId, {
+          task: nextTask,
+          _status: 'failed',
+          attempts: nextAttempts,
+          errorMessage: '任务完成但未返回图片 URL',
+          maxWaitSeconds: result.max_wait_seconds ?? entry.maxWaitSeconds ?? null,
+          elapsedSeconds: elapsedForEntry(entry),
+        })
       }
-      activeHistoryId.value = null
       return
     }
 
     if (result.status === 'failed') {
-      stopWithError(result.error || '任务失败')
-      updateEntry(activeHistoryId.value, { _status: 'failed' })
-      activeHistoryId.value = null
+      stopWithError(entryId, result.error || '任务失败', { task: nextTask, attempts: nextAttempts })
       return
     }
 
-    schedulePoll()
+    updateEntry(entryId, {
+      task: nextTask,
+      _status: result.status || 'processing',
+      attempts: nextAttempts,
+      expiresAt: result.expires_at ?? entry.expiresAt ?? null,
+      maxWaitSeconds: result.max_wait_seconds ?? entry.maxWaitSeconds ?? null,
+    })
+    schedulePoll(entryId, nextTask)
   } catch (error) {
-    stopWithError(error.message || '查询任务状态失败')
-    updateEntry(activeHistoryId.value, { _status: 'failed' })
-    activeHistoryId.value = null
+    stopWithError(entryId, error.message || '查询任务状态失败')
   }
 }
 
-function stopWithError(message) {
-  loading.value = false
-  status.value = 'failed'
-  errorMessage.value = message
-  needsProvider.value = typeof message === 'string' && message.includes('API 配置')
-  clearTimers()
+function stopWithError(entryId, message, extra = {}) {
+  const entry = findHistoryEntry(entryId)
+  clearPollTimer(entryId)
+  updateEntry(entryId, {
+    _status: 'failed',
+    errorMessage: message,
+    elapsedSeconds: elapsedForEntry(entry),
+    ...extra,
+  })
 }
 
-function stopWithTimeout() {
-  loading.value = false
-  status.value = 'timeout'
-  errorMessage.value = '已超过 5 分钟，任务轮询已自动停止'
-  clearTimers()
-  updateEntry(activeHistoryId.value, { _status: 'timeout' })
-  activeHistoryId.value = null
+function stopWithTimeout(entryId) {
+  const entry = findHistoryEntry(entryId)
+  clearPollTimer(entryId)
+  const waitLimit = Number(entry?.maxWaitSeconds) || DEFAULT_MAX_WAIT_SECONDS
+  updateEntry(entryId, {
+    _status: 'timeout',
+    errorMessage: `已超过 ${waitLimit} 秒，任务轮询已自动停止`,
+    elapsedSeconds: elapsedForEntry(entry),
+  })
 }
 
-function reusePrompt() {
-  form.prompt =
-    mode.value === 'edit'
-      ? '只修改蒙版区域：替换为透明玻璃控制面板，保持原图光照、视角和边缘自然融合'
-      : '电影级产品摄影，一台半透明的桌面图像生成终端，暖色工作灯，清晰细节，真实材质'
+async function reusePrompt() {
+  try {
+    if (!templates.value.length) {
+      await loadTemplates()
+    }
+    if (!templates.value.length) {
+      ElMessage.warning('暂无可用模板，请先在设置中添加提示词模板')
+      return
+    }
+    if (form.prompt.trim()) {
+      await ElMessageBox.confirm('当前提示词不为空，是否用随机示例覆盖？', '覆盖提示词', {
+        type: 'warning',
+        confirmButtonText: '覆盖',
+        cancelButtonText: '取消',
+      })
+    }
+    const item = requestRandomFill()
+    if (item) ElMessage.success(`已填入示例：${item.title}`)
+  } catch (error) {
+    if (error !== 'cancel') ElMessage.error(error.message || '示例加载失败')
+  }
 }
 
 function onMaskChange(nextState) {
   maskState.value = nextState
+  const revision = Number(nextState?.imageRevision || 0)
+  const width = Number(nextState?.imageWidth)
+  const height = Number(nextState?.imageHeight)
+  if (
+    nextState?.hasImage &&
+    revision &&
+    revision !== syncedEditImageRevision.value &&
+    Number.isInteger(width) &&
+    width > 0 &&
+    Number.isInteger(height) &&
+    height > 0
+  ) {
+    sizeW.value = width
+    sizeH.value = height
+    syncedEditImageRevision.value = revision
+  }
+  if (!nextState?.hasImage) {
+    syncedEditImageRevision.value = 0
+  }
+  if (!restoringEditDraft.value && mode.value === 'edit' && displayHistoryId.value && nextState?.draft) {
+    updateEntry(displayHistoryId.value, { editDraft: nextState.draft })
+    scheduleEditDraftSave(displayHistoryId.value, nextState.draft)
+  }
 }
 
 async function downloadOne(url, index) {
-  const ok = await downloadImage(url, `gpt-img2-${index + 1}`)
+  const ok = await downloadImage(url, `img-Creater-${index + 1}`)
   if (!ok) {
     ElMessage.info('图片为跨域链接，已在新标签页打开，可右键另存为')
   }
 }
 
+function persistCurrentEditDraft() {
+  if (mode.value !== 'edit' || !displayHistoryId.value) return
+  const draft = regionEditorRef.value?.exportDraft?.()
+  if (!draft) return
+  updateEntry(displayHistoryId.value, { editDraft: draft })
+  persistEditDraftNow(displayHistoryId.value, draft)
+}
+
+function scheduleEditDraftSave(entryId, draft) {
+  if (!entryId || !draft) return
+  clearDraftSaveTimer(entryId)
+  draftSaveTimers.set(
+    entryId,
+    window.setTimeout(() => {
+      draftSaveTimers.delete(entryId)
+      persistEditDraftNow(entryId, draft)
+    }, 500),
+  )
+}
+
+async function persistEditDraftNow(entryId, draft) {
+  if (!entryId || !draft) return
+  try {
+    await saveEditDraft(entryId, draft)
+  } catch {
+    // Draft persistence is best-effort; generation history remains usable.
+  }
+}
+
+async function restoreEditDraftForEntry(entry) {
+  restoringEditDraft.value = true
+  try {
+    let draft = entry.editDraft || null
+    if (!draft) {
+      draft = await getEditDraft(entry.id)
+      if (draft) updateEntry(entry.id, { editDraft: draft })
+    }
+    if (draft) {
+      await regionEditorRef.value?.restoreDraft?.(draft)
+    } else {
+      regionEditorRef.value?.clearAll?.()
+    }
+  } catch {
+    regionEditorRef.value?.clearAll?.()
+  } finally {
+    restoringEditDraft.value = false
+  }
+}
+
 // ---- history actions ----
-function recallHistory(entry) {
+async function recallHistory(entry) {
+  persistCurrentEditDraft()
+  displayHistoryId.value = entry.id
   form.prompt = entry.prompt || ''
   if (entry.size) parseSize(entry.size)
   if (entry.mode) mode.value = entry.mode
-  images.value = entry.urls || []
-  status.value = entry._status === 'completed' ? 'completed' : 'idle'
-  errorMessage.value = ''
+  if (entry.mode === 'edit') {
+    await restoreEditDraftForEntry(entry)
+  } else {
+    regionEditorRef.value?.clearAll?.()
+    maskState.value = { hasImage: false, hasMask: false }
+  }
   ElMessage.success('已切换到该历史记录')
 }
 
-function deleteHistory(entry) {
-  removeEntry(entry.id)
-  if (activeHistoryId.value === entry.id) activeHistoryId.value = null
+async function deleteHistory(entry) {
+  try {
+    await ElMessageBox.confirm('删除该会话记录？', '确认删除', {
+      type: 'warning',
+      confirmButtonText: '删除',
+      cancelButtonText: '取消',
+    })
+    clearPollTimer(entry.id)
+    clearDraftSaveTimer(entry.id)
+    try {
+      await deleteSession(entry.id)
+    } catch {
+      ElMessage.warning('后端会话目录删除失败，本地记录已移除')
+    }
+    removeEntry(entry.id)
+    if (displayHistoryId.value === entry.id) {
+      const nextEntry = history.value[0] || null
+      displayHistoryId.value = null
+      if (nextEntry) {
+        await recallHistory(nextEntry)
+      } else {
+        regionEditorRef.value?.clearAll?.()
+        maskState.value = { hasImage: false, hasMask: false }
+      }
+    }
+  } catch (error) {
+    if (error !== 'cancel') ElMessage.error(error.message || '删除失败')
+  }
+}
+
+function newConversation() {
+  persistCurrentEditDraft()
+  displayHistoryId.value = null
+  form.prompt = ''
+  mode.value = 'generate'
+  parseSize('1024x1024')
+  referenceImages.value = []
+  regionEditorRef.value?.clearAll?.()
+  maskState.value = { hasImage: false, hasMask: false }
+}
+
+async function clearAllHistory() {
+  try {
+    await ElMessageBox.confirm('删除全部会话历史？该操作不可撤销。', '确认删除全部', {
+      type: 'warning',
+      confirmButtonText: '删除全部',
+      cancelButtonText: '取消',
+    })
+    clearTimers()
+    try {
+      await deleteSessions()
+    } catch {
+      ElMessage.warning('后端会话目录清空失败，本地记录已清空')
+    }
+    displayHistoryId.value = null
+    clearStoredHistory()
+    regionEditorRef.value?.clearAll?.()
+    maskState.value = { hasImage: false, hasMask: false }
+  } catch (error) {
+    if (error !== 'cancel') ElMessage.error(error.message || '清空失败')
+  }
 }
 
 // Retry a failed entry with the same params and overwrite it (no new entry).
-// Note: edit-mode retries reuse whatever is currently drawn in the editor.
-function retryHistory(entry) {
-  if (loading.value) {
-    ElMessage.warning('有任务正在进行，请稍候')
-    return
-  }
+async function retryHistory(entry) {
+  persistCurrentEditDraft()
   form.prompt = entry.prompt || ''
   if (entry.size) parseSize(entry.size)
   if (entry.mode) mode.value = entry.mode
+  if (entry.mode === 'edit') {
+    displayHistoryId.value = entry.id
+    await restoreEditDraftForEntry(entry)
+  }
   submitTask(entry.id)
 }
 
@@ -538,6 +790,20 @@ function restoreDraft() {
   }
 }
 
+function restoreRunningTasks() {
+  const now = Date.now()
+  let hasRunning = false
+  history.value.forEach((entry) => {
+    if (!isRunningStatus(entry._status) || !entry.task?.taskId) return
+    hasRunning = true
+    if (!entry.startedAt) {
+      updateEntry(entry.id, { startedAt: now })
+    }
+    schedulePoll(entry.id, entry.task, 500)
+  })
+  if (hasRunning) startClock()
+}
+
 watch([() => form.prompt, () => form.size, mode], () => {
   try {
     window.localStorage.setItem(
@@ -549,12 +815,33 @@ watch([() => form.prompt, () => form.size, mode], () => {
   }
 })
 
-onMounted(restoreDraft)
-onBeforeUnmount(clearTimers)
+onMounted(async () => {
+  restoreDraft()
+  try {
+    await loadPersistedSessions()
+  } catch {
+    ElMessage.warning('后端历史会话加载失败，仅显示本地历史')
+  }
+  restoreRunningTasks()
+})
+onBeforeUnmount(() => {
+  clearTimers()
+  window.removeEventListener('pointermove', moveMonitor)
+})
+
+watch(
+  history,
+  (items) => {
+    if (!displayHistoryId.value && items.length) {
+      displayHistoryId.value = items[0].id
+    }
+  },
+  { immediate: true },
+)
 </script>
 
 <template>
-  <div class="flex h-full">
+  <div class="flex h-full min-h-0">
     <!-- History sidebar (permanent left panel) -->
     <aside
       class="flex shrink-0 flex-col border-r border-[var(--studio-line)] bg-[var(--studio-panel)]"
@@ -562,15 +849,24 @@ onBeforeUnmount(clearTimers)
     >
       <div class="flex items-center justify-between border-b border-[var(--studio-line)] px-4 py-3">
         <h2 class="text-sm font-black text-[var(--studio-ink)]">会话历史</h2>
-        <el-button
-          v-if="history.length"
-          text
-          size="small"
-          type="danger"
-          :icon="Delete"
-          aria-label="清空全部历史"
-          @click="clearHistory"
-        />
+        <div class="flex items-center gap-1">
+          <el-button
+            text
+            size="small"
+            :icon="Plus"
+            aria-label="新建空白对话"
+            @click="newConversation"
+          />
+          <el-button
+            v-if="history.length"
+            text
+            size="small"
+            type="danger"
+            :icon="Delete"
+            aria-label="清空全部历史"
+            @click="clearAllHistory"
+          />
+        </div>
       </div>
 
       <!-- Search + time filter -->
@@ -590,6 +886,9 @@ onBeforeUnmount(clearTimers)
             {{ opt.label }}
           </button>
         </div>
+        <el-select v-model="historySort" size="small" class="w-full" placeholder="排序">
+          <el-option v-for="opt in historySortOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
+        </el-select>
       </div>
 
       <div class="thin-scrollbar flex-1 overflow-auto">
@@ -644,7 +943,7 @@ onBeforeUnmount(clearTimers)
     </aside>
 
     <!-- Main: control form + region editor (left column), task monitor + gallery (right column) -->
-    <div class="flex flex-1 overflow-hidden">
+    <div class="flex min-h-0 flex-1 overflow-hidden">
       <!-- Left column: form + region editor -->
       <div class="flex w-[440px] shrink-0 flex-col gap-4 overflow-auto border-r border-[var(--studio-line)] p-5">
         <form class="studio-panel rounded-lg p-5" @submit.prevent="submitTask">
@@ -661,7 +960,7 @@ onBeforeUnmount(clearTimers)
               type="button"
               class="h-10 rounded-[6px] text-sm font-bold transition"
               :class="mode === 'generate' ? 'bg-[var(--studio-solid)] text-[var(--studio-on-solid)]' : 'text-[var(--studio-muted)] hover:bg-[var(--studio-paper)]'"
-              @click="mode = 'generate'"
+              @click="switchMode('generate')"
             >
               文生图
             </button>
@@ -669,13 +968,13 @@ onBeforeUnmount(clearTimers)
               type="button"
               class="h-10 rounded-[6px] text-sm font-bold transition"
               :class="mode === 'edit' ? 'bg-[var(--studio-solid)] text-[var(--studio-on-solid)]' : 'text-[var(--studio-muted)] hover:bg-[var(--studio-paper)]'"
-              @click="mode = 'edit'"
+              @click="switchMode('edit')"
             >
               局部编辑
             </button>
           </div>
 
-          <div class="block">
+          <div class="block" @paste.capture="onPromptPaste" @dragover.prevent @drop="onPromptDrop">
             <div class="mb-2 flex items-center justify-between">
               <span class="text-sm font-semibold">Prompt</span>
               <button
@@ -694,51 +993,9 @@ onBeforeUnmount(clearTimers)
               :rows="mode === 'edit' ? 7 : 10"
               resize="none"
               :maxlength="settings.maxPromptChars"
-              placeholder="描述要生成或修改的画面…（Ctrl/⌘ + Enter 提交）"
-              @keydown.ctrl.enter.prevent="submitTask"
-              @keydown.meta.enter.prevent="submitTask"
+              placeholder="描述要生成或修改的画面…"
             />
             <p class="mt-1 text-right text-xs text-[var(--studio-muted)]">{{ promptChars }} / {{ settings.maxPromptChars }}</p>
-          </div>
-
-          <!-- Example prompt library -->
-          <div class="mt-2">
-            <div class="flex items-center justify-between">
-              <button
-                type="button"
-                class="flex items-center gap-1.5 text-xs font-semibold text-[var(--studio-muted)] transition hover:text-[var(--studio-teal)]"
-                @click="promptLibOpen = !promptLibOpen"
-              >
-                <span>{{ promptLibOpen ? '▾' : '▸' }}</span>
-                <span>示例提示词</span>
-              </button>
-              <button
-                type="button"
-                class="flex items-center gap-1 text-xs font-semibold text-[var(--studio-muted)] transition hover:text-[var(--studio-coral)]"
-                title="随机填入一条示例"
-                @click="randomPrompt"
-              >
-                <el-icon><Refresh /></el-icon>
-                <span>随机</span>
-              </button>
-            </div>
-            <div v-if="promptLibOpen" class="mt-2 space-y-3">
-              <div v-for="cat in promptCategories" :key="cat.label">
-                <p class="mb-1.5 text-xs font-bold text-[var(--studio-ink)]">{{ cat.label }}</p>
-                <div class="flex flex-wrap gap-1.5">
-                  <button
-                    v-for="item in cat.items"
-                    :key="item.text"
-                    type="button"
-                    class="rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface)] px-2.5 py-1 text-left text-xs leading-relaxed text-[var(--studio-ink)] transition hover:border-[var(--studio-teal)] hover:bg-[var(--studio-surface-soft)]"
-                    :title="item.text"
-                    @click="fillPrompt(item.text)"
-                  >
-                    {{ item.text.slice(0, 28) }}{{ item.text.length > 28 ? '…' : '' }}
-                  </button>
-                </div>
-              </div>
-            </div>
           </div>
 
           <!-- Reference images (generate mode) -->
@@ -794,11 +1051,11 @@ onBeforeUnmount(clearTimers)
             <div class="grid grid-cols-2 gap-2">
               <label class="block">
                 <span class="mb-1 block text-xs text-[var(--studio-muted)]">宽 (px)</span>
-                <el-input-number v-model="sizeW" :min="64" :max="4096" :step="64" controls-position="right" class="w-full" />
+                <el-input-number v-model="sizeW" :min="1" :step="1" step-strictly controls-position="right" class="w-full" />
               </label>
               <label class="block">
                 <span class="mb-1 block text-xs text-[var(--studio-muted)]">高 (px)</span>
-                <el-input-number v-model="sizeH" :min="64" :max="4096" :step="64" controls-position="right" class="w-full" />
+                <el-input-number v-model="sizeH" :min="1" :step="1" step-strictly controls-position="right" class="w-full" />
               </label>
             </div>
           </div>
@@ -814,7 +1071,7 @@ onBeforeUnmount(clearTimers)
             </div>
           </div>
 
-          <el-button class="mt-5 w-full" type="primary" size="large" native-type="submit" :loading="loading" :icon="MagicStick">
+          <el-button class="mt-5 w-full" type="primary" size="large" native-type="submit" :icon="MagicStick">
             {{ buttonText }}
           </el-button>
         </form>
@@ -825,30 +1082,42 @@ onBeforeUnmount(clearTimers)
              module height instead of leaving a large gap. -->
         <div v-if="mode === 'generate'" class="studio-panel rounded-lg p-4 text-sm leading-6 text-[var(--studio-muted)]">
           <p class="mb-1 text-xs font-bold uppercase tracking-[0.16em] text-[var(--studio-amber)]">Tips</p>
-          <p>· 用 <span class="font-semibold text-[var(--studio-ink)]">Ctrl/⌘ + Enter</span> 快速提交。</p>
           <p>· 切换到「局部编辑」可在原图上直接涂抹/框选修改区域。</p>
-          <p>· 生成的临时链接通常 1 小时内有效，请及时下载保存。</p>
+          <p>· 生成成功的图片会保存到本地历史目录，并可在作品集中查看。</p>
         </div>
       </div>
 
       <!-- Right column: task monitor + gallery -->
-      <div class="flex flex-1 flex-col gap-4 overflow-auto p-5">
+      <div class="flex min-h-0 flex-1 flex-col gap-4 overflow-hidden p-5">
         <!-- Task monitor -->
-        <div class="studio-panel rounded-lg p-5">
+        <div
+          class="studio-panel rounded-lg p-5"
+          :class="monitorFloating ? 'shadow-2xl' : ''"
+          :style="monitorStyle"
+        >
           <div class="grid grid-cols-[1fr_auto] items-start gap-4">
-            <div>
+            <div
+              :class="monitorFloating ? 'cursor-move select-none' : ''"
+              title="拖拽移动任务状态"
+              @pointerdown="startMonitorDrag"
+            >
               <p class="text-xs font-semibold uppercase tracking-[0.16em] text-[var(--studio-teal)]">Task Monitor</p>
               <h2 class="mt-1 text-2xl font-black">{{ operationLabel }}任务状态</h2>
             </div>
-            <el-tag :type="status === 'completed' ? 'success' : status === 'failed' || status === 'timeout' ? 'danger' : 'warning'" effect="plain">
-              {{ statusLabel }}
-            </el-tag>
+            <div class="flex items-center gap-2">
+              <el-button v-if="monitorFloating" size="small" text @click="resetMonitorPosition">回原位</el-button>
+              <el-button v-else size="small" text @click="floatMonitor">悬浮</el-button>
+              <el-tag :type="status === 'completed' ? 'success' : status === 'failed' || status === 'timeout' ? 'danger' : 'warning'" effect="plain">
+                {{ statusLabel }}
+              </el-tag>
+            </div>
           </div>
 
           <div class="mt-4 grid grid-cols-4 gap-3 text-sm">
             <div class="rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface-soft)] p-3">
               <p class="text-xs text-[var(--studio-muted)]">耗时</p>
               <p class="mt-1 text-xl font-black">{{ elapsedSeconds }}s</p>
+              <p class="mt-0.5 text-xs text-[var(--studio-muted)]">上限 {{ maxWaitSeconds }}s</p>
             </div>
             <div class="rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface-soft)] p-3">
               <p class="text-xs text-[var(--studio-muted)]">任务</p>
@@ -879,7 +1148,7 @@ onBeforeUnmount(clearTimers)
         </div>
 
         <!-- Gallery -->
-        <div class="studio-panel flex min-h-0 flex-1 flex-col rounded-lg p-5">
+        <div class="studio-panel flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg p-5">
           <div class="mb-4 flex items-end justify-between">
             <div>
               <p class="text-xs font-semibold uppercase tracking-[0.16em] text-[var(--studio-amber)]">Gallery Output</p>
@@ -891,10 +1160,10 @@ onBeforeUnmount(clearTimers)
             </div>
           </div>
 
-          <div v-if="showSkeleton" class="gallery-grid">
-            <el-skeleton animated>
+          <div v-if="showSkeleton" class="flex min-h-0 flex-1">
+            <el-skeleton animated class="h-full w-full">
               <template #template>
-                <el-skeleton-item variant="image" class="!h-[280px] !rounded-md" />
+                <el-skeleton-item variant="image" class="!h-full !min-h-0 !rounded-md" />
                 <div class="mt-3">
                   <el-skeleton-item variant="p" class="!w-2/3" />
                 </div>
@@ -902,21 +1171,20 @@ onBeforeUnmount(clearTimers)
             </el-skeleton>
           </div>
 
-          <div v-else-if="images.length" class="gallery-grid">
-            <figure v-for="(url, index) in images" :key="url" class="group relative overflow-hidden rounded-md border border-[var(--studio-line)] bg-[var(--studio-canvas)]">
+          <div v-else-if="currentImage" class="flex min-h-0 flex-1 items-center justify-center">
+            <figure class="group relative flex h-full w-full items-center justify-center overflow-hidden rounded-md border border-[var(--studio-line)] bg-[var(--studio-canvas)]">
               <el-image
-                :src="url"
-                :alt="`生成图片 ${index + 1}`"
+                :src="currentImage"
+                alt="生成图片"
                 :preview-src-list="images"
-                :initial-index="index"
+                :initial-index="0"
                 preview-teleported
                 hide-on-click-modal
                 fit="contain"
-                loading="lazy"
-                class="block h-[280px] w-full cursor-zoom-in"
+                class="block h-full w-full cursor-zoom-in"
               >
                 <template #error>
-                  <div class="flex h-[280px] w-full flex-col items-center justify-center gap-1 bg-[var(--studio-surface-soft)] text-center text-xs text-[var(--studio-muted)]">
+                  <div class="flex h-full w-full flex-col items-center justify-center gap-1 bg-[var(--studio-surface-soft)] text-center text-xs text-[var(--studio-muted)]">
                     <el-icon class="text-2xl"><Picture /></el-icon>
                     <span>图片无法加载</span>
                     <span>（链接可能已过期）</span>
@@ -924,13 +1192,13 @@ onBeforeUnmount(clearTimers)
                 </template>
               </el-image>
               <figcaption class="pointer-events-none absolute inset-x-0 bottom-0 flex translate-y-full items-center justify-between bg-[rgba(23,33,38,0.86)] px-3 py-2 text-sm text-white transition group-hover:translate-y-0">
-                <span>Image {{ index + 1 }}</span>
+                <span>Image 1</span>
                 <button
                   type="button"
                   class="pointer-events-auto inline-flex h-8 w-8 items-center justify-center rounded-md bg-white text-[#172126] transition hover:bg-[var(--studio-coral)] hover:text-white"
                   title="下载图片"
-                  :aria-label="`下载第 ${index + 1} 张图片`"
-                  @click="downloadOne(url, index)"
+                  aria-label="下载当前图片"
+                  @click="downloadOne(currentImage, 0)"
                 >
                   <el-icon><Download /></el-icon>
                 </button>
@@ -954,14 +1222,34 @@ onBeforeUnmount(clearTimers)
 
     <!-- Prompt zoom editor -->
     <el-dialog v-model="promptZoomOpen" title="编辑 Prompt" width="760px" top="8vh">
-      <el-input
-        v-model="form.prompt"
-        type="textarea"
-        :rows="18"
-        resize="none"
-        :maxlength="settings.maxPromptChars"
-        placeholder="描述要生成或修改的画面…"
-      />
+      <div class="rounded-md border border-transparent" @paste.capture="onPromptPaste" @dragover.prevent @drop="onPromptDrop">
+        <el-input
+          v-model="form.prompt"
+          type="textarea"
+          :rows="18"
+          resize="none"
+          :maxlength="settings.maxPromptChars"
+          placeholder="描述要生成或修改的画面…"
+        />
+      </div>
+      <div v-if="mode === 'generate' && referenceImages.length" class="mt-3 flex flex-wrap gap-2">
+        <div
+          v-for="(ref, i) in referenceImages"
+          :key="i"
+          class="group relative h-14 w-14 overflow-hidden rounded-md border border-[var(--studio-line)]"
+        >
+          <img :src="ref" alt="" class="h-full w-full object-cover" />
+          <button
+            type="button"
+            class="absolute right-0.5 top-0.5 flex h-5 w-5 items-center justify-center rounded bg-[rgba(23,33,38,0.75)] text-white opacity-0 transition group-hover:opacity-100"
+            :aria-label="`移除参考图 ${i + 1}`"
+            title="移除"
+            @click="removeReference(i)"
+          >
+            <el-icon class="text-xs"><Delete /></el-icon>
+          </button>
+        </div>
+      </div>
       <p class="mt-1 text-right text-xs text-[var(--studio-muted)]">{{ promptChars }} / {{ settings.maxPromptChars }}</p>
       <template #footer>
         <el-button @click="promptZoomOpen = false">完成</el-button>

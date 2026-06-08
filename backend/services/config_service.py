@@ -11,6 +11,10 @@ from typing import Any
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "data" / "configs.json"
 DEFAULT_MODEL = "gpt-image-2"
 DEFAULT_API_TYPE = "openai"
+DEFAULT_AUTO_MODE = True
+DEFAULT_INTERNAL_AUTO_MODE = False
+DEFAULT_TIMEOUT_SECONDS = 30
+DEFAULT_RETRY_COUNT = 0
 
 # Upstream protocol per node. "openai" is the standard OpenAI-compatible
 # Images API (/v1/images/generations, /v1/images/edits); "async" is a custom
@@ -66,6 +70,10 @@ class ConfigService:
 
     def get_enabled_configs(self) -> list[dict[str, Any]]:
         return [config for config in self.list_configs() if self.is_enabled(config)]
+
+    def get_secret(self, config_id: str) -> dict[str, Any]:
+        config = self.get_config(config_id)
+        return {"id": config["id"], "api_key": str(config.get("api_key") or "")}
 
     def create_config(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
@@ -193,6 +201,29 @@ class ConfigService:
         model = str(merged.get("model") or DEFAULT_MODEL).strip()
         status = self._normalize_status(merged.get("status", True))
         api_type = self._normalize_api_type(merged.get("api_type", DEFAULT_API_TYPE))
+        auto_mode = self._normalize_bool(merged.get("auto_mode", DEFAULT_AUTO_MODE), "auto_mode")
+        internal_auto_mode = self._normalize_bool(
+            merged.get("internal_auto_mode", DEFAULT_INTERNAL_AUTO_MODE),
+            "internal_auto_mode",
+        )
+        timeout_seconds = self._normalize_int(
+            merged.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
+            "timeout_seconds",
+            minimum=1,
+        )
+        retry_count = self._normalize_int(
+            merged.get("retry_count", DEFAULT_RETRY_COUNT),
+            "retry_count",
+            minimum=0,
+        )
+        modes = self._normalize_modes(
+            merged.get("modes"),
+            base_url=base_url,
+            model=model,
+            api_type=api_type,
+            timeout_seconds=timeout_seconds,
+            retry_count=retry_count,
+        )
 
         if not name:
             raise ConfigValidationError("配置名称不能为空")
@@ -211,7 +242,61 @@ class ConfigService:
             "model": model,
             "api_type": api_type,
             "status": status,
+            "auto_mode": auto_mode,
+            "internal_auto_mode": internal_auto_mode,
+            "timeout_seconds": timeout_seconds,
+            "retry_count": retry_count,
+            "modes": modes,
         }
+
+    def _normalize_modes(
+        self,
+        value: Any,
+        *,
+        base_url: str,
+        model: str,
+        api_type: str,
+        timeout_seconds: int,
+        retry_count: int,
+    ) -> list[dict[str, Any]]:
+        if value in (None, ""):
+            return []
+        if not isinstance(value, list):
+            raise ConfigValidationError("modes must be a list")
+
+        modes: list[dict[str, Any]] = []
+        for index, item in enumerate(value):
+            if not isinstance(item, dict):
+                raise ConfigValidationError("each mode must be an object")
+            mode_name = str(item.get("name") or f"mode-{index + 1}").strip() or f"mode-{index + 1}"
+            mode_api_type = self._normalize_api_type(item.get("api_type", api_type))
+            mode_base_url = str(item.get("base_url") or base_url).strip().rstrip("/")
+            mode_model = str(item.get("model") or model).strip()
+            mode_timeout = self._normalize_int(
+                item.get("timeout_seconds", timeout_seconds),
+                f"modes[{index}].timeout_seconds",
+                minimum=1,
+            )
+            mode_retry = self._normalize_int(
+                item.get("retry_count", retry_count),
+                f"modes[{index}].retry_count",
+                minimum=0,
+            )
+            if not mode_base_url.startswith(("http://", "https://")):
+                raise ConfigValidationError(f"modes[{index}].base_url must start with http:// or https://")
+            if not mode_model:
+                raise ConfigValidationError(f"modes[{index}].model cannot be empty")
+            modes.append(
+                {
+                    "name": mode_name,
+                    "api_type": mode_api_type,
+                    "base_url": mode_base_url,
+                    "model": mode_model,
+                    "timeout_seconds": mode_timeout,
+                    "retry_count": mode_retry,
+                }
+            )
+        return modes
 
     @staticmethod
     def _normalize_api_type(value: Any) -> str:
@@ -223,6 +308,10 @@ class ConfigService:
 
     @staticmethod
     def _normalize_status(value: Any) -> bool:
+        return ConfigService._normalize_bool(value, "status")
+
+    @staticmethod
+    def _normalize_bool(value: Any, field_name: str) -> bool:
         if isinstance(value, bool):
             return value
         text = str(value).strip().lower()
@@ -230,9 +319,18 @@ class ConfigService:
             return True
         if text in {"disabled", "disable", "false", "0", "off"}:
             return False
-        raise ConfigValidationError("status 必须是启用/禁用状态")
+        raise ConfigValidationError(f"{field_name} must be a boolean")
+
+    @staticmethod
+    def _normalize_int(value: Any, field_name: str, *, minimum: int) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ConfigValidationError(f"{field_name} must be an integer") from exc
+        if parsed < minimum:
+            raise ConfigValidationError(f"{field_name} must be >= {minimum}")
+        return parsed
 
     @staticmethod
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-

@@ -1,4 +1,5 @@
 import { ref } from 'vue'
+import { listSessions } from '../api/generation'
 
 const STORAGE_KEY = 'studio-generation-history'
 const MAX_ENTRIES = 30
@@ -24,6 +25,7 @@ function sanitizeForStorage(entries) {
       ...entry,
       urls: urls.filter((url) => typeof url === 'string' && !url.startsWith('data:')),
       imageCount: urls.length,
+      editDraft: undefined,
     }
   })
 }
@@ -69,5 +71,34 @@ export function useGenerationHistory() {
     persist()
   }
 
-  return { history, addEntry, updateEntry, removeEntry, clearHistory }
+  async function loadPersistedSessions() {
+    const sessions = await listSessions()
+    if (!Array.isArray(sessions) || !sessions.length) return []
+    const existingById = new Map(history.value.map((entry) => [entry.id, entry]))
+    for (const session of sessions) {
+      const urls = Array.isArray(session.urls) ? session.urls : []
+      const entry = {
+        id: session.id,
+        prompt: session.prompt || '',
+        mode: session.mode || 'generate',
+        size: session.size || '1024x1024',
+        urls,
+        apiName: session.api_name || '',
+        imageCount: urls.length,
+        time: Date.parse(session.updated_at || session.created_at || '') || Date.now(),
+        _status: 'completed',
+        task: session.task_id ? { taskId: session.task_id, apiId: session.api_id, apiName: session.api_name } : null,
+        attempts: Array.isArray(session.attempts) ? session.attempts : [],
+        expiresAt: session.expires_at ?? null,
+      }
+      existingById.set(entry.id, { ...(existingById.get(entry.id) || {}), ...entry })
+    }
+    history.value = Array.from(existingById.values())
+      .sort((a, b) => Number(b.time || 0) - Number(a.time || 0))
+      .slice(0, MAX_ENTRIES)
+    persist()
+    return sessions
+  }
+
+  return { history, addEntry, updateEntry, removeEntry, clearHistory, loadPersistedSessions }
 }
