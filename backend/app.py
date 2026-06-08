@@ -1,3 +1,4 @@
+import logging
 import os
 
 from flask import Flask, jsonify
@@ -6,6 +7,9 @@ from flask_cors import CORS
 
 def create_app() -> Flask:
     app = Flask(__name__)
+    # Surface app-level INFO logs (e.g. the detection startup status) on the
+    # console when launched via run.ps1.
+    app.logger.setLevel(logging.INFO)
     # Local single-user tool: only the Vite dev origin needs cross-origin access.
     allowed = os.getenv("FRONTEND_ORIGIN", "http://127.0.0.1:5173,http://localhost:5173").split(",")
     CORS(app, resources={r"/api/*": {"origins": [o.strip() for o in allowed if o.strip()]}})
@@ -55,15 +59,49 @@ def _register_blueprints(app: Flask) -> None:
     else:
         app.register_blueprint(generation_bp, url_prefix="/api")
 
-    # Beta: decoupled AI-image detection. Registers only if the route module
-    # is present; the route itself further degrades if detection deps are absent.
+    # Beta: decoupled AI-image detection. It must NEVER break app startup, so
+    # ANY failure to import or register the optional route is caught and logged
+    # with the specific error instead of propagating.
     try:
         from .routes.detection import detection_bp
-    except ModuleNotFoundError as exc:
-        if exc.name != "backend.routes.detection":
-            raise
+    except Exception as exc:  # noqa: BLE001 - isolate the optional beta module
+        app.logger.warning(
+            "[detection] route failed to load; /api/detect disabled: %s: %s",
+            type(exc).__name__, exc,
+        )
     else:
         app.register_blueprint(detection_bp, url_prefix="/api/detect")
+        _log_detection_status(app)
+
+
+def _log_detection_status(app: Flask) -> None:
+    """Probe the optional detection module at startup and log a clear status
+    line (ready / degraded / failed). Never raises — a broken beta module must
+    not affect the host app."""
+    try:
+        from detection import detector_health
+
+        report = detector_health()
+    except Exception as exc:  # noqa: BLE001
+        app.logger.warning(
+            "[detection] module failed to load; /api/detect will report unavailable: %s: %s",
+            type(exc).__name__, exc,
+        )
+        return
+
+    if report.get("available"):
+        analyzers = report.get("analyzers", {})
+        enabled = sum(1 for ok in analyzers.values() if ok)
+        missing_opt = report.get("missing_optional") or []
+        suffix = f" (optional deps missing: {', '.join(missing_opt)})" if missing_opt else ""
+        app.logger.info("[detection] ready: %d/%d analyzers available%s", enabled, len(analyzers), suffix)
+    else:
+        missing = ", ".join(report.get("missing_required") or []) or "unknown"
+        app.logger.warning(
+            "[detection] degraded: missing required deps [%s] — run "
+            "`pip install -r detection/requirements.txt` and restart to enable",
+            missing,
+        )
 
 
 app = create_app()

@@ -32,8 +32,12 @@ def detect_health():
 
         return _success(detector_health())
     except Exception as exc:  # noqa: BLE001 - never break the app over the beta module
-        current_app.logger.warning("detection health probe failed: %s", exc)
-        return _success({"available": False, "missing_required": ["detection 模块不可用"], "error": str(exc)})
+        current_app.logger.warning("[detection] health probe failed: %s: %s", type(exc).__name__, exc)
+        return _success({
+            "available": False,
+            "missing_required": ["detection 模块不可用"],
+            "error": f"{type(exc).__name__}: {exc}",
+        })
 
 
 @detection_bp.post("")
@@ -42,7 +46,8 @@ def detect():
     try:
         from detection import detect_image
     except Exception as exc:  # noqa: BLE001
-        return _error("检测模块未启用（缺少依赖）", 503, {"error": str(exc)})
+        current_app.logger.warning("[detection] module import failed, returning 503: %s: %s", type(exc).__name__, exc)
+        return _error("检测模块未启用（缺少依赖或模块错误）", 503, {"error": f"{type(exc).__name__}: {exc}"})
 
     payload = request.get_json(silent=True) or {}
     image_field = payload.get("image", "")
