@@ -1,11 +1,13 @@
 <script setup>
 import { computed, ref } from 'vue'
-import { Moon, Setting, Sunny } from '@element-plus/icons-vue'
+import { Aim, Moon, Setting, Sunny } from '@element-plus/icons-vue'
 import Settings from './components/Settings/index.vue'
 import Playground from './components/Playground/index.vue'
+import Detector from './components/Detector/index.vue'
 import { useTheme } from './composables/useTheme'
 
 const settingsOpen = ref(false)
+const detectorOpen = ref(false)
 
 const { theme, toggleTheme } = useTheme()
 const isDark = computed(() => theme.value === 'dark')
@@ -31,6 +33,17 @@ const isDark = computed(() => theme.value === 'dark')
         </button>
         <button
           type="button"
+          class="flex h-9 items-center gap-1.5 shrink-0 rounded-md border border-[var(--studio-line)] px-2.5 text-sm font-semibold text-[var(--studio-muted)] transition hover:border-[var(--studio-amber)] hover:text-[var(--studio-amber)]"
+          title="AI 生成检测 (Beta)"
+          aria-label="打开 AI 生成检测"
+          @click="detectorOpen = true"
+        >
+          <el-icon><Aim /></el-icon>
+          <span>检测</span>
+          <span class="rounded bg-[var(--studio-amber)]/15 px-1 text-[10px] uppercase">beta</span>
+        </button>
+        <button
+          type="button"
           class="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-[var(--studio-line)] text-[var(--studio-muted)] transition hover:border-[var(--studio-teal)] hover:text-[var(--studio-teal)]"
           title="设置"
           aria-label="打开设置"
@@ -40,6 +53,11 @@ const isDark = computed(() => theme.value === 'dark')
         </button>
       </div>
     </header>
+
+    <!-- Detection modal (beta) -->
+    <el-dialog v-model="detectorOpen" title="AI 生成检测 (Beta)" width="560px" top="6vh" destroy-on-close>
+      <Detector />
+    </el-dialog>
 
     <!-- Settings modal -->
     <el-dialog v-model="settingsOpen" title="设置" width="1040px" top="6vh" destroy-on-close>
