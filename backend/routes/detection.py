@@ -9,6 +9,7 @@ used by the other routes.
 from __future__ import annotations
 
 import base64
+import io
 import sys
 from pathlib import Path
 from typing import Any
@@ -57,6 +58,13 @@ def detect():
     return _success(result)
 
 
+# Input guards for the public detect endpoint. The detection module decodes
+# pixels inside its analyzers, so reject oversized / decompression-bomb inputs
+# here, at the host boundary, before any pixel buffer is allocated.
+_MAX_IMAGE_BYTES = 20 * 1024 * 1024   # 20 MB decoded
+_MAX_IMAGE_PIXELS = 50_000_000        # 50 MP
+
+
 def _decode_image(field: Any) -> tuple[bytes, str | None]:
     text = str(field or "").strip()
     if not text:
@@ -66,9 +74,36 @@ def _decode_image(field: Any) -> tuple[bytes, str | None]:
             return b"", "image 必须是 data:*;base64,... 格式"
         text = text.split(";base64,", 1)[1]
     try:
-        return base64.b64decode(text), None
+        data = base64.b64decode(text)
     except Exception:  # noqa: BLE001
         return b"", "image base64 解码失败"
+    if not data:
+        return b"", "image 为空"
+    if len(data) > _MAX_IMAGE_BYTES:
+        return b"", f"图片过大（上限 {_MAX_IMAGE_BYTES // (1024 * 1024)}MB）"
+    ok, err = _validate_image(data)
+    if not ok:
+        return b"", err
+    return data, None
+
+
+def _validate_image(data: bytes) -> tuple[bool, str | None]:
+    """Header-only check: confirm decodability and guard against a
+    decompression bomb (huge declared dimensions) before any analyzer
+    allocates pixel buffers. Reads only the header; never mutates a global
+    Pillow setting (so the host's other image paths are unaffected)."""
+    try:
+        from PIL import Image
+    except Exception:  # noqa: BLE001 - Pillow absent: detection reports unavailable anyway
+        return True, None
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            width, height = im.size
+    except Exception as exc:  # noqa: BLE001
+        return False, f"无法解析图片: {exc}"
+    if width * height > _MAX_IMAGE_PIXELS:
+        return False, f"图片分辨率过大（{width}x{height}，上限 {_MAX_IMAGE_PIXELS // 1_000_000}MP）"
+    return True, None
 
 
 def _success(data: Any, status: int = 200):
