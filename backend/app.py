@@ -55,6 +55,16 @@ def _register_blueprints(app: Flask) -> None:
     else:
         app.register_blueprint(generation_bp, url_prefix="/api")
 
+    # Beta: decoupled AI-image detection. Registers only if the route module
+    # is present; the route itself further degrades if detection deps are absent.
+    try:
+        from .routes.detection import detection_bp
+    except ModuleNotFoundError as exc:
+        if exc.name != "backend.routes.detection":
+            raise
+    else:
+        app.register_blueprint(detection_bp, url_prefix="/api/detect")
+
 
 app = create_app()
 
