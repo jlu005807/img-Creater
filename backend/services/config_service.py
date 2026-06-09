@@ -10,16 +10,20 @@ from typing import Any
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "data" / "configs.json"
 DEFAULT_MODEL = "gpt-image-2"
-DEFAULT_API_TYPE = "openai"
+DEFAULT_API_TYPE = "auto"
 DEFAULT_AUTO_MODE = True
 DEFAULT_INTERNAL_AUTO_MODE = False
 DEFAULT_TIMEOUT_SECONDS = 30
 DEFAULT_RETRY_COUNT = 0
 
-# Upstream protocol per node. "openai" is the standard OpenAI-compatible
-# Images API (/v1/images/generations, /v1/images/edits); "async" is a custom
-# relay that exposes /async/images submit + poll.
+# Upstream protocol per node. "auto" tries the standard OpenAI-compatible
+# Images API first and can switch to an async relay at runtime without rewriting
+# the saved node config. "async" explicitly uses /async/images submit + poll.
 _API_TYPE_ALIASES = {
+    "auto": "auto",
+    "automatic": "auto",
+    "detect": "auto",
+    "autodetect": "auto",
     "openai": "openai",
     "openai-compatible": "openai",
     "openai_compatible": "openai",
@@ -303,7 +307,7 @@ class ConfigService:
         text = str(value or DEFAULT_API_TYPE).strip().lower()
         resolved = _API_TYPE_ALIASES.get(text)
         if resolved is None:
-            raise ConfigValidationError("api_type 只支持 openai、async、custom 或 chat")
+            raise ConfigValidationError("api_type 只支持 auto、openai、async、custom 或 chat")
         return resolved
 
     @staticmethod

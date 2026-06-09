@@ -3,6 +3,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { Delete, Edit, Hide, Plus, Rank, Refresh, SwitchButton, View } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { createConfig, deleteConfig, getConfigSecret, listConfigs, reorderConfigs, updateConfig } from '../../api/configs'
+import { backendRouteMissingMessage, isBackendRouteMissing } from '../../api/client'
 
 const configs = ref([])
 const loading = ref(false)
@@ -13,30 +14,17 @@ const secretLoadingId = ref(null)
 const editingSecretVisible = ref(false)
 const revealedKeys = reactive({})
 
-function createMode() {
-  return {
-    name: '',
-    api_type: 'openai',
-    base_url: '',
-    model: '',
-    timeout_seconds: null,
-    retry_count: null,
-  }
-}
-
 function newEmptyForm() {
   return {
     name: '',
     base_url: '',
     api_key: '',
     model: 'gpt-image-2',
-    api_type: 'openai',
+    api_type: 'auto',
     status: true,
     auto_mode: true,
-    internal_auto_mode: false,
     timeout_seconds: 30,
     retry_count: 0,
-    modes: [],
   }
 }
 
@@ -44,6 +32,7 @@ const form = reactive(newEmptyForm())
 const editingKeyPreview = ref('')
 
 const apiTypeOptions = [
+  { value: 'auto', label: '自动尝试协议', hint: '在当前节点内依次尝试 Images / async / Chat' },
   { value: 'openai', label: 'OpenAI 兼容', hint: '标准 /v1/images 接口（推荐）' },
   { value: 'chat', label: 'Chat Completions', hint: 'POST /v1/chat/completions（部分代理用此端点）' },
   { value: 'custom', label: '自定义 URL', hint: '直接 POST 到填写的完整地址，不拼接任何路径' },
@@ -53,6 +42,7 @@ const apiTypeOptions = [
 const formTitle = computed(() => (editingId.value ? '编辑 API 节点' : '新增 API 节点'))
 const enabledCount = computed(() => configs.value.filter((item) => item.status).length)
 const apiTypeLabel = (value) => {
+  if (value === 'auto') return '自动尝试协议'
   if (value === 'async') return '异步中转'
   if (value === 'custom') return '自定义 URL'
   if (value === 'chat') return 'Chat 补全'
@@ -65,6 +55,7 @@ const endpointHint = computed(() => {
   if (form.api_type === 'async') return `提交：${base}/async/images`
   if (form.api_type === 'chat') return `请求：${base}/v1/chat/completions`
   const root = base.endsWith('/v1') ? base : `${base}/v1`
+  if (form.api_type === 'auto') return `自动：当前节点内尝试 ${root}/images/generations、${base}/async/images、${root}/chat/completions`
   return `请求：${root}/images/generations`
 })
 
@@ -125,23 +116,11 @@ function buildPayload() {
     model: form.model,
     api_type: form.api_type,
     status: form.status,
-    auto_mode: form.auto_mode,
-    internal_auto_mode: form.internal_auto_mode,
+    auto_mode: true,
+    internal_auto_mode: false,
     timeout_seconds: form.timeout_seconds,
     retry_count: form.retry_count,
-    modes: form.internal_auto_mode
-      ? form.modes.map((mode, index) => {
-          const item = {
-            name: mode.name?.trim() || `mode-${index + 1}`,
-            api_type: mode.api_type || form.api_type,
-          }
-          if (mode.base_url?.trim()) item.base_url = mode.base_url.trim()
-          if (mode.model?.trim()) item.model = mode.model.trim()
-          if (mode.timeout_seconds !== null && mode.timeout_seconds !== '') item.timeout_seconds = mode.timeout_seconds
-          if (mode.retry_count !== null && mode.retry_count !== '') item.retry_count = mode.retry_count
-          return item
-        })
-      : [],
+    modes: [],
   }
 }
 
@@ -154,13 +133,11 @@ function editConfig(item) {
     base_url: item.base_url,
     api_key: '', // never prefilled — the backend only returns a masked preview
     model: item.model || 'gpt-image-2',
-    api_type: item.api_type || 'openai',
+    api_type: item.api_type || 'auto',
     status: Boolean(item.status),
     auto_mode: item.auto_mode !== false,
-    internal_auto_mode: Boolean(item.internal_auto_mode),
     timeout_seconds: item.timeout_seconds || 30,
     retry_count: item.retry_count || 0,
-    modes: Array.isArray(item.modes) ? item.modes.map((mode) => ({ ...createMode(), ...mode })) : [],
   })
 }
 
@@ -173,19 +150,27 @@ async function selectConfig(item) {
   await loadEditingKey({ visible: false })
 }
 
-function addMode() {
-  form.modes.push({ ...createMode(), api_type: form.api_type })
-}
-
-function removeMode(index) {
-  form.modes.splice(index, 1)
-}
-
 async function recoverMissingConfig(itemId) {
   delete revealedKeys[itemId]
   if (editingId.value === itemId) resetForm()
   ElMessage.warning('该 API 节点不存在或服务未刷新，已重新加载节点列表')
   await loadConfigs()
+}
+
+async function handleSecretNotFound(itemId) {
+  delete revealedKeys[itemId]
+  let latest = []
+  try {
+    latest = await listConfigs()
+    configs.value = latest
+  } catch {
+    latest = configs.value
+  }
+  if (latest.some((item) => item.id === itemId)) {
+    ElMessage.error(backendRouteMissingMessage('API Key 查看'))
+    return
+  }
+  await recoverMissingConfig(itemId)
 }
 
 async function toggleSecret(item) {
@@ -198,8 +183,8 @@ async function toggleSecret(item) {
     const secret = await getConfigSecret(item.id)
     revealedKeys[item.id] = secret.api_key || ''
   } catch (error) {
-    if (error.status === 404) {
-      await recoverMissingConfig(item.id)
+    if (isBackendRouteMissing(error)) {
+      await handleSecretNotFound(item.id)
       return
     }
     ElMessage.error(error.message || '读取 API Key 失败')
@@ -216,8 +201,8 @@ async function loadEditingKey({ visible }) {
     form.api_key = secret.api_key || ''
     editingSecretVisible.value = visible
   } catch (error) {
-    if (error.status === 404) {
-      await recoverMissingConfig(editingId.value)
+    if (isBackendRouteMissing(error)) {
+      await handleSecretNotFound(editingId.value)
       return
     }
     ElMessage.error(error.message || '读取 API Key 失败')
@@ -322,32 +307,22 @@ onMounted(loadConfigs)
           </label>
           <label class="block">
             <span class="mb-1 block text-sm font-semibold">API Key</span>
-            <template v-if="editingId">
-              <div class="rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface-soft)] p-3">
-                <div class="flex items-center justify-between gap-3">
-                  <div class="min-w-0">
-                    <p class="text-xs text-[var(--studio-muted)]">当前 Key</p>
-                    <p class="mt-1 truncate text-sm font-semibold text-[var(--studio-ink)]">
-                      {{ editingSecretVisible ? form.api_key : editingKeyPreview || '********' }}
-                    </p>
-                  </div>
-                  <el-button
-                    :icon="editingSecretVisible ? Hide : View"
-                    :loading="secretLoadingId === editingId"
-                    @click="editingSecretVisible ? hideEditingKey() : revealEditingKey()"
-                    circle
-                    :title="editingSecretVisible ? '隐藏 Key' : '显示 Key'"
-                    :aria-label="editingSecretVisible ? '隐藏 API Key' : '显示 API Key'"
-                  />
-                </div>
-                <el-input
-                  v-model="form.api_key"
-                  class="mt-3"
-                  :type="editingSecretVisible ? 'text' : 'password'"
-                  placeholder="输入新的 API Key；留空保存则不修改"
+            <el-input
+              v-if="editingId"
+              v-model="form.api_key"
+              :type="editingSecretVisible ? 'text' : 'password'"
+              :placeholder="editingKeyPreview || '输入新的 API Key；留空保存则不修改'"
+            >
+              <template #append>
+                <el-button
+                  :icon="editingSecretVisible ? Hide : View"
+                  :loading="secretLoadingId === editingId"
+                  @click="editingSecretVisible ? hideEditingKey() : revealEditingKey()"
+                  :title="editingSecretVisible ? '隐藏 Key' : '显示 Key'"
+                  :aria-label="editingSecretVisible ? '隐藏 API Key' : '显示 API Key'"
                 />
-              </div>
-            </template>
+              </template>
+            </el-input>
             <el-input
               v-else
               v-model="form.api_key"
@@ -373,13 +348,6 @@ onMounted(loadConfigs)
             <span class="text-sm font-semibold">启用节点</span>
             <el-switch v-model="form.status" />
           </div>
-          <div class="flex items-center justify-between rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface-soft)] px-3 py-2">
-            <div>
-              <span class="text-sm font-semibold">自动模式</span>
-              <p class="text-xs text-[var(--studio-muted)]">失败后按优先级继续尝试后续节点</p>
-            </div>
-            <el-switch v-model="form.auto_mode" />
-          </div>
           <div class="grid grid-cols-2 gap-3">
             <label class="block">
               <span class="mb-1 block text-sm font-semibold">超时时间（秒）</span>
@@ -389,34 +357,6 @@ onMounted(loadConfigs)
               <span class="mb-1 block text-sm font-semibold">重试次数</span>
               <el-input-number v-model="form.retry_count" :min="0" :step="1" controls-position="right" class="w-full" />
             </label>
-          </div>
-          <div class="rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface-soft)] p-3">
-            <div class="flex items-center justify-between gap-3">
-              <div>
-                <span class="text-sm font-semibold">节点内部自动模式</span>
-                <p class="text-xs text-[var(--studio-muted)]">按下方模式顺序依次尝试，单个模式失败后再切换下一个。</p>
-              </div>
-              <el-switch v-model="form.internal_auto_mode" />
-            </div>
-
-            <div v-if="form.internal_auto_mode" class="mt-3 space-y-3">
-              <div
-                v-for="(modeItem, index) in form.modes"
-                :key="index"
-                class="grid grid-cols-[minmax(0,1fr)_110px_88px_88px_auto] gap-2 rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface)] p-2"
-              >
-                <el-input v-model="modeItem.name" placeholder="模式名" />
-                <el-select v-model="modeItem.api_type">
-                  <el-option v-for="opt in apiTypeOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
-                </el-select>
-                <el-input-number v-model="modeItem.timeout_seconds" :min="1" :step="1" step-strictly controls-position="right" placeholder="继承" />
-                <el-input-number v-model="modeItem.retry_count" :min="0" :step="1" controls-position="right" placeholder="继承" />
-                <el-button :icon="Delete" title="删除模式" @click="removeMode(index)" />
-                <el-input v-model="modeItem.base_url" class="col-span-2" placeholder="Base URL，留空继承节点" />
-                <el-input v-model="modeItem.model" class="col-span-3" placeholder="模型，留空继承节点" />
-              </div>
-              <el-button text type="primary" :icon="Plus" @click="addMode">添加请求模式</el-button>
-            </div>
           </div>
         </div>
 
@@ -465,11 +405,10 @@ onMounted(loadConfigs)
               <p class="mt-1 truncate text-sm text-[var(--studio-muted)]">{{ item.base_url }}</p>
               <p class="mt-1 flex items-center gap-2 text-xs text-[var(--studio-muted)]">
                 <span>Key {{ revealedKeys[item.id] || item.api_key_preview || '********' }}</span>
-                <span v-if="item.internal_auto_mode">内部模式 {{ item.modes?.length || 0 }}</span>
               </p>
               <p class="mt-1 text-xs text-[var(--studio-muted)]">{{ item.model }} · {{ apiTypeLabel(item.api_type) }}</p>
               <p class="mt-1 text-xs text-[var(--studio-muted)]">
-                {{ item.auto_mode === false ? '单节点' : '自动容错' }} · {{ item.timeout_seconds || 30 }}s · 重试 {{ item.retry_count || 0 }}
+                失败继续后续节点 · {{ item.timeout_seconds || 30 }}s · 重试 {{ item.retry_count || 0 }}
               </p>
             </div>
 

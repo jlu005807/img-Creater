@@ -50,6 +50,9 @@ if [ ! -f backend/data/configs.json ] && [ -f backend/data/configs.example.json 
   ok 'Created backend/data/configs.json from template'
 fi
 
+mkdir -p history
+ok 'Ensured history directory exists'
+
 printf '\nDone.\n'
-printf 'Start everything with:  ./run.sh\n'
+printf 'Start everything with:  ./run.sh  (it frees stale ports 5000/5173 first)\n'
 printf 'Then open the gear icon (top-right) to add an API node.\n'

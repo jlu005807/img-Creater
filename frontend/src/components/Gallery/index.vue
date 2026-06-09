@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from 'vue'
 import { Download, Picture, Refresh } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { listSessions } from '../../api/generation'
+import { backendRouteMissingMessage, isBackendRouteMissing } from '../../api/client'
 import { downloadImage } from '../../utils/download'
 
 const loading = ref(false)
@@ -31,7 +32,7 @@ async function loadGallery() {
     const data = await listSessions()
     sessions.value = Array.isArray(data) ? data : []
   } catch (error) {
-    ElMessage.error(error.message || '作品集加载失败')
+    ElMessage.error(isBackendRouteMissing(error) ? backendRouteMissingMessage('作品集') : error.message || '作品集加载失败')
   } finally {
     loading.value = false
   }

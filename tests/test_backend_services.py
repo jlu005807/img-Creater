@@ -2,24 +2,43 @@ import base64
 import io
 import json
 import tempfile
+import time
 from pathlib import Path
 from unittest import TestCase, main
 
 from PIL import Image
+from requests.exceptions import Timeout
 
 from backend.services.config_service import ConfigService
 from backend.services.image_service import ImageService
+from backend.services.prompt_template_service import DEFAULT_TEMPLATES, PromptTemplateService
 from backend.services.task_store import TaskStore
 
 
 class FakeResponse:
-    def __init__(self, status_code=200, payload=None, text=""):
+    def __init__(self, status_code=200, payload=None, text="", headers=None):
         self.status_code = status_code
         self._payload = payload if payload is not None else {}
         self.text = text or json.dumps(self._payload)
+        self.headers = dict(headers or {})
+        self.content = b""
 
     def json(self):
         return self._payload
+
+
+class FakeBinaryResponse(FakeResponse):
+    def __init__(self, content=b"PNGDATA", status_code=200, headers=None):
+        super().__init__(status_code, payload={}, text="", headers=headers or {"Content-Type": "image/png"})
+        self.content = content
+
+
+class BadJsonResponse(FakeResponse):
+    def __init__(self, status_code=200, text="<html>bad gateway</html>", headers=None):
+        super().__init__(status_code, payload={}, text=text, headers=headers)
+
+    def json(self):
+        raise ValueError("Expecting value: line 1 column 1 (char 0)")
 
 
 class FakeHttpClient:
@@ -44,8 +63,51 @@ class FakeHttpClient:
         return response
 
 
+class TimeAdvancingHttpClient(FakeHttpClient):
+    def __init__(self, clock, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.clock = clock
+
+    def get(self, url, **kwargs):
+        self.clock["now"] += 2
+        return super().get(url, **kwargs)
+
+
+class CancellingGetHttpClient(FakeHttpClient):
+    def __init__(self, store, task_id_holder, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.store = store
+        self.task_id_holder = task_id_holder
+
+    def get(self, url, **kwargs):
+        with self.store._lock:
+            task_id = self.task_id_holder.get("task_id") or next(iter(self.store._tasks))
+        self.store.cancel(task_id)
+        return super().get(url, **kwargs)
+
+
+class CancelAwareHttpClient(FakeHttpClient):
+    def __init__(self, store, task_id_holder):
+        super().__init__()
+        self.store = store
+        self.task_id_holder = task_id_holder
+
+    def post(self, url, **kwargs):
+        self.posts.append((url, kwargs))
+        task_id = self.task_id_holder.get("task_id")
+        if not task_id:
+            with self.store._lock:
+                task_id = next(iter(self.store._tasks))
+        self.store.cancel(task_id)
+        return FakeResponse(200, {"data": [{"b64_json": "QUJD"}]})
+
+
 def _png_data_url(size=(4, 4), color=(255, 255, 255, 255)):
     image = Image.new("RGBA", size, color)
+    return _image_data_url(image)
+
+
+def _image_data_url(image):
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
@@ -56,10 +118,11 @@ def _service(config_service, http_client, **kwargs):
     # run_async=False executes the worker inline for deterministic assertions.
     if "result_dir" not in kwargs and "persist_results" not in kwargs:
         kwargs["persist_results"] = False
+    if "store" not in kwargs:
+        kwargs["store"] = TaskStore()
     return ImageService(
         config_service=config_service,
         http_client=http_client,
-        store=TaskStore(),
         run_async=False,
         async_poll_interval=0,
         **kwargs,
@@ -84,7 +147,7 @@ class ConfigServiceTests(TestCase):
             second = service.create_config(
                 {
                     "name": "Relay",
-                    "base_url": "https://relay.example.com",
+                    "base_url": "https://fnuu.net",
                     "api_key": "key-2",
                     "model": "gpt-image-2",
                     "api_type": "async",
@@ -93,13 +156,32 @@ class ConfigServiceTests(TestCase):
             )
 
             self.assertEqual(first["base_url"], "https://primary.example.com")
-            self.assertEqual(first["api_type"], "openai")  # default
+            self.assertEqual(first["api_type"], "auto")  # default
             self.assertEqual(second["api_type"], "async")
             self.assertEqual([item["id"] for item in service.list_configs()], [first["id"], second["id"]])
 
             service.reorder_configs([second["id"], first["id"]])
             reloaded = ConfigService(config_path=config_path)
             self.assertEqual([item["id"] for item in reloaded.list_configs()], [second["id"], first["id"]])
+
+    def test_accepts_auto_api_type_without_rewriting_to_specific_protocol(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+
+            created = service.create_config(
+                {
+                    "name": "Auto",
+                    "base_url": "https://fnuu.net",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "auto",
+                    "status": True,
+                }
+            )
+
+            self.assertEqual(created["api_type"], "auto")
+            updated = service.update_config(created["id"], {"name": "Auto Updated"})
+            self.assertEqual(updated["api_type"], "auto")
 
     def test_persists_runtime_options_and_defaults_auto_mode(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -204,6 +286,47 @@ class ConfigServiceTests(TestCase):
             self.assertEqual(updated_null["api_key"], "sk-secret-1234")
 
 
+class PromptTemplateServiceTests(TestCase):
+    def test_default_templates_include_people_generation_examples_exact_text(self):
+        templates = {item["id"]: item for item in DEFAULT_TEMPLATES}
+
+        self.assertIn("seed-portrait-basketball-direct-flash", templates)
+        self.assertIn("seed-portrait-korean-soft-mist", templates)
+        self.assertIn("seed-portrait-subway-candid", templates)
+
+        self.assertIn("Basketball Court Direct Flash Portrait", templates["seed-portrait-basketball-direct-flash"]["title"])
+        self.assertIn(
+            "35mm color film photography with harsh direct on-camera flash",
+            templates["seed-portrait-basketball-direct-flash"]["text"],
+        )
+        self.assertIn(
+            "body angled sideways with naturally arched back and hips gently pushed back",
+            templates["seed-portrait-basketball-direct-flash"]["text"],
+        )
+        self.assertIn("Source: @BubbleBrain", templates["seed-portrait-basketball-direct-flash"]["text"])
+
+        self.assertIn("Korean Editorial Portrait with Soft Mist", templates["seed-portrait-korean-soft-mist"]["title"])
+        self.assertIn(
+            "9:16 vertical - editorial portrait, single subject soft black mist filter",
+            templates["seed-portrait-korean-soft-mist"]["text"],
+        )
+        self.assertIn("Source: @BubbleBrain", templates["seed-portrait-korean-soft-mist"]["text"])
+
+        self.assertIn("Subway Candid Photo", templates["seed-portrait-subway-candid"]["title"])
+        self.assertEqual(
+            templates["seed-portrait-subway-candid"]["text"],
+            "Prompt:\n\nA beautiful woman looking at her phone on the subway; a candid photo.\nSource: @AntCaveClub | @underwoodxie96",
+        )
+
+    def test_initializes_prompt_template_json_with_people_examples(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = PromptTemplateService(template_path=Path(tmp_dir) / "prompt_templates.json")
+            templates = {item["id"]: item for item in service.list_templates()}
+
+            self.assertIn("seed-portrait-basketball-direct-flash", templates)
+            self.assertIn("Source: @BubbleBrain", templates["seed-portrait-basketball-direct-flash"]["text"])
+
+
 class OpenAIProviderTests(TestCase):
     def _config_service(self, tmp_dir, configs):
         service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
@@ -290,6 +413,94 @@ class OpenAIProviderTests(TestCase):
             # size='auto' must be omitted so non-gpt-image upstreams don't 400.
             self.assertNotIn("size", http_client.posts[0][1]["json"])
 
+    def test_openai_edit_mask_already_at_source_size_is_not_cropped_by_panel_selection(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service, _ = self._config_service(
+                tmp_dir,
+                [
+                    {
+                        "name": "Primary",
+                        "base_url": "https://api.openai.com",
+                        "api_key": "key-1",
+                        "model": "gpt-image-2",
+                        "api_type": "openai",
+                        "status": True,
+                    }
+                ],
+            )
+            source = _png_data_url((6, 6))
+            mask = Image.new("RGBA", (6, 6), (0, 0, 0, 0))
+            # Frontend exportPayload already scales mask to the source image
+            # size. This opaque pixel must survive even when selection.box is
+            # panel-space and larger than the source.
+            mask.putpixel((5, 5), (255, 255, 255, 255))
+            http_client = FakeHttpClient(
+                post_responses=[FakeResponse(200, {"data": [{"b64_json": "QUJD"}]})]
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_edit_generation(
+                prompt="edit corner",
+                image=source,
+                mask=_image_data_url(mask),
+                size="1024x1024",
+                n=1,
+                selection={
+                    "canvas": {"width": 400, "height": 360},
+                    "box": {"x": 20, "y": 0, "width": 360, "height": 360},
+                },
+            )
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "completed")
+            sent_mask_bytes = http_client.posts[0][1]["files"]["mask"][1]
+            output = Image.open(io.BytesIO(sent_mask_bytes)).convert("RGBA")
+            self.assertEqual(output.size, (6, 6))
+            # OpenAI masks invert alpha: opaque editor mark -> transparent edit area.
+            self.assertEqual(output.getpixel((5, 5))[3], 0)
+            self.assertEqual(output.getpixel((0, 0))[3], 255)
+
+    def test_openai_edit_panel_sized_mask_is_cropped_to_image_box_before_resize(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service, _ = self._config_service(
+                tmp_dir,
+                [
+                    {
+                        "name": "Primary",
+                        "base_url": "https://api.openai.com",
+                        "api_key": "key-1",
+                        "model": "gpt-image-2",
+                        "api_type": "openai",
+                        "status": True,
+                    }
+                ],
+            )
+            source = _png_data_url((2, 2))
+            mask = Image.new("RGBA", (4, 4), (0, 0, 0, 0))
+            mask.putpixel((3, 3), (255, 255, 255, 255))
+            http_client = FakeHttpClient(
+                post_responses=[FakeResponse(200, {"data": [{"b64_json": "QUJD"}]})]
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_edit_generation(
+                prompt="edit corner",
+                image=source,
+                mask=_image_data_url(mask),
+                size="1024x1024",
+                n=1,
+                selection={
+                    "canvas": {"width": 4, "height": 4},
+                    "box": {"x": 2, "y": 2, "width": 2, "height": 2},
+                },
+            )
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "completed")
+            sent_mask_bytes = http_client.posts[0][1]["files"]["mask"][1]
+            output = Image.open(io.BytesIO(sent_mask_bytes)).convert("RGBA")
+            self.assertEqual(output.getpixel((1, 1))[3], 0)
+
     def test_provider_timeout_is_not_capped_by_global_task_timeout(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_service, _ = self._config_service(
@@ -315,6 +526,326 @@ class OpenAIProviderTests(TestCase):
 
             self.assertEqual(http_client.posts[0][1]["timeout"], 9999)
 
+    def test_openai_generation_uses_generation_timeout_floor_for_slow_sync_providers(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service, _ = self._config_service(
+                tmp_dir,
+                [
+                    {
+                        "name": "Primary",
+                        "base_url": "https://api.openai.com",
+                        "api_key": "key-1",
+                        "model": "gpt-image-2",
+                        "api_type": "openai",
+                        "status": True,
+                        "timeout_seconds": 30,
+                    }
+                ],
+            )
+            http_client = FakeHttpClient(
+                post_responses=[FakeResponse(200, {"data": [{"b64_json": "QUJD"}]})]
+            )
+            service = _service(config_service, http_client, generation_timeout=180)
+
+            submit = service.submit_generation(prompt="hi", size="1024x1024", n=1)
+            service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(http_client.posts[0][1]["timeout"], 180)
+            self.assertEqual(submit["max_wait_seconds"], 180)
+
+    def test_openai_generation_timeout_stops_without_next_node_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service, created = self._config_service(
+                tmp_dir,
+                [
+                    {
+                        "name": "Primary",
+                        "base_url": "https://api.openai.com",
+                        "api_key": "key-1",
+                        "model": "gpt-image-2",
+                        "api_type": "openai",
+                        "status": True,
+                        "timeout_seconds": 30,
+                    },
+                    {
+                        "name": "Backup",
+                        "base_url": "https://backup.example.com",
+                        "api_key": "key-2",
+                        "model": "gpt-image-2",
+                        "api_type": "openai",
+                        "status": True,
+                        "timeout_seconds": 30,
+                    },
+                ],
+            )
+            _primary, _backup = created
+            http_client = FakeHttpClient(
+                post_responses=[Timeout("Read timed out."), FakeResponse(200, {"data": [{"b64_json": "QUJD"}]})]
+            )
+            service = _service(config_service, http_client, generation_timeout=180)
+
+            submit = service.submit_generation(prompt="hi", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "failed")
+            self.assertIn("请求超时", result["error"])
+            self.assertIn("避免重复扣费", result["error"])
+            self.assertEqual([call[0] for call in http_client.posts], ["https://api.openai.com/v1/images/generations"])
+            self.assertEqual([call[1]["timeout"] for call in http_client.posts], [180])
+            self.assertEqual(submit["max_wait_seconds"], 180)
+
+    def test_grok_imagine_generation_uses_xai_openai_compatible_shape(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service, _ = self._config_service(
+                tmp_dir,
+                [
+                    {
+                        "name": "xAI",
+                        "base_url": "https://api.x.ai",
+                        "api_key": "key-1",
+                        "model": "grok-imagine-image-lite",
+                        "api_type": "openai",
+                        "status": True,
+                    }
+                ],
+            )
+            http_client = FakeHttpClient(
+                post_responses=[FakeResponse(200, {"data": [{"url": "https://cdn.example.com/grok.png"}]})]
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="hi", size="971x1619", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(http_client.posts[0][0], "https://api.x.ai/v1/images/generations")
+            body = http_client.posts[0][1]["json"]
+            self.assertEqual(body["model"], "grok-imagine-image-lite")
+            self.assertEqual(body["aspect_ratio"], "9:16")
+            self.assertEqual(body["resolution"], "2k")
+            self.assertNotIn("size", body)
+
+    def test_grok_imagine_edit_uses_xai_json_image_url_shape(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service, _ = self._config_service(
+                tmp_dir,
+                [
+                    {
+                        "name": "xAI",
+                        "base_url": "https://api.x.ai",
+                        "api_key": "key-1",
+                        "model": "grok-imagine-image-lite",
+                        "api_type": "openai",
+                        "status": True,
+                    }
+                ],
+            )
+            source = _png_data_url((4, 4))
+            mask = _png_data_url((4, 4))
+            composite = _png_data_url((4, 4), color=(0, 255, 255, 255))
+            http_client = FakeHttpClient(
+                post_responses=[FakeResponse(200, {"data": [{"url": "https://cdn.example.com/grok-edit.png"}]})]
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_edit_generation(
+                prompt="change the marked area",
+                image=source,
+                mask=mask,
+                composite=composite,
+                size="1024x1024",
+                n=1,
+            )
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(http_client.posts[0][0], "https://api.x.ai/v1/images/edits")
+            kwargs = http_client.posts[0][1]
+            self.assertNotIn("files", kwargs)
+            body = kwargs["json"]
+            self.assertEqual(body["model"], "grok-imagine-image-lite")
+            self.assertEqual(body["prompt"], "change the marked area")
+            self.assertEqual(body["n"], 1)
+            self.assertEqual(body["image"], {"type": "image_url", "url": composite})
+            self.assertNotIn("mask", body)
+            self.assertNotIn("size", body)
+
+    def test_grok_imagine_reference_generation_uses_xai_json_images_shape(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service, _ = self._config_service(
+                tmp_dir,
+                [
+                    {
+                        "name": "xAI",
+                        "base_url": "https://api.x.ai",
+                        "api_key": "key-1",
+                        "model": "grok-imagine-image-lite",
+                        "api_type": "openai",
+                        "status": True,
+                    }
+                ],
+            )
+            references = [_png_data_url((4, 4)), _png_data_url((6, 6))]
+            http_client = FakeHttpClient(
+                post_responses=[FakeResponse(200, {"data": [{"url": "https://cdn.example.com/grok-ref.png"}]})]
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(
+                prompt="blend these",
+                size="1024x1024",
+                n=1,
+                reference_images=references,
+            )
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(http_client.posts[0][0], "https://api.x.ai/v1/images/edits")
+            kwargs = http_client.posts[0][1]
+            self.assertNotIn("files", kwargs)
+            body = kwargs["json"]
+            self.assertEqual(body["model"], "grok-imagine-image-lite")
+            self.assertEqual(body["prompt"], "blend these")
+            self.assertEqual(body["images"], [{"type": "image_url", "url": ref} for ref in references])
+            self.assertNotIn("size", body)
+
+    def test_grok_imagine_generation_maps_two_to_one_custom_size(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service, _ = self._config_service(
+                tmp_dir,
+                [
+                    {
+                        "name": "xAI",
+                        "base_url": "https://api.x.ai",
+                        "api_key": "key-1",
+                        "model": "grok-imagine-image-lite",
+                        "api_type": "openai",
+                        "status": True,
+                    }
+                ],
+            )
+            http_client = FakeHttpClient(
+                post_responses=[FakeResponse(200, {"data": [{"url": "https://cdn.example.com/grok-wide.png"}]})]
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="wide scene", size="2048x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "completed")
+            body = http_client.posts[0][1]["json"]
+            self.assertEqual(body["aspect_ratio"], "2:1")
+            self.assertEqual(body["resolution"], "2k")
+
+    def test_openai_generation_tracks_client_and_upstream_request_ids(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service, _ = self._config_service(
+                tmp_dir,
+                [
+                    {
+                        "name": "Primary",
+                        "base_url": "https://api.openai.com",
+                        "api_key": "key-1",
+                        "model": "gpt-image-2",
+                        "api_type": "openai",
+                        "status": True,
+                    }
+                ],
+            )
+            http_client = FakeHttpClient(
+                post_responses=[
+                    FakeResponse(
+                        200,
+                        {"data": [{"b64_json": "QUJD"}]},
+                        headers={"x-request-id": "req-upstream-123"},
+                    )
+                ]
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="hi", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(http_client.posts[0][1]["headers"]["X-Client-Request-Id"], submit["task_id"])
+            self.assertEqual(result["request_id"], submit["task_id"])
+            self.assertEqual(result["upstream_request_id"], "req-upstream-123")
+
+    def test_openai_generation_exposes_response_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service, _ = self._config_service(
+                tmp_dir,
+                [
+                    {
+                        "name": "Primary",
+                        "base_url": "https://api.openai.com",
+                        "api_key": "key-1",
+                        "model": "gpt-image-2",
+                        "api_type": "openai",
+                        "status": True,
+                    }
+                ],
+            )
+            http_client = FakeHttpClient(
+                post_responses=[
+                    FakeResponse(
+                        200,
+                        {
+                            "created": 1713833628,
+                            "background": "opaque",
+                            "output_format": "png",
+                            "quality": "high",
+                            "size": "1024x1024",
+                            "usage": {"total_tokens": 123},
+                            "data": [{"b64_json": "QUJD"}],
+                        },
+                    )
+                ]
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="hi", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(
+                result["response_meta"],
+                {
+                    "created": 1713833628,
+                    "background": "opaque",
+                    "output_format": "png",
+                    "quality": "high",
+                    "size": "1024x1024",
+                    "usage": {"total_tokens": 123},
+                },
+            )
+
+    def test_cancelled_task_ignores_late_openai_response(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service, _ = self._config_service(
+                tmp_dir,
+                [
+                    {
+                        "name": "Primary",
+                        "base_url": "https://api.openai.com",
+                        "api_key": "key-1",
+                        "model": "gpt-image-2",
+                        "api_type": "openai",
+                        "status": True,
+                    }
+                ],
+            )
+            store = TaskStore()
+            task_id_holder = {}
+            http_client = CancelAwareHttpClient(store, task_id_holder)
+            service = _service(config_service, http_client, store=store)
+
+            submit = service.submit_generation(prompt="hi", size="1024x1024", n=1)
+            task_id_holder["task_id"] = submit["task_id"]
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "cancelled")
+            self.assertEqual(result["urls"], [])
+            self.assertEqual(result["error"], "任务已手动停止")
+
     def test_generation_falls_back_to_next_enabled_node(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_service, created = self._config_service(
@@ -325,6 +856,7 @@ class OpenAIProviderTests(TestCase):
                         "base_url": "https://primary.example.com",
                         "api_key": "key-1",
                         "model": "gpt-image-2",
+                        "api_type": "openai",
                         "status": True,
                     },
                     {
@@ -339,6 +871,7 @@ class OpenAIProviderTests(TestCase):
                         "base_url": "https://backup.example.com",
                         "api_key": "key-2",
                         "model": "gpt-image-2",
+                        "api_type": "openai",
                         "status": True,
                     },
                 ],
@@ -367,6 +900,395 @@ class OpenAIProviderTests(TestCase):
             self.assertFalse(result["attempts"][0]["ok"])
             self.assertEqual(result["attempts"][0]["api_id"], primary["id"])
             self.assertTrue(result["attempts"][1]["ok"])
+
+    def test_generation_falls_back_to_next_node_even_when_first_auto_mode_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service, _created = self._config_service(
+                tmp_dir,
+                [
+                    {
+                        "name": "Primary",
+                        "base_url": "https://primary.example.com",
+                        "api_key": "key-1",
+                        "model": "gpt-image-2",
+                        "api_type": "openai",
+                        "status": True,
+                        "auto_mode": False,
+                    },
+                    {
+                        "name": "Backup",
+                        "base_url": "https://backup.example.com",
+                        "api_key": "key-2",
+                        "model": "gpt-image-2",
+                        "api_type": "openai",
+                        "status": True,
+                    },
+                ],
+            )
+            http_client = FakeHttpClient(
+                post_responses=[
+                    FakeResponse(500, {"error": {"message": "primary failed"}}),
+                    FakeResponse(200, {"data": [{"url": "https://cdn.example.com/ok.png"}]}),
+                ]
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="a red house", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["urls"], ["https://cdn.example.com/ok.png"])
+            self.assertEqual(
+                [call[0] for call in http_client.posts],
+                [
+                    "https://primary.example.com/v1/images/generations",
+                    "https://backup.example.com/v1/images/generations",
+                ],
+            )
+
+    def test_openai_timeout_does_not_retry_or_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service, _created = self._config_service(
+                tmp_dir,
+                [
+                    {
+                        "name": "Slow OpenAI",
+                        "base_url": "https://slow.example.com",
+                        "api_key": "key-1",
+                        "model": "gpt-image-2",
+                        "api_type": "openai",
+                        "status": True,
+                        "timeout_seconds": 60,
+                        "retry_count": 3,
+                    },
+                    {
+                        "name": "Relay",
+                        "base_url": "https://relay.example.com",
+                        "api_key": "key-2",
+                        "model": "gpt-image-2",
+                        "api_type": "async",
+                        "status": True,
+                    },
+                ],
+            )
+            http_client = FakeHttpClient(
+                post_responses=[
+                    Timeout("read timed out"),
+                    FakeResponse(200, {"task_id": "up-1", "status": "queued"}),
+                ],
+                get_responses=[FakeResponse(200, {"status": "completed", "urls": ["https://cdn.example.com/a.png"]})],
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="a red house", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "failed")
+            self.assertIn("请求超时", result["error"])
+            self.assertIn("避免重复扣费", result["error"])
+            self.assertEqual([call[0] for call in http_client.posts], ["https://slow.example.com/v1/images/generations"])
+            self.assertEqual(http_client.gets, [])
+
+    def test_openai_compat_use_async_images_error_switches_same_node_to_async(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service, _created = self._config_service(
+                tmp_dir,
+                [
+                    {
+                        "name": "Relay",
+                        "base_url": "https://relay.example.com",
+                        "api_key": "key-1",
+                        "model": "gpt-image-2",
+                        "api_type": "openai",
+                        "status": True,
+                    },
+                ],
+            )
+            http_client = FakeHttpClient(
+                post_responses=[
+                    FakeResponse(
+                        503,
+                        {
+                            "error": {
+                                "message": "please use async endpoint POST /async/images",
+                                "code": "use_async_images",
+                            }
+                        },
+                    ),
+                    FakeResponse(200, {"task_id": "up-1", "status": "queued"}),
+                ],
+                get_responses=[FakeResponse(200, {"status": "completed", "urls": ["https://cdn.example.com/a.png"]})],
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="a red house", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(
+                [call[0] for call in http_client.posts],
+                [
+                    "https://relay.example.com/v1/images/generations",
+                    "https://relay.example.com/async/images",
+                ],
+            )
+
+    def test_auto_protocol_switches_to_async_without_rewriting_config(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "configs.json"
+            config_service = ConfigService(config_path=config_path)
+            created = config_service.create_config(
+                {
+                    "name": "Relay",
+                    "base_url": "https://relay.example.com",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "auto",
+                    "status": True,
+                }
+            )
+            http_client = FakeHttpClient(
+                post_responses=[
+                    FakeResponse(
+                        503,
+                        {
+                            "error": {
+                                "message": "please use async endpoint POST /async/images",
+                                "code": "use_async_images",
+                            }
+                        },
+                    ),
+                    FakeResponse(200, {"task_id": "up-1", "status": "queued"}),
+                ],
+                get_responses=[FakeResponse(200, {"status": "completed", "urls": ["https://cdn.example.com/a.png"]})],
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="a red house", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+            reloaded = ConfigService(config_path=config_path)
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["effective_api_type"], "async")
+            self.assertEqual(result["attempts"][0]["configured_api_type"], "auto")
+            self.assertEqual(result["attempts"][0]["effective_api_type"], "async")
+            self.assertEqual(reloaded.get_config(created["id"])["api_type"], "auto")
+            self.assertEqual(
+                [call[0] for call in http_client.posts],
+                [
+                    "https://relay.example.com/v1/images/generations",
+                    "https://relay.example.com/async/images",
+                ],
+            )
+
+    def test_auto_protocol_uses_openai_first_for_aiapi_host_and_records_request_url(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service, created = self._config_service(
+                tmp_dir,
+                [
+                    {
+                        "name": "aiapi1",
+                        "base_url": "https://aiapi1.cc.cd",
+                        "api_key": "key-1",
+                        "model": "gpt-image-2",
+                        "api_type": "auto",
+                        "status": True,
+                    }
+                ],
+            )
+            http_client = FakeHttpClient(
+                post_responses=[FakeResponse(200, {"data": [{"b64_json": "QUJD"}]})]
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="a red house", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["api_id"], created[0]["id"])
+            self.assertEqual([call[0] for call in http_client.posts], ["https://aiapi1.cc.cd/v1/images/generations"])
+            self.assertEqual(result["effective_api_type"], "openai")
+            self.assertEqual(result["request_url"], "https://aiapi1.cc.cd/v1/images/generations")
+            self.assertEqual(result["attempts"][0]["configured_api_type"], "auto")
+            self.assertEqual(result["attempts"][0]["effective_api_type"], "openai")
+            self.assertEqual(result["attempts"][0]["request_url"], "https://aiapi1.cc.cd/v1/images/generations")
+
+    def test_auto_protocol_tries_all_supported_protocols_inside_node_before_next_node(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service, created = self._config_service(
+                tmp_dir,
+                [
+                    {
+                        "name": "Auto Node",
+                        "base_url": "https://auto.example.com",
+                        "api_key": "key-1",
+                        "model": "gpt-image-2",
+                        "api_type": "auto",
+                        "status": True,
+                        "retry_count": 0,
+                    },
+                    {
+                        "name": "Backup",
+                        "base_url": "https://backup.example.com",
+                        "api_key": "key-2",
+                        "model": "gpt-image-2",
+                        "api_type": "openai",
+                        "status": True,
+                    },
+                ],
+            )
+            primary, backup = created
+            http_client = FakeHttpClient(
+                post_responses=[
+                    FakeResponse(500, {"error": {"message": "openai images failed"}}),
+                    FakeResponse(404, {"error": {"message": "async unavailable"}}),
+                    FakeResponse(200, {"data": [{"b64_json": "QUJD"}], "output_format": "png"}),
+                ]
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="a red house", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["api_id"], primary["id"])
+            self.assertNotEqual(result["api_id"], backup["id"])
+            self.assertEqual(
+                [call[0] for call in http_client.posts],
+                [
+                    "https://auto.example.com/v1/images/generations",
+                    "https://auto.example.com/async/images",
+                    "https://auto.example.com/v1/chat/completions",
+                ],
+            )
+            self.assertFalse(result["attempts"][0]["ok"])
+            self.assertEqual(result["attempts"][0]["effective_api_type"], "openai")
+            self.assertFalse(result["attempts"][1]["ok"])
+            self.assertEqual(result["attempts"][1]["effective_api_type"], "async")
+            self.assertTrue(result["attempts"][2]["ok"])
+            self.assertEqual(result["attempts"][2]["effective_api_type"], "chat")
+
+    def test_auto_protocol_uses_async_first_for_known_async_host_without_rewriting_config(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "configs.json"
+            config_service = ConfigService(config_path=config_path)
+            created = config_service.create_config(
+                {
+                    "name": "fnuu",
+                    "base_url": "https://fnuu.net",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "auto",
+                    "status": True,
+                }
+            )
+            http_client = FakeHttpClient(
+                post_responses=[FakeResponse(200, {"task_id": "up-1", "status": "queued"})],
+                get_responses=[FakeResponse(200, {"status": "completed", "urls": ["https://cdn.example.com/a.png"]})],
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="a red house", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+            reloaded = ConfigService(config_path=config_path)
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["effective_api_type"], "async")
+            self.assertEqual(result["attempts"][0]["configured_api_type"], "auto")
+            self.assertEqual(result["attempts"][0]["effective_api_type"], "async")
+            self.assertEqual(reloaded.get_config(created["id"])["api_type"], "auto")
+            self.assertEqual([call[0] for call in http_client.posts], ["https://fnuu.net/async/images"])
+
+    def test_auto_protocol_falls_back_to_openai_when_async_endpoint_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "fnuu",
+                    "base_url": "https://fnuu.net",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "auto",
+                    "status": True,
+                    "retry_count": 0,
+                }
+            )
+            http_client = FakeHttpClient(
+                post_responses=[
+                    FakeResponse(404, {"error": {"message": "not found"}}),
+                    FakeResponse(200, {"data": [{"b64_json": "QUJD"}]}),
+                ]
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="a red house", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["effective_api_type"], "openai")
+            self.assertEqual(
+                [call[0] for call in http_client.posts],
+                [
+                    "https://fnuu.net/async/images",
+                    "https://fnuu.net/v1/images/generations",
+                ],
+            )
+            self.assertFalse(result["attempts"][0]["ok"])
+            self.assertEqual(result["attempts"][0]["effective_api_type"], "async")
+            self.assertTrue(result["attempts"][1]["ok"])
+            self.assertEqual(result["attempts"][1]["effective_api_type"], "openai")
+
+    def test_auto_protocol_tries_supported_protocols_inside_node_before_next_node(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service, created = self._config_service(
+                tmp_dir,
+                [
+                    {
+                        "name": "Auto Node",
+                        "base_url": "https://auto.example.com",
+                        "api_key": "key-1",
+                        "model": "gpt-image-2",
+                        "api_type": "auto",
+                        "status": True,
+                        "retry_count": 0,
+                    },
+                    {
+                        "name": "Backup",
+                        "base_url": "https://backup.example.com",
+                        "api_key": "key-2",
+                        "model": "gpt-image-2",
+                        "api_type": "openai",
+                        "status": True,
+                    },
+                ],
+            )
+            primary, _backup = created
+            http_client = FakeHttpClient(
+                post_responses=[
+                    FakeResponse(404, {"error": {"message": "not found"}}),
+                    FakeResponse(404, {"error": {"message": "not found"}}),
+                    FakeResponse(200, {"data": [{"b64_json": "QUJD"}]}),
+                ]
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="a red house", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["api_id"], primary["id"])
+            self.assertEqual(
+                [call[0] for call in http_client.posts],
+                [
+                    "https://auto.example.com/v1/images/generations",
+                    "https://auto.example.com/async/images",
+                    "https://auto.example.com/v1/chat/completions",
+                ],
+            )
+            self.assertEqual(
+                [attempt["effective_api_type"] for attempt in result["attempts"]],
+                ["openai", "async", "chat"],
+            )
 
     def test_generation_retries_provider_before_fallback(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -411,9 +1333,13 @@ class OpenAIProviderTests(TestCase):
                     "https://primary.example.com/v1/images/generations",
                 ],
             )
-            self.assertEqual(result["attempts"], [{"api_id": primary["id"], "api_name": "Primary", "ok": True}])
+            self.assertEqual(result["attempts"][0]["api_id"], primary["id"])
+            self.assertEqual(result["attempts"][0]["api_name"], "Primary")
+            self.assertTrue(result["attempts"][0]["ok"])
+            self.assertEqual(result["attempts"][0]["configured_api_type"], "auto")
+            self.assertEqual(result["attempts"][0]["effective_api_type"], "openai")
 
-    def test_auto_mode_false_stops_after_first_failed_node(self):
+    def test_auto_mode_false_still_allows_next_node_fallback(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_service, created = self._config_service(
                 tmp_dir,
@@ -423,6 +1349,7 @@ class OpenAIProviderTests(TestCase):
                         "base_url": "https://primary.example.com",
                         "api_key": "key-1",
                         "model": "gpt-image-2",
+                        "api_type": "openai",
                         "status": True,
                         "auto_mode": False,
                     },
@@ -431,11 +1358,12 @@ class OpenAIProviderTests(TestCase):
                         "base_url": "https://backup.example.com",
                         "api_key": "key-2",
                         "model": "gpt-image-2",
+                        "api_type": "openai",
                         "status": True,
                     },
                 ],
             )
-            primary, _backup = created
+            primary, backup = created
             http_client = FakeHttpClient(
                 post_responses=[
                     FakeResponse(500, {"error": {"message": "provider down"}}),
@@ -447,9 +1375,11 @@ class OpenAIProviderTests(TestCase):
             submit = service.submit_generation(prompt="a red house", size="1024x1024", n=1)
             result = service.poll_generation_status(task_id=submit["task_id"])
 
-            self.assertEqual(result["status"], "failed")
-            self.assertEqual(len(http_client.posts), 1)
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(len(http_client.posts), 2)
             self.assertEqual(result["attempts"][0]["api_id"], primary["id"])
+            self.assertEqual(result["attempts"][1]["api_id"], backup["id"])
+            self.assertTrue(result["attempts"][1]["ok"])
 
     def test_edit_uses_multipart_image_and_mask(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -472,7 +1402,7 @@ class OpenAIProviderTests(TestCase):
 
             submit = service.submit_edit_generation(
                 prompt="replace the masked area",
-                image=_png_data_url((6, 6), (10, 20, 30, 255)),
+                image=_png_data_url((6, 6), (10, 20, 30, 255)).replace("image/png", "image/jpeg", 1),
                 mask=_png_data_url((6, 6), (255, 255, 255, 255)),
                 size="1024x1024",
                 n=1,
@@ -488,6 +1418,8 @@ class OpenAIProviderTests(TestCase):
             self.assertIn("files", kwargs)
             self.assertIn("image", kwargs["files"])
             self.assertIn("mask", kwargs["files"])
+            self.assertEqual(kwargs["files"]["image"][2], "image/png")
+            self.assertEqual(kwargs["files"]["mask"][2], "image/png")
             self.assertEqual(kwargs["data"]["model"], "gpt-image-2")
             self.assertEqual(kwargs["data"]["prompt"], "replace the masked area")
             # multipart request must not force a JSON content-type
@@ -656,6 +1588,41 @@ class CustomProviderTests(TestCase):
             self.assertEqual(result["urls"], ["https://cdn/pic.png"])
             self.assertEqual(http_client.posts[0][0], "https://my-proxy.example.com/api/v2/img")
 
+    def test_custom_url_is_not_auto_switched_to_async_endpoint(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "Direct",
+                    "base_url": "https://my-proxy.example.com/api/v2/img",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "custom",
+                    "status": True,
+                    "retry_count": 0,
+                }
+            )
+            http_client = FakeHttpClient(
+                post_responses=[
+                    FakeResponse(
+                        503,
+                        {
+                            "error": {
+                                "message": "please use async endpoint POST /async/images",
+                                "code": "use_async_images",
+                            }
+                        },
+                    )
+                ]
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="hi", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual([call[0] for call in http_client.posts], ["https://my-proxy.example.com/api/v2/img"])
+
 
 class ReferenceImageTests(TestCase):
     def test_openai_generation_with_references_uses_edits_multipart(self):
@@ -755,6 +1722,655 @@ class AsyncRelayProviderTests(TestCase):
             self.assertEqual(result["api_id"], provider["id"])
             self.assertEqual(http_client.posts[0][0], "https://relay.example.com/async/images")
             self.assertEqual(http_client.gets[0][0], "https://relay.example.com/async/images/up-1")
+
+    def test_async_relay_strips_openai_v1_suffix_before_submit_and_poll(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "Relay",
+                    "base_url": "https://fnuu.net/v1",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "async",
+                    "status": True,
+                }
+            )
+            http_client = FakeHttpClient(
+                post_responses=[FakeResponse(200, {"task_id": "up-1", "status": "queued"})],
+                get_responses=[FakeResponse(200, {"status": "completed", "urls": ["https://cdn.example.com/a.png"]})],
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="a red house", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(http_client.posts[0][0], "https://fnuu.net/async/images")
+            self.assertEqual(http_client.gets[0][0], "https://fnuu.net/async/images/up-1")
+
+    def test_async_relay_generation_forwards_reference_images_in_submit_body(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "Relay",
+                    "base_url": "https://fnuu.net",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "async",
+                    "status": True,
+                }
+            )
+            reference_images = [_png_data_url((4, 4)), _png_data_url((6, 6))]
+            http_client = FakeHttpClient(
+                post_responses=[FakeResponse(200, {"task_id": "up-1", "status": "queued"})],
+                get_responses=[FakeResponse(200, {"status": "completed", "urls": ["https://cdn.example.com/a.png"]})],
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(
+                prompt="blend these",
+                size="1024x1024",
+                n=1,
+                reference_images=reference_images,
+            )
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(len(http_client.posts), 1)
+            body = http_client.posts[0][1]["json"]
+            self.assertEqual(body["reference_images"], reference_images)
+            self.assertEqual(body["model"], "gpt-image-2")
+            self.assertEqual(body["size"], "1024x1024")
+
+    def test_async_relay_edit_forwards_image_mask_composite_and_selection_in_submit_body(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "Relay",
+                    "base_url": "https://fnuu.net",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "async",
+                    "status": True,
+                }
+            )
+            source = _png_data_url((8, 8))
+            mask = _png_data_url((8, 8), (255, 255, 255, 255))
+            composite = _png_data_url((8, 8), (0, 128, 128, 255))
+            selection = {
+                "canvas": {"width": 400, "height": 360},
+                "box": {"x": 20, "y": 0, "width": 360, "height": 360},
+                "bbox": {"x": 120, "y": 120, "width": 40, "height": 40},
+            }
+            http_client = FakeHttpClient(
+                post_responses=[FakeResponse(200, {"task_id": "up-1", "status": "queued"})],
+                get_responses=[FakeResponse(200, {"status": "completed", "urls": ["https://cdn.example.com/a.png"]})],
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_edit_generation(
+                prompt="edit region",
+                image=source,
+                mask=mask,
+                composite=composite,
+                selection=selection,
+                size="1024x1024",
+                n=1,
+            )
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(len(http_client.posts), 1)
+            body = http_client.posts[0][1]["json"]
+            self.assertEqual(body["image"], source)
+            self.assertEqual(body["mask"], mask)
+            self.assertEqual(body["composite"], composite)
+            self.assertEqual(body["selection"], selection)
+            self.assertEqual(body["edit_mode"], "mask")
+
+    def test_async_protocol_is_matched_case_and_whitespace_insensitively(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "Relay",
+                    "base_url": "https://relay.example.com/",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "async",
+                    "status": True,
+                }
+            )
+            original = config_service.get_enabled_configs
+            config_service.get_enabled_configs = lambda: [{**item, "api_type": " async "} for item in original()]
+            http_client = FakeHttpClient(
+                post_responses=[FakeResponse(200, {"task_id": "up-1", "status": "queued"})],
+                get_responses=[FakeResponse(200, {"status": "completed", "urls": ["https://cdn.example.com/a.png"]})],
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="a red house", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(http_client.posts[0][0], "https://relay.example.com/async/images")
+
+    def test_async_relay_submit_timeout_stops_without_paid_fallbacks(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "Relay",
+                    "base_url": "https://fnuu.net",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "auto",
+                    "status": True,
+                    "retry_count": 0,
+                }
+            )
+            config_service.create_config(
+                {
+                    "name": "Backup",
+                    "base_url": "https://backup.example.com",
+                    "api_key": "key-2",
+                    "model": "gpt-image-2",
+                    "api_type": "openai",
+                    "status": True,
+                }
+            )
+            http_client = FakeHttpClient(
+                post_responses=[
+                    Timeout("submit timed out"),
+                    FakeResponse(200, {"data": [{"url": "https://cdn.example.com/should-not-use.png"}]}),
+                ]
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="a red house", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "failed")
+            self.assertIn("提交任务超时", result["error"])
+            self.assertIn("避免重复扣费", result["error"])
+            self.assertEqual([call[0] for call in http_client.posts], ["https://fnuu.net/async/images"])
+            self.assertEqual(http_client.gets, [])
+            self.assertEqual(result["attempts"][0]["effective_api_type"], "async")
+
+    def test_async_relay_keeps_polling_after_upstream_task_is_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "Relay",
+                    "base_url": "https://relay.example.com/",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "async",
+                    "status": True,
+                    "timeout_seconds": 1,
+                }
+            )
+            clock = {"now": 1000.0}
+            http_client = TimeAdvancingHttpClient(
+                clock,
+                post_responses=[FakeResponse(200, {"task_id": "up-1", "status": "queued"})],
+                get_responses=[
+                    FakeResponse(200, {"status": "processing"}),
+                    FakeResponse(200, {"status": "completed", "urls": ["https://cdn.example.com/a.png"]}),
+                ],
+            )
+            service = _service(config_service, http_client, async_max_wait=0)
+
+            original_monotonic = time.monotonic
+            try:
+                time.monotonic = lambda: clock["now"]
+                submit = service.submit_generation(prompt="a red house", size="1024x1024", n=1)
+                result = service.poll_generation_status(task_id=submit["task_id"])
+            finally:
+                time.monotonic = original_monotonic
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["urls"], ["https://cdn.example.com/a.png"])
+            self.assertEqual(len(http_client.gets), 2)
+            self.assertEqual(result["upstream_task_id"], "up-1")
+
+    def test_async_relay_uses_returned_poll_url_and_posts_once(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "Relay",
+                    "base_url": "https://relay.example.com/api",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "async",
+                    "status": True,
+                }
+            )
+            http_client = FakeHttpClient(
+                post_responses=[
+                    FakeResponse(
+                        200,
+                        {
+                            "task_id": "up-1",
+                            "status": "queued",
+                            "poll_url": "/async/images/up-1",
+                        },
+                    )
+                ],
+                get_responses=[
+                    FakeResponse(200, {"status": "processing"}),
+                    FakeResponse(200, {"status": "completed", "urls": ["https://cdn.example.com/a.png"]}),
+                ],
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="a red house", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(len(http_client.posts), 1)
+            self.assertEqual(http_client.posts[0][0], "https://relay.example.com/api/async/images")
+            self.assertEqual(
+                [call[0] for call in http_client.gets],
+                [
+                    "https://relay.example.com/async/images/up-1",
+                    "https://relay.example.com/async/images/up-1",
+                ],
+            )
+            self.assertEqual(result["poll_count"], 2)
+            self.assertEqual(result["last_poll_status"], "completed")
+
+    def test_async_relay_unwraps_data_object_status_payloads(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "Relay",
+                    "base_url": "https://relay.example.com",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "async",
+                    "status": True,
+                }
+            )
+            http_client = FakeHttpClient(
+                post_responses=[FakeResponse(200, {"data": {"task_id": "up-1", "status": "queued"}})],
+                get_responses=[
+                    FakeResponse(
+                        200,
+                        {"data": {"status": "completed", "urls": ["https://cdn.example.com/a.png"]}},
+                    )
+                ],
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="a red house", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["urls"], ["https://cdn.example.com/a.png"])
+
+    def test_async_relay_keeps_polling_after_poll_timeout_once_task_is_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "Relay",
+                    "base_url": "https://fnuu.net",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "async",
+                    "status": True,
+                }
+            )
+            http_client = FakeHttpClient(
+                post_responses=[FakeResponse(200, {"task_id": "up-1", "status": "queued"})],
+                get_responses=[
+                    Timeout("Read timed out."),
+                    FakeResponse(200, {"status": "completed", "urls": ["https://cdn.example.com/a.png"]}),
+                ],
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="a red house", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(len(http_client.posts), 1)
+            self.assertEqual(len(http_client.gets), 2)
+            self.assertEqual(result["poll_count"], 2)
+            self.assertEqual(result["last_poll_status"], "completed")
+            self.assertIsNone(result["last_poll_error"])
+
+    def test_async_relay_keeps_polling_after_poll_returns_non_json_once_task_is_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "Relay",
+                    "base_url": "https://fnuu.net",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "async",
+                    "status": True,
+                }
+            )
+            http_client = FakeHttpClient(
+                post_responses=[FakeResponse(200, {"task_id": "up-1", "status": "queued"})],
+                get_responses=[
+                    BadJsonResponse(502, "<html>temporary gateway page</html>"),
+                    FakeResponse(200, {"status": "completed", "urls": ["https://cdn.example.com/a.png"]}),
+                ],
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="a red house", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(len(http_client.posts), 1)
+            self.assertEqual(len(http_client.gets), 2)
+            self.assertEqual(result["poll_count"], 2)
+            self.assertEqual(result["last_poll_status"], "completed")
+
+    def test_async_relay_submit_non_json_surfaces_readable_error_details(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "Relay",
+                    "base_url": "https://fnuu.net",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "async",
+                    "status": True,
+                    "retry_count": 0,
+                }
+            )
+            http_client = FakeHttpClient(
+                post_responses=[BadJsonResponse(502, "<html>upstream error</html>")]
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="a red house", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "failed")
+            self.assertIn("合法 JSON", result["attempts"][0]["error"])
+            self.assertIn("<html>upstream error</html>", result["attempts"][0]["details"]["text"])
+
+    def test_async_relay_completed_without_urls_fails_without_trying_paid_fallbacks(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "Relay",
+                    "base_url": "https://fnuu.net",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "auto",
+                    "status": True,
+                    "retry_count": 0,
+                }
+            )
+            config_service.create_config(
+                {
+                    "name": "Backup",
+                    "base_url": "https://backup.example.com",
+                    "api_key": "key-2",
+                    "model": "gpt-image-2",
+                    "api_type": "openai",
+                    "status": True,
+                }
+            )
+            http_client = FakeHttpClient(
+                post_responses=[FakeResponse(200, {"task_id": "up-1", "status": "queued"})],
+                get_responses=[FakeResponse(200, {"status": "completed", "urls": []})],
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="a red house", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "failed")
+            self.assertIn("未返回图片", result["error"])
+            self.assertEqual([call[0] for call in http_client.posts], ["https://fnuu.net/async/images"])
+
+    def test_async_relay_failed_status_surfaces_error_message_and_does_not_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "Relay",
+                    "base_url": "https://fnuu.net",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "auto",
+                    "status": True,
+                    "retry_count": 0,
+                }
+            )
+            config_service.create_config(
+                {
+                    "name": "Backup",
+                    "base_url": "https://backup.example.com",
+                    "api_key": "key-2",
+                    "model": "gpt-image-2",
+                    "api_type": "openai",
+                    "status": True,
+                }
+            )
+            http_client = FakeHttpClient(
+                post_responses=[FakeResponse(200, {"task_id": "up-1", "status": "queued"})],
+                get_responses=[
+                    FakeResponse(
+                        200,
+                        {
+                            "status": "failed",
+                            "error": {"message": "content policy refused this image", "code": "content_policy"},
+                        },
+                    )
+                ],
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="a red house", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "failed")
+            self.assertIn("content policy refused this image", result["error"])
+            self.assertEqual([call[0] for call in http_client.posts], ["https://fnuu.net/async/images"])
+            self.assertEqual(result["attempts"][0]["effective_api_type"], "async")
+            self.assertIn("content_policy", json.dumps(result["attempts"][0]["details"], ensure_ascii=False))
+
+    def test_async_relay_failed_status_on_non_2xx_poll_surfaces_error_without_retrying_paid_submit(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "Relay",
+                    "base_url": "https://fnuu.net",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "auto",
+                    "status": True,
+                    "retry_count": 0,
+                }
+            )
+            config_service.create_config(
+                {
+                    "name": "Backup",
+                    "base_url": "https://backup.example.com",
+                    "api_key": "key-2",
+                    "model": "gpt-image-2",
+                    "api_type": "openai",
+                    "status": True,
+                }
+            )
+            http_client = FakeHttpClient(
+                post_responses=[FakeResponse(200, {"task_id": "up-1", "status": "queued"})],
+                get_responses=[
+                    FakeResponse(
+                        500,
+                        {
+                            "status": "failed",
+                            "error": {"message": "model refused this prompt", "code": "safety_refusal"},
+                        },
+                    ),
+                    FakeResponse(200, {"status": "completed", "urls": ["https://cdn.example.com/should-not-use.png"]}),
+                ],
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="a red house", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "failed")
+            self.assertIn("model refused this prompt", result["error"])
+            self.assertEqual([call[0] for call in http_client.posts], ["https://fnuu.net/async/images"])
+            self.assertEqual(len(http_client.gets), 1)
+            self.assertIn("safety_refusal", json.dumps(result["attempts"][0]["details"], ensure_ascii=False))
+
+    def test_async_relay_completed_urls_are_downloaded_to_session_directory(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "Relay",
+                    "base_url": "https://fnuu.net",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "async",
+                    "status": True,
+                    "retry_count": 0,
+                }
+            )
+            http_client = FakeHttpClient(
+                post_responses=[FakeResponse(200, {"task_id": "up-1", "status": "queued"})],
+                get_responses=[
+                    FakeResponse(200, {"status": "completed", "urls": ["https://cdn.example.com/fnuu.png"]}),
+                    FakeBinaryResponse(b"PNGDATA", headers={"Content-Type": "image/png"}),
+                ],
+            )
+            result_dir = Path(tmp_dir) / "history"
+            service = _service(config_service, http_client, result_dir=result_dir)
+
+            submit = service.submit_generation(
+                prompt="a red house",
+                size="1024x1024",
+                n=1,
+                history_id="session-fnuu",
+            )
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "completed")
+            self.assertTrue(result["urls"][0].startswith("/api/results/session-fnuu/"))
+            saved_name = result["urls"][0].rsplit("/", 1)[1]
+            self.assertEqual((result_dir / "session-fnuu" / saved_name).read_bytes(), b"PNGDATA")
+            self.assertEqual(
+                [call[0] for call in http_client.gets],
+                ["https://fnuu.net/async/images/up-1", "https://cdn.example.com/fnuu.png"],
+            )
+
+    def test_async_relay_result_download_failure_fails_without_paid_fallbacks(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "Relay",
+                    "base_url": "https://fnuu.net",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "async",
+                    "status": True,
+                    "retry_count": 0,
+                }
+            )
+            config_service.create_config(
+                {
+                    "name": "Backup",
+                    "base_url": "https://backup.example.com",
+                    "api_key": "key-2",
+                    "model": "gpt-image-2",
+                    "api_type": "openai",
+                    "status": True,
+                }
+            )
+            http_client = FakeHttpClient(
+                post_responses=[
+                    FakeResponse(200, {"task_id": "up-1", "status": "queued"}),
+                    FakeResponse(200, {"data": [{"url": "https://cdn.example.com/should-not-use.png"}]}),
+                ],
+                get_responses=[
+                    FakeResponse(200, {"status": "completed", "urls": ["https://cdn.example.com/fnuu.png"]}),
+                    FakeResponse(500, {"error": {"message": "expired"}}),
+                ],
+            )
+            result_dir = Path(tmp_dir) / "history"
+            service = _service(config_service, http_client, result_dir=result_dir)
+
+            submit = service.submit_generation(
+                prompt="a red house",
+                size="1024x1024",
+                n=1,
+                history_id="session-fnuu",
+            )
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "failed")
+            self.assertIn("结果下载失败", result["error"])
+            self.assertEqual([call[0] for call in http_client.posts], ["https://fnuu.net/async/images"])
+            self.assertEqual(
+                [call[0] for call in http_client.gets],
+                ["https://fnuu.net/async/images/up-1", "https://cdn.example.com/fnuu.png"],
+            )
+            self.assertFalse((result_dir / "session-fnuu" / "session.json").exists())
+
+    def test_cancelled_async_task_does_not_fallback_to_another_protocol_or_node(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "Relay",
+                    "base_url": "https://fnuu.net",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "auto",
+                    "status": True,
+                    "retry_count": 0,
+                }
+            )
+            config_service.create_config(
+                {
+                    "name": "Backup",
+                    "base_url": "https://backup.example.com",
+                    "api_key": "key-2",
+                    "model": "gpt-image-2",
+                    "api_type": "openai",
+                    "status": True,
+                }
+            )
+            store = TaskStore()
+            holder = {}
+            http_client = CancellingGetHttpClient(
+                store,
+                holder,
+                post_responses=[FakeResponse(200, {"task_id": "up-1", "status": "queued"})],
+                get_responses=[FakeResponse(200, {"status": "processing"})],
+            )
+            service = _service(config_service, http_client, store=store)
+
+            submit = service.submit_generation(prompt="a red house", size="1024x1024", n=1)
+            holder["task_id"] = submit["task_id"]
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "cancelled")
+            self.assertEqual([call[0] for call in http_client.posts], ["https://fnuu.net/async/images"])
 
 
 class StatusLookupTests(TestCase):

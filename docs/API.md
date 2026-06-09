@@ -74,7 +74,7 @@ Content-Type: application/json
   "base_url": "https://api.openai.com",
   "api_key": "sk-xxx",
   "model": "gpt-image-2",
-  "api_type": "openai",
+  "api_type": "auto",
   "status": true
 }
 ```
@@ -85,7 +85,7 @@ Content-Type: application/json
 - `base_url`: 上游服务根地址，必须以 `http://` 或 `https://` 开头
 - `api_key`: 节点访问密钥
 - `model`: 默认模型名
-- `api_type`: 接入协议，`openai`（OpenAI 兼容，默认）/ `chat` / `custom` / `async`
+- `api_type`: 接入协议，`auto`（默认，当前节点内自动尝试 Images / async / Chat）/ `openai` / `chat` / `custom` / `async`
 - `status`: 是否启用
 
 成功时返回 `201 Created`。
@@ -314,7 +314,7 @@ GET /api/status?task_id={task_id}
 - `api_id`/`api_name` 表示 worker 最终命中（或正在尝试）的节点，可能为 `null`（任务刚入队时）。
 - `attempts` 记录每个被尝试节点是否成功，便于排查容灾路径。
 - `urls` 只在 `completed` 时有意义；OpenAI 兼容节点通常是 `data:` URL，异步中转节点通常是远程 URL。
-- `max_wait_seconds` 表示前端本次轮询可等待的秒数，来自当前节点或模式的 `timeout_seconds`。
+- `max_wait_seconds` 表示前端本次轮询可等待的秒数。OpenAI 兼容同步请求会取节点 `timeout_seconds` 与后端 `generation_timeout` 的较大值；异步中转进入云端生成后返回 `null`，表示持续等待直到完成、失败或手动停止。
 - 任务不存在或已过期返回 `404`。
 
 ## 6. 会话、草稿与作品集
@@ -381,7 +381,13 @@ DELETE /api/prompt-templates/{id}
 
 ## 8. 上游图片服务契约
 
-### 8.1 OpenAI 兼容（`api_type = openai`，默认）
+### 8.1 自动尝试协议（`api_type = auto`，默认）
+
+后端会在当前节点内依次尝试协议候选：OpenAI Images、异步中转、Chat Completions；已知异步中转域名会优先尝试 async。只有当前节点的协议候选全部失败后，才会切换到下一个启用节点。状态响应会返回 `configured_api_type`、`effective_api_type` 和 `request_url`，该过程不会改写 `backend/data/configs.json` 中保存的节点协议。
+
+`auto` 只表示“当前节点内自动尝试已接入协议”，不控制后续节点 fallback；后续启用节点始终会在当前节点全部候选失败后继续尝试。`custom` 需要完整 URL，无法从 `base_url` 安全推断，因此不参与自动协议序列。
+
+### 8.2 OpenAI 兼容（`api_type = openai`）
 
 ```text
 POST {base_url}/v1/images/generations   # JSON
@@ -412,7 +418,19 @@ POST {base_url}/v1/images/edits         # multipart/form-data
 
 后端会把 `b64_json` 转成 `data:image/...;base64,...`，或直接透传 `url`。
 
-### 8.2 自定义异步中转（`api_type = async`）
+#### xAI / Grok Imagine
+
+文生图可作为 OpenAI 兼容节点接入：
+
+```text
+base_url = https://api.x.ai
+api_type = openai 或 auto
+model    = grok-imagine-image-quality（或服务商实际开放的 Grok Imagine 模型名）
+```
+
+当模型名以 `grok-imagine-image` 开头或 `base_url` 为 `https://api.x.ai` 时，后端仍请求 `POST /v1/images/generations`，但会把前端 `size` 转换为 xAI 风格的 `aspect_ratio` 和 `resolution`，并不发送任意 `size` 字段。当前已按 OpenAI 兼容路径适配文生图；Grok 局部编辑不保证兼容当前 multipart edits，如需使用 xAI JSON 形态编辑接口需要单独增加适配。
+
+### 8.3 自定义异步中转（`api_type = async`）
 
 ```text
 POST {base_url}/async/images
@@ -420,3 +438,15 @@ GET  {base_url}/async/images/{task_id}
 ```
 
 提交体为 JSON，局部编辑时在 `model/prompt/size/n` 基础上增加 `image`、`mask`、`edit_mode`、`selection`；后端在 worker 内提交后轮询 `GET` 直至 `completed`/`failed`。
+
+提交成功响应必须包含 `task_id`，可选包含 `poll_url`：
+
+```json
+{
+  "task_id": "47528f39a8644bdfae66dc0bb1f430dd",
+  "status": "queued",
+  "poll_url": "/async/images/47528f39a8644bdfae66dc0bb1f430dd"
+}
+```
+
+如果返回 `poll_url`，后端按该地址轮询；否则默认轮询 `GET {base_url}/async/images/{task_id}`。轮询响应可直接返回状态对象，也可包在 `data` 对象内。`status=completed` 时从 `urls` 数组取图片；`status=failed` 时读取 `error`。拿到 `task_id` 后后端不会再提交第二次任务，单次轮询超时只更新状态并继续轮询，避免已扣费任务丢失。

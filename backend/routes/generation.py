@@ -63,6 +63,14 @@ def get_generation_status():
         return _image_error(exc)
 
 
+@generation_bp.post("/tasks/<task_id>/cancel")
+def cancel_generation_task(task_id: str):
+    try:
+        return _success(_image_service().cancel_generation(task_id=task_id))
+    except Exception as exc:
+        return _image_error(exc)
+
+
 @generation_bp.get("/sessions")
 def list_sessions():
     try:
@@ -76,7 +84,7 @@ def list_sessions():
             manifest_path = session_dir / "session.json"
             if not manifest_path.exists():
                 continue
-            with manifest_path.open("r", encoding="utf-8") as fh:
+            with manifest_path.open("r", encoding="utf-8-sig") as fh:
                 manifest = json.load(fh)
             if not isinstance(manifest, dict) or manifest.get("status") != "completed":
                 continue
@@ -131,7 +139,7 @@ def get_edit_draft(history_id: str):
         draft_path = _edit_draft_path(history_id)
         if not draft_path.exists():
             return _success(None)
-        with draft_path.open("r", encoding="utf-8") as fh:
+        with draft_path.open("r", encoding="utf-8-sig") as fh:
             return _success(json.load(fh))
     except Exception as exc:
         return _image_error(exc)

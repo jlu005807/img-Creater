@@ -1,5 +1,6 @@
 import { ref } from 'vue'
 import { listSessions } from '../api/generation'
+import { backendRouteMissingMessage, isBackendRouteMissing } from '../api/client'
 
 const STORAGE_KEY = 'studio-generation-history'
 const MAX_ENTRIES = 30
@@ -72,7 +73,17 @@ export function useGenerationHistory() {
   }
 
   async function loadPersistedSessions() {
-    const sessions = await listSessions()
+    let sessions
+    try {
+      sessions = await listSessions()
+    } catch (error) {
+      if (isBackendRouteMissing(error)) {
+        const next = new Error(backendRouteMissingMessage('历史会话'))
+        next.status = error.status
+        throw next
+      }
+      throw error
+    }
     if (!Array.isArray(sessions) || !sessions.length) return []
     const existingById = new Map(history.value.map((entry) => [entry.id, entry]))
     for (const session of sessions) {

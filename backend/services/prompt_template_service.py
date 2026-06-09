@@ -12,44 +12,68 @@ DEFAULT_TEMPLATE_PATH = Path(__file__).resolve().parents[1] / "data" / "prompt_t
 
 DEFAULT_TEMPLATES = [
     {
-        "id": "seed-photo-1",
-        "title": "写实摄影：雨夜街头",
-        "text": "一位年轻女子在雨夜的东京街头，霓虹灯倒映在潮湿的路面上，35mm 胶片拍摄风格",
+        "id": "seed-photo-product",
+        "title": "写实摄影：产品主图",
+        "text": "Create a premium studio product photograph of a translucent smart speaker on a brushed aluminum surface, softbox lighting, crisp reflections, shallow depth of field, clean background, realistic materials, commercial advertising quality, no text, no logo.",
     },
     {
-        "id": "seed-photo-2",
-        "title": "写实摄影：日落海岸",
-        "text": "壮丽的日落海岸线，长曝光波浪模糊成雾，电影级暖色调",
+        "id": "seed-poster-typography",
+        "title": "海报设计：字体排版",
+        "text": "Design a vertical cinematic poster for a fictional art exhibition titled \"LIGHT ARCHIVE\", elegant editorial typography, strong visual hierarchy, one striking central image, museum-grade layout, balanced margins, refined color palette, print-ready composition.",
     },
     {
-        "id": "seed-anime-1",
-        "title": "动漫插画：飞行城堡",
-        "text": "吉卜力工作室风格，一座漂浮在云海之上的飞行城堡，金色夕阳光照，细节丰富",
+        "id": "seed-infographic",
+        "title": "信息图：流程说明",
+        "text": "Create a clean infographic explaining a four-step AI image workflow: prompt, reference, generation, refinement. Use clear English labels, simple icons, consistent spacing, modern SaaS visual style, high readability, white background, professional layout.",
     },
     {
-        "id": "seed-product-1",
-        "title": "产品摄影：耳机",
-        "text": "极简产品摄影，一副无线耳机放在大理石台面上，柔和工作室打光，干净背景",
+        "id": "seed-character-consistency",
+        "title": "角色设计：一致性设定",
+        "text": "Generate a character reference sheet for an original young explorer, front view, side view, three facial expressions, consistent outfit and hairstyle, clean turnaround layout, neutral background, detailed fabric and accessory notes, polished concept art style.",
     },
     {
-        "id": "seed-watercolor-1",
-        "title": "水彩艺术：花园",
-        "text": "盛开的花园，印象派水彩风格，明亮色彩，湿润笔触",
+        "id": "seed-ui-mockup",
+        "title": "界面设计：移动 App",
+        "text": "Create a high-fidelity mobile app screen for a personal finance dashboard, dark mode, clear cards, transaction list, monthly spending chart, restrained accent colors, realistic iOS layout, readable text, production-ready UI mockup.",
     },
     {
-        "id": "seed-cyberpunk-1",
-        "title": "赛博朋克：城市",
-        "text": "赛博朋克城市景观，高耸的摩天大楼布满全息广告，飞行载具穿梭，紫青色霓虹色调",
+        "id": "seed-game-asset",
+        "title": "游戏素材：图标套组",
+        "text": "Create a cohesive set of twelve fantasy RPG item icons, potions, rings, scrolls, gems, and keys, isometric view, transparent-feeling dark background, consistent lighting, sharp silhouettes, game-ready asset style.",
     },
     {
-        "id": "seed-edit-1",
-        "title": "局部编辑：替换背景",
-        "text": "只修改被标记区域：将背景替换为星空夜景，保持主体不变，边缘自然融合",
+        "id": "seed-social-card",
+        "title": "社媒图片：活动宣传",
+        "text": "Design a square social media announcement graphic for a weekend design workshop, bold headline, supporting date and location text, layered paper texture, warm but professional colors, eye-catching composition, suitable for Instagram.",
     },
     {
-        "id": "seed-edit-2",
-        "title": "局部编辑：改变颜色",
-        "text": "只修改被标记区域：将汽车颜色改为金属红，保持光照、材质和反射自然",
+        "id": "seed-local-edit",
+        "title": "局部编辑：自然替换",
+        "text": "Edit only the masked area. Replace it with a realistic glass control panel, preserve the original camera angle, lighting direction, shadows, reflections, edge detail, and overall photographic style. Do not change unmasked areas.",
+    },
+    {
+        "id": "seed-portrait-basketball-direct-flash",
+        "title": "人物写真：球场直闪（Basketball Court Direct Flash Portrait）",
+        "text": """Prompt:
+
+35mm color film photography with harsh direct on-camera flash, specular highlights on skin and clothing, strong catchlights in eyes, high contrast flash illumination, authentic film grain and color shift, high fashion fresh innocent basketball court editorial style, intimate first-person low-angle POV shot from below, early 20s sexy Chinese female idol with ultra-realistic delicate refined Chinese features, seductive almond-shaped fox eyes with natural double eyelids, high nose bridge, small sharp V-shaped jawline, flawless realistic porcelain skin with cool ivory undertone and visible flash specular highlights, fine delicate skin texture with subtle pores micro details and natural dewy glow under flash, fresh natural sporty makeup with soft dewy glow, subtle natural flush on cheeks, natural pink lips slightly parted, subtle natural freckles across nose and cheeks, long dark brown hair tied in a high playful ponytail with some loose strands framing the face and realistic loose strands, wearing a loose white tank top and white high-waisted basketball shorts, white knee-high sports socks, seductive natural leaning pose against the basketball hoop pole on the outdoor court at dusk, body angled sideways with naturally arched back and hips gently pushed back to accentuate perky round hips and sexy butt curve, one leg naturally extended forward toward the camera and the other leg slightly bent to emphasize long sexy legs, both hands lightly resting on the basketball pole at shoulder height, intensely seductive playful yet pitiable doe-eyed gaze straight at the viewer with soft vulnerable longing eyes and a gentle teasing smile full of quiet temptation and desire, harsh direct on-camera flash creating sharp specular highlights and strong catchlights, background with blurred basketball court and hoop under dusk sky, high contrast film color grading with natural flash look, extremely sharp yet soft skin rendering with authentic 35mm direct flash aesthetic, natural hair strands, realistic fabric texture on tank top and shorts with socks detail, no plastic skin, no digital over-sharpening, no airbrushing, no blemishes, no moles, no oily skin, no watermark, no text, authentic 35mm direct flash film basketball court look --ar 9:16
+Source: @BubbleBrain""",
+    },
+    {
+        "id": "seed-portrait-korean-soft-mist",
+        "title": "人物写真：韩系柔雾（Korean Editorial Portrait with Soft Mist）",
+        "text": """Prompt:
+
+9:16 vertical - editorial portrait, single subject soft black mist filter, subtle haze, gentle highlight bloom, muted tones minimal indoor space, clean background, slight texture young Korean woman, minimal makeup, natural skin texture outfit: fitted ribbed knit top or soft camisole layered under a loose shirt, paired with high-waisted shorts or skirt; fabric slightly clings to body shape, soft and natural, no revealing elements hair: slightly messy, natural volume pose: sitting on floor with one leg bent and the other relaxed, body slightly leaning, shoulders not aligned, head tilted composition: subject slightly off-center, negative space present expression: calm, slightly distant, natural lips lighting: soft side light, gentle shadow falloff mood: understated, quiet, subtly sensual through natural body lines, relaxed and unposed quality: fine grain, slight softness, realistic look
+Source: @BubbleBrain""",
+    },
+    {
+        "id": "seed-portrait-subway-candid",
+        "title": "人物写真：地铁抓拍（Subway Candid Photo）",
+        "text": """Prompt:
+
+A beautiful woman looking at her phone on the subway; a candid photo.
+Source: @AntCaveClub | @underwoodxie96""",
     },
 ]
 

@@ -17,6 +17,10 @@ export function getGenerationStatus({ apiId, taskId }) {
   })
 }
 
+export function cancelGenerationTask(taskId) {
+  return apiClient.post(`/tasks/${taskId}/cancel`)
+}
+
 export function saveEditDraft(historyId, payload) {
   return apiClient.put(`/edit-drafts/${historyId}`, payload)
 }

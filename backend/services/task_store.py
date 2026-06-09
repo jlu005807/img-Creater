@@ -48,15 +48,38 @@ class TaskStore:
         with self._lock:
             task = self._tasks.get(task_id)
             if task is not None:
+                if task.get("status") == "cancelled" and fields.get("status") != "cancelled":
+                    return
                 task.update(fields)
                 # Stamp terminal time so TTL only reaps finished tasks.
-                if fields.get("status") in {"completed", "failed"} and not task.get("completed_at"):
+                if fields.get("status") in {"completed", "failed", "cancelled"} and not task.get("completed_at"):
                     task["completed_at"] = time.time()
 
     def get(self, task_id: str) -> dict[str, Any] | None:
         with self._lock:
             task = self._tasks.get(task_id)
             return dict(task) if task is not None else None
+
+    def cancel(self, task_id: str, error: str = "任务已手动停止") -> bool:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return False
+            if task.get("status") in {"completed", "failed", "cancelled"}:
+                return False
+            task.update(
+                {
+                    "status": "cancelled",
+                    "error": error,
+                    "completed_at": time.time(),
+                }
+            )
+            return True
+
+    def is_cancelled(self, task_id: str) -> bool:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            return bool(task and task.get("status") == "cancelled")
 
     def _evict_expired_locked(self) -> None:
         # Only evict tasks that have finished and whose TTL has elapsed; never

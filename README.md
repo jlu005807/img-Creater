@@ -10,10 +10,10 @@
 - 参考图：文生图可上传最多 N 张参考图辅助生成（上限在设置中可配置，默认 3）。
 - 局部编辑：上传/拖拽原图后直接在图上涂抹、框选、橡皮擦标记修改区域，半透明遮罩实时叠加；无需手动制作蒙版，前端自动合成混合图。支持按钮撤销、遮罩显隐切换、整体放大编辑，并会按会话保存原图与编辑痕迹。
 - 尺寸：宽高自定义输入 + 比例预设（1:1 / 4:3 / 3:4 / 16:9 / 9:16）。
-- 多接入协议：每个节点可选 **OpenAI 兼容**（`/v1/images`）、**Chat Completions**（`/v1/chat/completions`）、**自定义 URL**（直接请求）或 **异步中转**（`/async/images`）。
+- 多接入协议：每个节点默认使用 **自动尝试协议**，也可固定为 **OpenAI 兼容**（`/v1/images`）、**Chat Completions**（`/v1/chat/completions`）、**自定义 URL**（直接请求）或 **异步中转**（`/async/images`）。
 - 多 API 节点：支持新增、编辑、删除、启用/禁用和拖拽排序；返回时 `api_key` 自动脱敏。
 - Fallback 容灾：后台 worker 按节点优先级依次尝试，直到某个节点成功产出图片。
-- 状态轮询：前端每 4 秒轮询一次任务状态，轮询上限跟随当前 API 节点的 `timeout_seconds`。
+- 状态轮询：前端每 4 秒轮询一次任务状态；OpenAI 兼容同步请求至少等待 180 秒，异步中转拿到 `task_id` 后持续轮询直到完成、失败或手动停止。
 - 结果画廊：按实际宽高比完整展示（不裁剪），支持全屏灯箱预览与可靠的跨域下载。
 - 生成历史：左侧会话队列含实时状态标记，支持模糊搜索、时间筛选、失败重试覆盖、复用参数、回看结果；成功结果会按会话目录写入后端 `history/`。
 - 作品集：顶部「作品集」页面读取后端已完成会话，以照片墙展示所有成功图片，支持放大预览和下载。
@@ -207,7 +207,7 @@ gpt-image-2 等模型通过兼容 OpenAI 协议的接口访问，单次生成可
    - `chat`：调用 `/v1/chat/completions`，从响应中解析图片。
    - `custom`：直接 POST 到填写的完整 URL，不拼接任何路径。
    - `async`：提交 `/async/images` 后由后端在 worker 内轮询直到完成。
-   - 任一节点失败即切换到下一个启用节点；节点内部自动模式会优先尝试当前选中协议，再尝试该节点的其它协议。
+   - `api_type = auto` 表示单个节点内自动尝试协议；任一节点耗尽自身协议候选后，再切换到下一个启用节点。
 3. 前端每 4 秒 `GET /api/status?task_id=...` 读取最新状态、命中的节点与尝试记录，直到 `completed`/`failed`。
 
 任务状态表仅存在于内存中，进程重启后不保留运行中任务；已完成图片和会话元数据会保留在后端历史目录。
@@ -227,7 +227,7 @@ backend/data/configs.json
 - `base_url`
 - `api_key`
 - `model`
-- `api_type`：接入协议，`openai`（默认）/ `chat` / `custom` / `async`
+- `api_type`：接入协议，`auto`（默认）/ `openai` / `chat` / `custom` / `async`
 - `status`
 - `created_at`
 - `updated_at`
@@ -238,7 +238,9 @@ backend/data/configs.json
 
 ## 上游接口约定
 
-默认按**兼容 OpenAI 协议**的接口访问（`api_type = openai`）：
+默认按**自动尝试协议**访问（`api_type = auto`）：在当前节点内依次尝试 OpenAI Images、异步中转、Chat Completions（已知异步中转域名会优先尝试 async），不会改写保存的节点配置。当前节点的协议候选全部失败后，才切换到下一个启用节点。
+
+兼容 OpenAI 协议（`api_type = openai`）请求：
 
 ```text
 POST {base_url}/v1/images/generations   # 文生图，JSON
@@ -248,9 +250,11 @@ POST {base_url}/v1/images/edits         # 局部编辑，multipart（image + mas
 - `base_url` 已以 `/v1` 结尾时不会重复拼接。
 - 响应中的 `b64_json` 会转成 `data:image/...;base64,...`，`url` 则原样透传。
 - 局部编辑的 `mask` 会由后端用 Pillow 按原图尺寸对齐，并反转透明区域以符合 OpenAI「透明处即编辑区」的约定。
+- xAI/Grok Imagine 文生图走同一个 `/v1/images/generations` 入口；模型名以 `grok-imagine-image` 开头或 `base_url` 为 `https://api.x.ai` 时，后端会把自定义 `宽x高` 转换为 xAI 的 `aspect_ratio` 与 `resolution` 参数。
 
 其他协议：
 
+- `api_type = auto`：当前节点内自动尝试 `POST {base_url}/v1/images/generations`/edits、`POST {base_url}/async/images`、`POST {base_url}/v1/chat/completions`；`custom` 需要完整 URL，不参与自动推断。
 - `api_type = chat`：`POST {base_url}/v1/chat/completions`，从响应中解析图片。
 - `api_type = custom`：直接 `POST {base_url}`（填写完整地址，不拼接路径）。
 - `api_type = async`：自定义异步中转——
@@ -259,6 +263,8 @@ POST {base_url}/v1/images/edits         # 局部编辑，multipart（image + mas
 POST {base_url}/async/images
 GET  {base_url}/async/images/{task_id}
 ```
+
+异步中转提交成功后必须返回 `task_id`（可选 `poll_url`）。后端只提交一次任务，之后按 `poll_url` 或 `/async/images/{task_id}` 轮询；单次轮询超时会继续等待，不会切换协议或后续节点，除非上游返回 `failed` 或用户手动停止。
 
 文生图可附带 `reference_images`（参考图）；局部编辑会附带 `image` / `mask` / `composite`（自动合成的混合图）。详细字段见 [docs/API.md](docs/API.md)。
 
@@ -288,7 +294,7 @@ npm.cmd run build
 ### 提交任务后失败
 
 - 检查 API 节点的 `base_url` 是否可访问、`api_key` 是否有效
-- 检查节点的 `接入协议` 是否与上游实际支持的协议一致（OpenAI 兼容 / Chat / 自定义 URL / 异步中转）
+- 优先使用默认 `自动尝试协议`；如上游要求完整自定义地址，再切到 `自定义 URL`
 - 任务监视器的「尝试记录」会列出每个节点的失败原因，便于排查容灾路径
 
 ### 局部编辑无法提交

@@ -10,6 +10,7 @@ class FakeImageService:
     def __init__(self):
         self.submit_calls = []
         self.status_calls = []
+        self.cancel_calls = []
         self.result_dir = None
 
     def submit_generation(self, prompt, size="1024x1024", n=1, quality=None, reference_images=None, history_id=None):
@@ -66,6 +67,14 @@ class FakeImageService:
             "attempts": [{"api_id": "api-1", "api_name": "Primary", "ok": True}],
             "expires_at": 1780309714,
             "error": None,
+        }
+
+    def cancel_generation(self, task_id=""):
+        self.cancel_calls.append({"task_id": task_id})
+        return {
+            "task_id": task_id,
+            "status": "cancelled",
+            "error": "任务已手动停止",
         }
 
 
@@ -188,6 +197,13 @@ class BackendRouteTests(TestCase):
         self.assertEqual(status_response.get_json()["data"]["status"], "completed")
         self.assertEqual(self.image_service.status_calls, [{"api_id": "api-1", "task_id": "task-123"}])
 
+    def test_generation_cancel_route_cancels_task_via_image_service(self):
+        response = self.client.post("/api/tasks/task-123/cancel")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["data"]["status"], "cancelled")
+        self.assertEqual(self.image_service.cancel_calls, [{"task_id": "task-123"}])
+
     def test_edit_route_submits_masked_edit_task(self):
         edit_response = self.client.post(
             "/api/edit",
@@ -305,6 +321,28 @@ class BackendRouteTests(TestCase):
         self.assertEqual(data[0]["id"], "history-1")
         self.assertEqual(data[0]["images"][0]["url"], "/api/results/history-1/image.png")
         self.assertEqual(data[0]["prompt"], "a red house")
+
+    def test_sessions_route_accepts_utf8_bom_manifests(self):
+        result_dir = Path(self.tmp_dir.name) / "history"
+        self.image_service.result_dir = result_dir
+        session_dir = result_dir / "history-bom"
+        session_dir.mkdir(parents=True)
+        (session_dir / "image.png").write_bytes(b"image")
+        (session_dir / "session.json").write_text(
+            (
+                '\ufeff{"id":"history-bom","prompt":"bom manifest","mode":"generate",'
+                '"status":"completed","urls":["/api/results/history-bom/image.png"],'
+                '"created_at":"2026-06-08T00:00:00Z","updated_at":"2026-06-08T00:00:01Z"}'
+            ),
+            encoding="utf-8",
+        )
+
+        response = self.client.get("/api/sessions")
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()["data"]
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["id"], "history-bom")
 
     def test_delete_session_routes_remove_persisted_history_dirs(self):
         result_dir = Path(self.tmp_dir.name) / "history"

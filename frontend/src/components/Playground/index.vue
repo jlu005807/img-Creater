@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { Delete, Download, FullScreen, MagicStick, Picture, Plus, Refresh, RefreshLeft, ZoomIn } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
+  cancelGenerationTask,
   deleteSession,
   deleteSessions,
   editImage,
@@ -11,6 +12,7 @@ import {
   getGenerationStatus,
   saveEditDraft,
 } from '../../api/generation'
+import { backendRouteMissingMessage, isBackendRouteMissing } from '../../api/client'
 import { downloadImage } from '../../utils/download'
 import { useGenerationHistory } from '../../composables/useGenerationHistory'
 import { useSettings } from '../../composables/useSettings'
@@ -29,7 +31,6 @@ watch(pendingFill, (val) => {
   }
 })
 
-const DEFAULT_MAX_WAIT_SECONDS = 300
 const POLL_INTERVAL_MS = 4000
 const DRAFT_KEY = 'studio-form-draft'
 const HISTORY_WIDTH = '276px'
@@ -156,6 +157,10 @@ function isRunningStatus(value) {
   return ['submitting', 'queued', 'processing'].includes(value)
 }
 
+function isStoppedStatus(value) {
+  return ['failed', 'timeout', 'cancelled'].includes(value)
+}
+
 function findHistoryEntry(id) {
   return history.value.find((entry) => entry.id === id) || null
 }
@@ -171,10 +176,17 @@ const errorMessage = computed(() => activeEntry.value?.errorMessage || '')
 const loading = computed(() => isRunningStatus(status.value))
 const needsProvider = computed(() => typeof errorMessage.value === 'string' && errorMessage.value.includes('API 配置'))
 const elapsedSeconds = computed(() => elapsedForEntry(activeEntry.value))
-const maxWaitSeconds = computed(() => Number(activeEntry.value?.maxWaitSeconds) || DEFAULT_MAX_WAIT_SECONDS)
+const maxWaitSeconds = computed(() => {
+  const value = Number(activeEntry.value?.maxWaitSeconds)
+  return Number.isFinite(value) && value > 0 ? value : null
+})
+const waitLimitLabel = computed(() => (maxWaitSeconds.value ? `${maxWaitSeconds.value}s` : '持续等待'))
 const monitorFloating = ref(false)
 const monitorPos = reactive({ x: 720, y: 96 })
 const monitorDrag = reactive({ active: false, dx: 0, dy: 0 })
+const resultFloating = ref(false)
+const resultPos = reactive({ x: 760, y: 280 })
+const resultDrag = reactive({ active: false, dx: 0, dy: 0 })
 const monitorStyle = computed(() =>
   monitorFloating.value
     ? {
@@ -183,6 +195,18 @@ const monitorStyle = computed(() =>
         top: `${monitorPos.y}px`,
         width: '520px',
         zIndex: 30,
+      }
+    : {},
+)
+const resultStyle = computed(() =>
+  resultFloating.value
+    ? {
+        position: 'fixed',
+        left: `${resultPos.x}px`,
+        top: `${resultPos.y}px`,
+        width: 'min(760px, calc(100vw - 24px))',
+        height: 'min(620px, calc(100vh - 24px))',
+        zIndex: 29,
       }
     : {},
 )
@@ -207,6 +231,7 @@ const statusLabel = computed(() => {
     completed: '已完成',
     failed: '失败',
     timeout: '超时',
+    cancelled: '已停止',
   }
   return labels[status.value] || status.value
 })
@@ -218,6 +243,44 @@ const buttonText = computed(() => {
 const showSkeleton = computed(() => loading.value && !images.value.length)
 const operationLabel = computed(() => ((activeEntry.value?.mode || mode.value) === 'edit' ? '局部编辑' : '文生图'))
 
+function apiTypeText(value) {
+  if (value === 'auto') return '自动识别'
+  if (value === 'async') return '异步中转'
+  if (value === 'custom') return '自定义 URL'
+  if (value === 'chat') return 'Chat'
+  if (value === 'openai') return 'OpenAI'
+  return value || ''
+}
+
+function attemptProtocolLabel(attempt) {
+  const configured = apiTypeText(attempt?.configured_api_type)
+  const effective = apiTypeText(attempt?.effective_api_type)
+  if (configured && effective && configured !== effective) return `${configured} -> ${effective}`
+  return effective || configured
+}
+
+function attemptErrorText(attempt) {
+  if (!attempt || attempt.ok) return ''
+  const parts = []
+  if (attempt.error) parts.push(String(attempt.error))
+  const details = attempt.details
+  if (details && typeof details === 'object') {
+    const upstream = details.upstream
+    const upstreamError = upstream?.error || details.error
+    if (upstreamError) {
+      if (typeof upstreamError === 'string') {
+        parts.push(upstreamError)
+      } else {
+        const message = upstreamError.message || upstreamError.error || upstreamError.detail || upstreamError.reason
+        const code = upstreamError.code || upstreamError.type
+        if (message && code) parts.push(`${message} (${code})`)
+        else if (message || code) parts.push(String(message || code))
+      }
+    }
+  }
+  return [...new Set(parts.filter(Boolean))].join(' · ')
+}
+
 function floatMonitor() {
   monitorFloating.value = true
 }
@@ -227,6 +290,15 @@ function resetMonitorPosition() {
   monitorDrag.active = false
 }
 
+function floatResult() {
+  resultFloating.value = true
+}
+
+function resetResultPosition() {
+  resultFloating.value = false
+  resultDrag.active = false
+}
+
 function startMonitorDrag(event) {
   if (!monitorFloating.value) return
   monitorDrag.active = true
@@ -234,6 +306,15 @@ function startMonitorDrag(event) {
   monitorDrag.dy = event.clientY - monitorPos.y
   window.addEventListener('pointermove', moveMonitor)
   window.addEventListener('pointerup', stopMonitorDrag, { once: true })
+}
+
+function startResultDrag(event) {
+  if (!resultFloating.value) return
+  resultDrag.active = true
+  resultDrag.dx = event.clientX - resultPos.x
+  resultDrag.dy = event.clientY - resultPos.y
+  window.addEventListener('pointermove', moveResult)
+  window.addEventListener('pointerup', stopResultDrag, { once: true })
 }
 
 function moveMonitor(event) {
@@ -247,6 +328,19 @@ function moveMonitor(event) {
 function stopMonitorDrag() {
   monitorDrag.active = false
   window.removeEventListener('pointermove', moveMonitor)
+}
+
+function moveResult(event) {
+  if (!resultDrag.active) return
+  const maxX = Math.max(0, window.innerWidth - 320)
+  const maxY = Math.max(0, window.innerHeight - 220)
+  resultPos.x = Math.min(maxX, Math.max(0, event.clientX - resultDrag.dx))
+  resultPos.y = Math.min(maxY, Math.max(0, event.clientY - resultDrag.dy))
+}
+
+function stopResultDrag() {
+  resultDrag.active = false
+  window.removeEventListener('pointermove', moveResult)
 }
 
 // ---- history search + time filter ----
@@ -308,13 +402,13 @@ const historyItems = computed(() => {
 
 function historyStatusIcon(item) {
   if (item._status === 'completed') return '✓'
-  if (item._status === 'failed' || item._status === 'timeout') return '✗'
+  if (isStoppedStatus(item._status)) return '✗'
   return '⟳'
 }
 
 function historyStatusClass(item) {
   if (item._status === 'completed') return 'text-[var(--studio-green)]'
-  if (item._status === 'failed' || item._status === 'timeout') return 'text-[var(--studio-coral)]'
+  if (isStoppedStatus(item._status)) return 'text-[var(--studio-coral)]'
   return 'text-[var(--studio-teal)] animate-spin'
 }
 
@@ -462,6 +556,8 @@ async function submitTask(reuseId = null) {
       taskId: result.task_id,
       apiName: result.api_name,
       operation: result.operation || mode.value,
+      configuredApiType: result.configured_api_type,
+      effectiveApiType: result.effective_api_type,
     }
     updateEntry(entryId, {
       task: nextTask,
@@ -488,11 +584,6 @@ async function pollStatusOnce(entryId) {
   const entry = findHistoryEntry(entryId)
   const activeTask = entry?.task
   if (!entry || !activeTask || !isRunningStatus(entry._status)) return
-  const waitLimit = Number(entry.maxWaitSeconds) || DEFAULT_MAX_WAIT_SECONDS
-  if (elapsedForEntry(entry) >= waitLimit) {
-    stopWithTimeout(entryId)
-    return
-  }
 
   try {
     const result = await getGenerationStatus({
@@ -505,6 +596,16 @@ async function pollStatusOnce(entryId) {
       nextTask.apiId = result.api_id
       nextTask.apiName = result.api_name
     }
+    if (result.request_id) nextTask.requestId = result.request_id
+    if (result.request_url) nextTask.requestUrl = result.request_url
+    if (result.upstream_request_id) nextTask.upstreamRequestId = result.upstream_request_id
+    if (result.upstream_task_id) nextTask.upstreamTaskId = result.upstream_task_id
+    nextTask.pollCount = result.poll_count ?? nextTask.pollCount
+    nextTask.lastPollStatus = result.last_poll_status || nextTask.lastPollStatus
+    nextTask.lastPollError = result.last_poll_error || ''
+    if (result.wait_phase) nextTask.waitPhase = result.wait_phase
+    if (result.configured_api_type) nextTask.configuredApiType = result.configured_api_type
+    if (result.effective_api_type) nextTask.effectiveApiType = result.effective_api_type
     if (result.operation) {
       nextTask.operation = result.operation
     }
@@ -538,6 +639,11 @@ async function pollStatusOnce(entryId) {
       return
     }
 
+    if (result.status === 'cancelled') {
+      stopWithCancelled(entryId, result.error || '任务已手动停止', { task: nextTask, attempts: nextAttempts })
+      return
+    }
+
     if (result.status === 'failed') {
       stopWithError(entryId, result.error || '任务失败', { task: nextTask, attempts: nextAttempts })
       return
@@ -552,7 +658,10 @@ async function pollStatusOnce(entryId) {
     })
     schedulePoll(entryId, nextTask)
   } catch (error) {
-    stopWithError(entryId, error.message || '查询任务状态失败')
+    const message = isBackendRouteMissing(error)
+      ? backendRouteMissingMessage('任务状态轮询')
+      : error.message || '查询任务状态失败'
+    stopWithError(entryId, message)
   }
 }
 
@@ -567,15 +676,56 @@ function stopWithError(entryId, message, extra = {}) {
   })
 }
 
-function stopWithTimeout(entryId) {
+function stopWithCancelled(entryId, message = '任务已手动停止', extra = {}) {
   const entry = findHistoryEntry(entryId)
   clearPollTimer(entryId)
-  const waitLimit = Number(entry?.maxWaitSeconds) || DEFAULT_MAX_WAIT_SECONDS
   updateEntry(entryId, {
-    _status: 'timeout',
-    errorMessage: `已超过 ${waitLimit} 秒，任务轮询已自动停止`,
+    _status: 'cancelled',
+    errorMessage: message,
     elapsedSeconds: elapsedForEntry(entry),
+    ...extra,
   })
+}
+
+async function stopActiveTask() {
+  const entry = activeEntry.value
+  const taskId = entry?.task?.taskId
+  if (!entry || !taskId || !isRunningStatus(entry._status)) return
+  try {
+    await ElMessageBox.confirm(
+      '停止后前端将不再等待该任务；如果上游接口不支持取消，已经发出的请求可能仍会在服务商侧继续执行。',
+      '停止任务',
+      {
+        type: 'warning',
+        confirmButtonText: '停止',
+        cancelButtonText: '继续等待',
+      },
+    )
+    const result = await cancelGenerationTask(taskId)
+    stopWithCancelled(entry.id, result?.error || '任务已手动停止', {
+      task: {
+        ...entry.task,
+        apiId: result?.api_id || entry.task.apiId,
+        apiName: result?.api_name || entry.task.apiName,
+        operation: result?.operation || entry.task.operation,
+        requestId: result?.request_id || entry.task.requestId,
+        requestUrl: result?.request_url || entry.task.requestUrl,
+        upstreamRequestId: result?.upstream_request_id || entry.task.upstreamRequestId,
+        upstreamTaskId: result?.upstream_task_id || entry.task.upstreamTaskId,
+        pollCount: result?.poll_count ?? entry.task.pollCount,
+        lastPollStatus: result?.last_poll_status || entry.task.lastPollStatus,
+        lastPollError: result?.last_poll_error || '',
+        waitPhase: result?.wait_phase || entry.task.waitPhase,
+        configuredApiType: result?.configured_api_type || entry.task.configuredApiType,
+        effectiveApiType: result?.effective_api_type || entry.task.effectiveApiType,
+      },
+      attempts: Array.isArray(result?.attempts) ? result.attempts : entry.attempts || [],
+    })
+    ElMessage.success('已停止本地等待')
+  } catch (error) {
+    if (error === 'cancel') return
+    ElMessage.error(error.message || '停止任务失败')
+  }
 }
 
 async function reusePrompt() {
@@ -819,14 +969,15 @@ onMounted(async () => {
   restoreDraft()
   try {
     await loadPersistedSessions()
-  } catch {
-    ElMessage.warning('后端历史会话加载失败，仅显示本地历史')
+  } catch (error) {
+    ElMessage.warning(error.message || '后端历史会话加载失败，仅显示本地历史')
   }
   restoreRunningTasks()
 })
 onBeforeUnmount(() => {
   clearTimers()
   window.removeEventListener('pointermove', moveMonitor)
+  window.removeEventListener('pointermove', moveResult)
 })
 
 watch(
@@ -918,7 +1069,7 @@ watch(
             </button>
             <div class="flex shrink-0 items-center gap-1">
               <button
-                v-if="item._status === 'failed' || item._status === 'timeout'"
+                v-if="isStoppedStatus(item._status)"
                 type="button"
                 class="opacity-0 transition group-hover:opacity-100"
                 title="重新生成并覆盖此记录"
@@ -1107,7 +1258,8 @@ watch(
             <div class="flex items-center gap-2">
               <el-button v-if="monitorFloating" size="small" text @click="resetMonitorPosition">回原位</el-button>
               <el-button v-else size="small" text @click="floatMonitor">悬浮</el-button>
-              <el-tag :type="status === 'completed' ? 'success' : status === 'failed' || status === 'timeout' ? 'danger' : 'warning'" effect="plain">
+              <el-button v-if="loading && task?.taskId" size="small" type="danger" plain @click="stopActiveTask">停止</el-button>
+              <el-tag :type="status === 'completed' ? 'success' : isStoppedStatus(status) ? 'danger' : 'warning'" effect="plain">
                 {{ statusLabel }}
               </el-tag>
             </div>
@@ -1117,46 +1269,82 @@ watch(
             <div class="rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface-soft)] p-3">
               <p class="text-xs text-[var(--studio-muted)]">耗时</p>
               <p class="mt-1 text-xl font-black">{{ elapsedSeconds }}s</p>
-              <p class="mt-0.5 text-xs text-[var(--studio-muted)]">上限 {{ maxWaitSeconds }}s</p>
+              <p class="mt-0.5 text-xs text-[var(--studio-muted)]">{{ waitLimitLabel }}</p>
             </div>
             <div class="rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface-soft)] p-3">
               <p class="text-xs text-[var(--studio-muted)]">任务</p>
               <p class="mt-1 truncate text-sm font-bold">{{ task?.taskId || '-' }}</p>
+              <p v-if="task?.upstreamTaskId" class="mt-0.5 truncate text-xs text-[var(--studio-muted)]">云端 {{ task.upstreamTaskId }}</p>
+              <p v-if="task?.upstreamRequestId" class="mt-0.5 truncate text-xs text-[var(--studio-muted)]">上游 {{ task.upstreamRequestId }}</p>
             </div>
             <div class="rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface-soft)] p-3">
               <p class="text-xs text-[var(--studio-muted)]">节点</p>
               <p class="mt-1 truncate text-sm font-bold">{{ task?.apiName || '-' }}</p>
+              <p v-if="task?.effectiveApiType" class="mt-0.5 truncate text-xs text-[var(--studio-muted)]">
+                协议 {{ apiTypeText(task.configuredApiType) || '-' }}<span v-if="task.configuredApiType && task.effectiveApiType && task.configuredApiType !== task.effectiveApiType"> -> {{ apiTypeText(task.effectiveApiType) }}</span><span v-else-if="task.effectiveApiType"> {{ apiTypeText(task.effectiveApiType) }}</span>
+              </p>
+              <p v-if="task?.requestUrl" class="mt-0.5 truncate text-xs text-[var(--studio-muted)]" :title="task.requestUrl">{{ task.requestUrl }}</p>
             </div>
             <div class="rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface-soft)] p-3">
               <p class="text-xs text-[var(--studio-muted)]">模式</p>
               <p class="mt-1 text-sm font-bold">{{ operationLabel }}</p>
+              <p v-if="task?.waitPhase === 'upstream_processing'" class="mt-0.5 text-xs text-[var(--studio-muted)]">云端生成中</p>
+              <p v-if="task?.pollCount" class="mt-0.5 text-xs text-[var(--studio-muted)]">
+                轮询 {{ task.pollCount }} 次<span v-if="task.lastPollStatus"> · {{ task.lastPollStatus }}</span>
+              </p>
             </div>
           </div>
 
           <el-alert v-if="errorMessage" class="mt-4" type="error" :closable="false" :title="errorMessage" />
+          <el-alert
+            v-else-if="task?.lastPollError"
+            class="mt-4"
+            type="warning"
+            :closable="false"
+            :title="`最近轮询错误：${task.lastPollError}`"
+          />
 
           <div v-if="needsProvider" class="mt-4 rounded-md border border-[var(--studio-coral)] bg-[var(--studio-surface-soft)] px-4 py-3 text-sm text-[var(--studio-ink)]">
             还没有可用的 API 节点，请点击右上角齿轮「设置」添加。
           </div>
 
           <div v-if="attempts.length" class="mt-4 flex flex-wrap gap-2">
-            <div v-for="attempt in attempts" :key="`${attempt.api_id}-${attempt.ok}`" class="flex items-center gap-2 rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface)] px-3 py-2 text-sm">
-              <span>{{ attempt.api_name }}</span>
-              <el-tag size="small" :type="attempt.ok ? 'success' : 'danger'">{{ attempt.ok ? '成功' : '失败' }}</el-tag>
+            <div v-for="attempt in attempts" :key="`${attempt.api_id}-${attempt.ok}`" class="max-w-full rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface)] px-3 py-2 text-sm">
+              <div class="flex items-center gap-2">
+                <span>{{ attempt.api_name }}</span>
+                <span v-if="attemptProtocolLabel(attempt)" class="text-xs text-[var(--studio-muted)]">{{ attemptProtocolLabel(attempt) }}</span>
+                <span v-if="attempt.request_url" class="max-w-[280px] truncate text-xs text-[var(--studio-muted)]" :title="attempt.request_url">{{ attempt.request_url }}</span>
+                <el-tag size="small" :type="attempt.ok ? 'success' : 'danger'">{{ attempt.ok ? '成功' : '失败' }}</el-tag>
+              </div>
+              <p v-if="attemptErrorText(attempt)" class="mt-1 max-w-[520px] break-words text-xs text-[var(--studio-coral)]">
+                {{ attemptErrorText(attempt) }}
+              </p>
             </div>
           </div>
         </div>
 
         <!-- Gallery -->
-        <div class="studio-panel flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg p-5">
+        <div
+          class="studio-panel flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg p-5"
+          :class="resultFloating ? 'shadow-2xl' : ''"
+          :style="resultStyle"
+        >
           <div class="mb-4 flex items-end justify-between">
-            <div>
+            <div
+              :class="resultFloating ? 'cursor-move select-none' : ''"
+              title="拖拽移动生成结果"
+              @pointerdown="startResultDrag"
+            >
               <p class="text-xs font-semibold uppercase tracking-[0.16em] text-[var(--studio-amber)]">Gallery Output</p>
               <h2 class="mt-1 text-2xl font-black">生成结果</h2>
             </div>
-            <div class="text-right text-sm text-[var(--studio-muted)]">
-              <p>{{ images.length }} 张图片</p>
-              <p v-if="expiresLabel" class="mt-0.5 text-xs text-[var(--studio-amber)]">链接将于 {{ expiresLabel }} 过期</p>
+            <div class="flex items-end gap-3">
+              <div class="text-right text-sm text-[var(--studio-muted)]">
+                <p>{{ images.length }} 张图片</p>
+                <p v-if="expiresLabel" class="mt-0.5 text-xs text-[var(--studio-amber)]">链接将于 {{ expiresLabel }} 过期</p>
+              </div>
+              <el-button v-if="resultFloating" size="small" text @click="resetResultPosition">回原位</el-button>
+              <el-button v-else size="small" text @click="floatResult">悬浮</el-button>
             </div>
           </div>
 

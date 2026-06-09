@@ -26,3 +26,10 @@ apiClient.interceptors.response.use(
   },
 )
 
+export function isBackendRouteMissing(error) {
+  return Number(error?.status) === 404
+}
+
+export function backendRouteMissingMessage(feature = '该功能') {
+  return `${feature}接口不存在，请重启后端到当前版本后再试`
+}

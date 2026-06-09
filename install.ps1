@@ -67,6 +67,9 @@ if (-not (Test-Path $configPath) -and (Test-Path $examplePath)) {
   Write-Ok 'Created backend\data\configs.json from template'
 }
 
+New-Item -ItemType Directory -Force -Path (Join-Path $root 'history') | Out-Null
+Write-Ok 'Ensured history directory exists'
+
 Write-Host "`nDone." -ForegroundColor Green
-Write-Host "Start everything with:  .\run.ps1" -ForegroundColor Green
+Write-Host "Start everything with:  .\run.ps1  (it frees stale ports 5000/5173 first)" -ForegroundColor Green
 Write-Host "Then open the gear icon (top-right) to add an API node." -ForegroundColor Green
