@@ -17,6 +17,14 @@ function load() {
   }
 }
 
+function persistedUrlList(value) {
+  return Array.isArray(value) ? value.filter((url) => typeof url === 'string' && !url.startsWith('data:')) : []
+}
+
+function referenceImagesForSession(session) {
+  return persistedUrlList(session?.reference_images)
+}
+
 // base64 (data:) images are far too large for the ~5MB localStorage quota, so
 // only remote URLs are persisted; data: results stay in memory for this session.
 function sanitizeForStorage(entries) {
@@ -24,7 +32,8 @@ function sanitizeForStorage(entries) {
     const urls = entry.urls || []
     return {
       ...entry,
-      urls: urls.filter((url) => typeof url === 'string' && !url.startsWith('data:')),
+      urls: persistedUrlList(urls),
+      referenceImages: persistedUrlList(entry.referenceImages),
       imageCount: urls.length,
       editDraft: undefined,
     }
@@ -94,6 +103,7 @@ export function useGenerationHistory() {
         mode: session.mode || 'generate',
         size: session.size || '1024x1024',
         urls,
+        referenceImages: referenceImagesForSession(session),
         apiName: session.api_name || '',
         imageCount: urls.length,
         time: Date.parse(session.updated_at || session.created_at || '') || Date.now(),

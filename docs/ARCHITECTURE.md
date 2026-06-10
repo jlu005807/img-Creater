@@ -20,7 +20,7 @@ Vue 3 Desktop UI
 
 - PC 工作台布局
 - 文生图与局部编辑两种交互模式
-- 原图上传和遮罩绘制
+- 原图上传和彩色标注绘制
 - 任务状态轮询节奏
 - 超时控制
 - 结果展示与下载
@@ -130,8 +130,8 @@ history/
 - 校验生成 / 局部编辑请求参数
 - 在 worker 线程内按节点优先级容灾执行
 - 按节点 `api_type` 适配上游协议：
-  - `openai`：`/v1/images/generations`（JSON）、`/v1/images/edits`（multipart），把 `b64_json`/`url` 规整为可展示链接；编辑时用 Pillow 对齐并反转遮罩
-  - `async`：提交 `/async/images` 后在 worker 内轮询直至完成
+  - `openai`：`/v1/images/generations`（JSON）、`/v1/images/edits`（multipart），把 `b64_json`/`url` 规整为可展示链接；编辑时上传干净原图、彩色标注图和参考图，不发送 `mask`
+  - `async`：提交 `/async/images` 后在 worker 内轮询直至完成；`fnuu.net` 固定轮询 `/async/task/{task_id}`
 - 把状态/结果写入 `TaskStore`
 - 把完成结果与 `session.json` 写入 `history/<session-id>/`
 
@@ -229,16 +229,15 @@ frontend/src/
 职责：
 
 - 上传本地原图
-- 在固定画布上绘制遮罩
+- 在固定画布上绘制半透明彩色标注层
 - 支持两种编辑工具：
   - `brush`
   - `rect`
-- 导出：
-  - `image`
-  - `mask`
-  - `selection`
+- 导出请求 payload：
+  - `source_image`：干净原图
+  - `marked_image`：原图叠加半透明彩色标注后的整图
 
-`selection` 不是图像内容本身，而是辅助元数据，用于把前端选区信息一起传给后端和上游服务。
+组件内部仍用一张离屏画布保存笔迹，以便撤销、擦除、前后对比和草稿恢复；该内部数据不会作为上游 `mask` 参数发送。
 
 ### `api/client.js`
 
@@ -259,6 +258,7 @@ User fills prompt and options
   -> Worker: try enabled providers in order
        openai -> POST {base}/v1/images/generations -> b64_json/url
        async  -> POST {base}/async/images then poll until completed
+                fnuu.net polls GET {base}/async/task/{task_id}
   -> Worker writes status/urls/attempts into TaskStore
   -> Frontend polls GET /api/status?task_id every 4s
   -> Gallery renders images
@@ -268,14 +268,15 @@ User fills prompt and options
 
 ```text
 User uploads image
-  -> RegionEditor draws mask + exports image + mask + selection(box)
+  -> RegionEditor draws colored marks + exports source_image + marked_image
   -> Playground calls POST /api/edit
   -> generation.py -> ImageService.submit_edit_generation()
   -> TaskStore.create() + start worker, return task_id (202)
   -> Worker per provider:
-       openai -> Pillow rebuilds mask (crop to box, resize, invert alpha)
-               -> POST {base}/v1/images/edits (multipart image+mask)
-       async  -> POST {base}/async/images (JSON, with image/mask) then poll
+       openai -> POST {base}/v1/images/edits
+                 multipart image/image[]: source image, marked image, refs
+       generic async/custom -> JSON with image/marked_image/source_image/reference_images/images
+       fnuu async -> POST {base}/async/images with image field, then poll /async/task/{task_id}
   -> Frontend polls GET /api/status?task_id every 4s
   -> Completed result displayed in gallery
 ```
@@ -294,30 +295,30 @@ User uploads image
 
 因为状态保存在后端 `TaskStore` 中，前端只用 `task_id` 查询，无需在轮询阶段绑定具体节点。
 
-## 8. 局部编辑的遮罩模型与数据流
+## 8. 局部编辑的标注图模型与数据流
 
-用户**无需手动制作蒙版**：上传原图后直接在图上涂抹/框选，标记区域以半透明青色实时叠加显示。前端局部编辑器内部维护一张独立的遮罩画布：
+用户**无需手动制作蒙版**：上传原图后直接在图上涂抹/框选，标记区域以半透明彩色实时叠加显示。前端局部编辑器内部维护一张独立的标注层画布：
 
 - 背景透明
-- 用户涂抹（画笔/橡皮擦）或框选时写入白色不透明区域
-- 提交前自动导出三样东西（PNG `data URL`）：
-  - `image`：原图
-  - `mask`：原图分辨率的遮罩（标记区域为不透明白）
-  - `composite`：**原图 + 半透明遮罩叠加合成的一张混合图**，可被需要单图的上游直接使用
-  - 并附带图片在画布中的 letterbox 矩形 `selection.box`
+- 用户涂抹（画笔/橡皮擦）或框选时写入当前选择的标注颜色
+- 该画布用于前端展示、撤销、擦除、前后对比和 `edit-draft.json` 草稿恢复
+- 提交前自动导出两张 PNG `data URL`：
+  - `source_image`：干净原图
+  - `marked_image`：**原图 + 半透明彩色标注叠加合成的一张整图**
 
 完整数据流：
 
 ```text
-上传原图 + 涂抹/框选 → 生成遮罩 + 合成半透明混合图(composite)
-  → 连同 prompt 提交 /api/edit
-  → 后端按协议处理并提交上游 → 输出修改后的图片
+上传原图 + 涂抹/框选 → 合成半透明彩色标注图(marked_image)
+  → 连同 prompt、source_image、可选 reference_images 提交 /api/edit
+  → 后端按协议转发并提交上游 → 输出修改后的图片
 ```
 
 后端处理因协议而异：
 
-- `openai`：用 Pillow 把画布尺寸的遮罩按 `selection.box` 裁回原图区域、缩放到原图尺寸，并**反转 alpha**（OpenAI 约定：透明处即编辑区）后作为 `mask` 文件上传
-- `async` / `custom`：原样把 `image`/`mask`/`composite`/`selection` 透传给上游
+- `openai`：通常上传 `image` 或 `image[]`，新版局部编辑顺序为干净原图、彩色标注图、可选参考图；不上传 `mask`。xAI/Grok Imagine 作为特例使用 JSON 图片字段而不是 multipart。
+- `custom` 和通用 `async`：JSON 中带 `image`/`marked_image`、可选 `source_image`、`reference_images` 和顺序数组 `images`
+- `fnuu.net`：按接入手册只使用 `image` 字段；局部编辑时 `image` 数组顺序为干净原图、彩色标注图、可选参考图
 
 ## 8.1 参考图（文生图）
 
@@ -325,7 +326,8 @@ User uploads image
 
 - `openai`：走 `/v1/images/edits`，参考图作为多个 `image[]` 文件上传
 - `chat`：作为 `image_url` 内容块加入 `messages`
-- `custom` / `async`：内联到 JSON 请求体的 `reference_images` 字段
+- `custom` / 通用 `async`：内联到 JSON 请求体的 `reference_images` 字段
+- `fnuu.net`：转换到 `image` 字段；`data URL` 和公网 URL 走 JSON，单张本地 `/api/results/...` 或本地路径走 multipart `image` 文件上传
 
 ## 9. 错误处理策略
 

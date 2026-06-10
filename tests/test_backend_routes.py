@@ -29,27 +29,25 @@ class FakeImageService:
     def submit_edit_generation(
         self,
         prompt,
-        image,
-        mask,
+        image=None,
         size="1024x1024",
         n=1,
-        edit_mode="mask",
-        selection=None,
         quality=None,
-        composite=None,
         history_id=None,
+        source_image=None,
+        marked_image=None,
+        reference_images=None,
     ):
         self.submit_calls.append(
             {
                 "prompt": prompt,
                 "image": image,
-                "mask": mask,
+                "source_image": source_image,
+                "marked_image": marked_image,
+                "reference_images": reference_images,
                 "size": size,
                 "n": n,
-                "edit_mode": edit_mode,
-                "selection": selection,
                 "quality": quality,
-                "composite": composite,
                 "history_id": history_id,
             }
         )
@@ -204,17 +202,16 @@ class BackendRouteTests(TestCase):
         self.assertEqual(response.get_json()["data"]["status"], "cancelled")
         self.assertEqual(self.image_service.cancel_calls, [{"task_id": "task-123"}])
 
-    def test_edit_route_submits_masked_edit_task(self):
+    def test_edit_route_submits_source_marked_and_reference_images(self):
         edit_response = self.client.post(
             "/api/edit",
             json={
                 "prompt": "replace selected area",
-                "image": "data:image/png;base64,aW1hZ2U=",
-                "mask": "data:image/png;base64,bWFzaw==",
+                "source_image": "data:image/png;base64,c291cmNl",
+                "marked_image": "data:image/png;base64,bWFya2Vk",
+                "reference_images": ["data:image/png;base64,cmVm"],
                 "size": "1024x1024",
                 "n": 1,
-                "edit_mode": "mask",
-                "selection": {"type": "rect", "bbox": {"x": 8, "y": 9, "width": 100, "height": 120}},
             },
         )
 
@@ -224,14 +221,13 @@ class BackendRouteTests(TestCase):
             self.image_service.submit_calls[-1],
             {
                 "prompt": "replace selected area",
-                "image": "data:image/png;base64,aW1hZ2U=",
-                "mask": "data:image/png;base64,bWFzaw==",
+                "image": None,
+                "source_image": "data:image/png;base64,c291cmNl",
+                "marked_image": "data:image/png;base64,bWFya2Vk",
+                "reference_images": ["data:image/png;base64,cmVm"],
                 "size": "1024x1024",
                 "n": 1,
-                "edit_mode": "mask",
-                "selection": {"type": "rect", "bbox": {"x": 8, "y": 9, "width": 100, "height": 120}},
                 "quality": None,
-                "composite": None,
                 "history_id": None,
             },
         )
@@ -308,6 +304,7 @@ class BackendRouteTests(TestCase):
             (
                 '{"id":"history-1","prompt":"a red house","mode":"generate",'
                 '"size":"1024x1024","status":"completed","urls":["/api/results/history-1/image.png"],'
+                '"reference_images":["/api/results/history-1/references/ref.png"],'
                 '"created_at":"2026-06-08T00:00:00Z","updated_at":"2026-06-08T00:00:01Z"}'
             ),
             encoding="utf-8",
@@ -320,6 +317,7 @@ class BackendRouteTests(TestCase):
         self.assertEqual(len(data), 1)
         self.assertEqual(data[0]["id"], "history-1")
         self.assertEqual(data[0]["images"][0]["url"], "/api/results/history-1/image.png")
+        self.assertEqual(data[0]["reference_images"], ["/api/results/history-1/references/ref.png"])
         self.assertEqual(data[0]["prompt"], "a red house")
 
     def test_sessions_route_accepts_utf8_bom_manifests(self):

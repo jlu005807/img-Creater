@@ -7,8 +7,8 @@
 ## 当前能力
 
 - 文生图：提交 `prompt` 与尺寸，由后台任务完成生成（默认 1 张，按上游返回数量展示）。
-- 参考图：文生图可上传最多 N 张参考图辅助生成（上限在设置中可配置，默认 3）。
-- 局部编辑：上传/拖拽原图后直接在图上涂抹、框选、橡皮擦标记修改区域，半透明遮罩实时叠加；无需手动制作蒙版，前端自动合成混合图。支持按钮撤销、遮罩显隐切换、整体放大编辑，并会按会话保存原图与编辑痕迹。
+- 参考图：文生图和局部编辑都可上传最多 N 张参考图辅助生成（上限在设置中可配置，默认 3）。
+- 局部编辑：上传/拖拽原图后直接在图上涂抹、框选、橡皮擦标记修改区域，半透明彩色标注实时叠加；提交时前端会同时提交干净原图、已标注图和可选参考图，后端会在提示词里附加每张图的含义。支持多种标注颜色、按钮撤销、前后对比滑杆、整体放大编辑，并会按会话保存原图与编辑痕迹。
 - 尺寸：宽高自定义输入 + 比例预设（1:1 / 4:3 / 3:4 / 16:9 / 9:16）。
 - 多接入协议：每个节点默认使用 **自动尝试协议**，也可固定为 **OpenAI 兼容**（`/v1/images`）、**Chat Completions**（`/v1/chat/completions`）、**自定义 URL**（直接请求）或 **异步中转**（`/async/images`）。
 - 多 API 节点：支持新增、编辑、删除、启用/禁用和拖拽排序；返回时 `api_key` 自动脱敏。
@@ -167,7 +167,7 @@ npm run dev
    - `base_url`
    - `api_key`
    - `model`
-   - `接入协议`（默认 `OpenAI 兼容`；可选 Chat Completions / 自定义 URL / 异步中转）
+   - `接入协议`（默认 `自动尝试协议`；可选 OpenAI 兼容 / Chat Completions / 自定义 URL / 异步中转）
 4. 保持节点为启用状态
 5. 如有多个节点，可在列表中拖拽调整优先级（后端按从上到下顺序容灾）
 
@@ -187,12 +187,12 @@ npm run dev
 
 1. 切换到 `局部编辑`
 2. 上传或拖拽原图
-3. 在原图上直接标记修改区域（半透明青色实时叠加）：
+3. 在原图上直接标记修改区域（半透明彩色实时叠加）：
    - `涂抹`：画笔标记不规则区域
    - `框选`：矩形标记
-   - `擦除`：去掉多余标记；可通过撤销按钮回退；可切换遮罩显隐、点「放大」精细编辑
+   - `擦除`：去掉多余标记；可通过撤销按钮回退；底部滑杆可对比原图/标注图，点「放大」精细编辑
 4. 输入编辑提示词，描述只应修改被标记覆盖的部分
-5. 提交任务（前端自动合成「原图 + 半透明遮罩」混合图与遮罩一并提交，无需手动制作蒙版）
+5. 提交任务（前端提交干净原图、半透明彩色标注图和可选参考图；后端不再接收单独蒙版）
 6. 前端会自动轮询 `/api/status`，直到返回结果
 
 > 历史记录在左侧队列实时显示状态（生成中 ⟳ / 已完成 ✓ / 失败 ✗），支持搜索、时间筛选、复用参数、查看结果，失败项可一键「重试并覆盖」。
@@ -244,13 +244,13 @@ backend/data/configs.json
 
 ```text
 POST {base_url}/v1/images/generations   # 文生图，JSON
-POST {base_url}/v1/images/edits         # 局部编辑，multipart（image + mask 文件）
+POST {base_url}/v1/images/edits         # 局部编辑，multipart（image 或 image[]）
 ```
 
 - `base_url` 已以 `/v1` 结尾时不会重复拼接。
 - 响应中的 `b64_json` 会转成 `data:image/...;base64,...`，`url` 则原样透传。
-- 局部编辑的 `mask` 会由后端用 Pillow 按原图尺寸对齐，并反转透明区域以符合 OpenAI「透明处即编辑区」的约定。
-- xAI/Grok Imagine 文生图走同一个 `/v1/images/generations` 入口；模型名以 `grok-imagine-image` 开头或 `base_url` 为 `https://api.x.ai` 时，后端会把自定义 `宽x高` 转换为 xAI 的 `aspect_ratio` 与 `resolution` 参数。
+- 局部编辑向后端提交 `source_image`（干净原图）、`marked_image`（半透明彩色标注图）和可选 `reference_images`；后端不接收、不生成、不转发单独的 `mask` 参数。
+- xAI/Grok Imagine 通过 OpenAI 兼容入口接入；模型名以 `grok-imagine-image` 开头或 `base_url` 为 `https://api.x.ai` 时，文生图会把自定义 `宽x高` 转换为 xAI 的 `aspect_ratio` 与 `resolution` 参数，局部编辑/参考图会走 xAI JSON 图片字段而不是 multipart 文件。
 
 其他协议：
 
@@ -261,12 +261,13 @@ POST {base_url}/v1/images/edits         # 局部编辑，multipart（image + mas
 
 ```text
 POST {base_url}/async/images
-GET  {base_url}/async/images/{task_id}
+GET  {base_url}/async/images/{task_id}   # 通用默认或上游 poll_url
+GET  {base_url}/async/task/{task_id}     # fnuu.net
 ```
 
-异步中转提交成功后必须返回 `task_id`（可选 `poll_url`）。后端只提交一次任务，之后按 `poll_url` 或 `/async/images/{task_id}` 轮询；单次轮询超时会继续等待，不会切换协议或后续节点，除非上游返回 `failed` 或用户手动停止。
+异步中转提交成功后必须返回 `task_id`（可选 `poll_url`）。后端只提交一次任务：通用中转按 `poll_url` 或 `/async/images/{task_id}` 轮询；`fnuu.net` 会按接入手册轮询 `/async/task/{task_id}`。单次轮询超时或临时非 JSON 不会再次提交任务，也不会切换协议或后续节点，除非上游明确返回 `failed`、结果下载失败或用户手动停止。完成时会从 `urls`、`result` 等字段取图，并保存到对应会话目录。
 
-文生图可附带 `reference_images`（参考图）；局部编辑会附带 `image` / `mask` / `composite`（自动合成的混合图）。详细字段见 [docs/API.md](docs/API.md)。
+文生图可附带 `reference_images`（参考图）；局部编辑会区分干净原图、标注图和参考图。详细字段见 [docs/API.md](docs/API.md)。
 
 ## 验证命令
 
@@ -295,17 +296,18 @@ npm.cmd run build
 
 - 检查 API 节点的 `base_url` 是否可访问、`api_key` 是否有效
 - 优先使用默认 `自动尝试协议`；如上游要求完整自定义地址，再切到 `自定义 URL`
+- 如果错误中出现 Cloudflare/网关 `504` HTML 页面，通常表示请求在中转站网关层超时或被拦截，不是本地 JSON 解析逻辑本身生成的错误；任务记录会保留 HTTP 状态、响应片段和网关提示
 - 任务监视器的「尝试记录」会列出每个节点的失败原因，便于排查容灾路径
 
 ### 局部编辑无法提交
 
 - 必须先上传原图，并在图上涂抹或框选出至少一块修改区域
-- 无需手动制作蒙版——遮罩与混合图由前端自动生成
+- 无需手动制作蒙版——只需在原图上涂抹或框选，前端提交时会生成一张彩色半透明标注图
 
 ### 跨域 / 端口
 
 - 后端默认仅允许 `http://127.0.0.1:5173`、`http://localhost:5173` 跨域；如改了前端地址，用 `FRONTEND_ORIGIN` 环境变量覆盖
-- 上传体积上限 25MB（局部编辑会内联原图、遮罩、混合图的 base64）
+- 上传体积上限 25MB（局部编辑会内联一张已标注原图的 base64）
 
 ## 相关文档
 

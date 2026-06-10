@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import base64
-import io
+import html
 import json
+import logging
+import mimetypes
+import re
 import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Any
 from math import gcd
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from .config_service import ConfigService, DEFAULT_MODEL
 from .task_store import TaskStore, task_store as default_task_store
@@ -18,7 +21,17 @@ from .task_store import TaskStore, task_store as default_task_store
 _VALID_QUALITY = {"auto", "low", "medium", "high"}
 DEFAULT_RESULT_DIR = Path(__file__).resolve().parents[2] / "history"
 KNOWN_ASYNC_RELAY_HOSTS = {"fnuu.net", "www.fnuu.net"}
+FNUU_MAX_IMAGE_BYTES = 12 * 1024 * 1024
 XAI_IMAGE_HOSTS = {"api.x.ai"}
+EDIT_REFERENCE_PROMPT_INSTRUCTION = (
+    "Use the attached images according to their roles. "
+    "The marked image may contain multiple colored regions. "
+    "Modify only the colored semi-transparent marked regions and preserve the clean source image outside those regions."
+)
+_IMAGE_URL_RE = re.compile(r"(?:https?://|data:image/)[^\s\"'<>\\)]+", re.IGNORECASE)
+_HTML_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff")
+logger = logging.getLogger(__name__)
 
 
 class ImageServiceError(Exception):
@@ -137,43 +150,42 @@ class ImageService:
     def submit_edit_generation(
         self,
         prompt: str,
-        image: str,
-        mask: str,
+        image: str | None = None,
+        source_image: str | None = None,
+        marked_image: str | None = None,
+        reference_images: list[str] | None = None,
         size: str = "1024x1024",
         n: int = 1,
-        edit_mode: str = "mask",
-        selection: dict[str, Any] | None = None,
         quality: str | None = None,
-        composite: str | None = None,
         history_id: str | None = None,
     ) -> dict[str, Any]:
-        edit_mode = str(edit_mode or "mask").strip() or "mask"
-        if edit_mode not in {"mask", "selection"}:
-            raise GenerationValidationError("edit_mode 只支持 mask 或 selection", status_code=400)
-        if selection is not None and not isinstance(selection, dict):
-            raise GenerationValidationError("selection 必须是对象", status_code=400)
-
+        normalized_marked_image = self._normalize_image_data_url(marked_image or image, "marked_image")
         payload: dict[str, Any] = {
             "prompt": self._normalize_prompt(prompt),
             "size": self._normalize_size(size),
             "n": self._normalize_image_count(n),
-            "image": self._normalize_image_data_url(image, "image"),
-            "mask": self._normalize_image_data_url(mask, "mask"),
-            "edit_mode": edit_mode,
+            # ``image`` is kept as a backward-compatible alias for providers
+            # that only know about one edit input.
+            "image": normalized_marked_image,
+            "marked_image": normalized_marked_image,
         }
+        if source_image:
+            payload["source_image"] = self._normalize_image_data_url(source_image, "source_image")
         normalized_history_id = self._normalize_history_id(history_id)
         if normalized_history_id:
             payload["history_id"] = normalized_history_id
         quality = self._normalize_quality(quality)
         if quality:
             payload["quality"] = quality
-        if selection is not None:
-            payload["selection"] = selection
-        # Pre-composed original+overlay image (frontend auto-generates it); the
-        # async/custom relays forward it so an upstream that wants a single
-        # blended image can use it directly.
-        if composite:
-            payload["composite"] = self._normalize_image_data_url(composite, "composite")
+        refs = self._normalize_reference_images(reference_images)
+        if refs:
+            payload["reference_images"] = refs
+        payload["edit_reference_image"] = payload["marked_image"]
+        payload["edit_reference_prompt"] = self._edit_reference_prompt(
+            payload["prompt"],
+            has_source=bool(payload.get("source_image")),
+            reference_count=len(payload.get("reference_images") or []),
+        )
         return self._start_task(payload=payload, operation="edit")
 
     def _start_task(self, payload: dict[str, Any], operation: str) -> dict[str, Any]:
@@ -189,6 +201,16 @@ class ImageService:
         self.store.update(task_id, max_wait_seconds=max_wait_seconds)
         if history_id:
             self.store.update(task_id, history_id=history_id)
+        logger.info(
+            "[image] task queued task_id=%s operation=%s history_id=%s providers=%d size=%s n=%s references=%d",
+            task_id,
+            operation,
+            history_id or "",
+            len(providers),
+            payload.get("size"),
+            payload.get("n"),
+            len(payload.get("reference_images") or []),
+        )
         if self.run_async:
             thread = threading.Thread(
                 target=self._execute_task,
@@ -219,6 +241,7 @@ class ImageService:
         if self.store.is_cancelled(task_id):
             return
         self.store.update(task_id, status="processing", history_id=history_id)
+        logger.info("[image] task processing task_id=%s operation=%s history_id=%s", task_id, operation, history_id or "")
         attempts: list[dict[str, Any]] = []
         # Each provider/mode carries its own positive timeout. Do not cap it
         # with a fixed global generation limit; user-configured timeouts are
@@ -229,6 +252,14 @@ class ImageService:
                 if self.store.is_cancelled(task_id):
                     return
                 self.store.update(task_id, api_id=provider["id"], api_name=provider["name"])
+                logger.info(
+                    "[image] provider start task_id=%s operation=%s api_id=%s api_name=%s api_type=%s",
+                    task_id,
+                    operation,
+                    provider.get("id"),
+                    provider.get("name"),
+                    provider.get("api_type"),
+                )
                 ok, urls, expires_at, response_meta, provider_attempts = self._run_provider_plan(
                     provider, payload, operation, deadline
                 )
@@ -237,6 +268,15 @@ class ImageService:
                 attempts.extend(provider_attempts)
                 self.store.update(task_id, attempts=list(attempts))
                 if not ok:
+                    last_error = provider_attempts[-1].get("error") if provider_attempts else ""
+                    logger.warning(
+                        "[image] provider failed task_id=%s api_id=%s api_name=%s attempts=%d error=%s",
+                        task_id,
+                        provider.get("id"),
+                        provider.get("name"),
+                        len(provider_attempts),
+                        last_error,
+                    )
                     continue
 
                 if not urls:
@@ -244,16 +284,28 @@ class ImageService:
                         self._failed_attempt(provider, ProviderRequestError("节点返回空图片列表"))
                     )
                     self.store.update(task_id, attempts=list(attempts))
+                    logger.warning(
+                        "[image] provider returned empty urls task_id=%s api_id=%s api_name=%s",
+                        task_id,
+                        provider.get("id"),
+                        provider.get("name"),
+                    )
                     continue
 
                 session_id = history_id or task_id
                 urls = self._persist_result_urls(provider, session_id, urls)
+                if self._all_urls_are_persisted_results(urls):
+                    expires_at = None
+                reference_urls = self._persist_reference_images(
+                    session_id, payload.get("reference_images") or []
+                )
                 self._persist_session_manifest(
                     session_id=session_id,
                     payload=payload,
                     operation=operation,
                     status="completed",
                     urls=urls,
+                    reference_images=reference_urls,
                     provider=provider,
                     task_id=task_id,
                     attempts=list(attempts),
@@ -264,6 +316,7 @@ class ImageService:
                     task_id,
                     status="completed",
                     urls=urls,
+                    reference_images=reference_urls,
                     expires_at=expires_at,
                     attempts=list(attempts),
                     error=None,
@@ -272,8 +325,19 @@ class ImageService:
                     configured_api_type=self._last_attempt_value(attempts, "configured_api_type"),
                     effective_api_type=self._last_attempt_value(attempts, "effective_api_type"),
                 )
+                logger.info(
+                    "[image] task completed task_id=%s operation=%s api_id=%s api_name=%s effective_api_type=%s urls=%d history_id=%s",
+                    task_id,
+                    operation,
+                    provider.get("id"),
+                    provider.get("name"),
+                    self._last_attempt_value(attempts, "effective_api_type") or provider.get("api_type"),
+                    len(urls),
+                    session_id,
+                )
                 return
 
+            logger.warning("[image] task failed task_id=%s operation=%s attempts=%d error=all providers failed", task_id, operation, len(attempts))
             self.store.update(
                 task_id,
                 status="failed",
@@ -281,14 +345,17 @@ class ImageService:
                 error="所有 API 节点均失败",
             )
         except TaskCancelled:
+            logger.info("[image] task cancelled task_id=%s operation=%s", task_id, operation)
             return
         except UpstreamTaskFailed as exc:
             if not self.store.is_cancelled(task_id):
                 attempts.append(self._failed_attempt(getattr(exc, "provider", {}) or {}, exc, getattr(exc, "candidate", None)))
                 self.store.update(task_id, status="failed", attempts=list(attempts), error=exc.message)
+                logger.warning("[image] task failed task_id=%s operation=%s error=%s", task_id, operation, exc.message)
         except Exception as exc:  # noqa: BLE001 - never let the worker die silently
             if not self.store.is_cancelled(task_id):
                 self.store.update(task_id, status="failed", attempts=list(attempts), error=str(exc))
+                logger.exception("[image] task crashed task_id=%s operation=%s error=%s", task_id, operation, exc)
 
     def _run_provider_plan(
         self,
@@ -324,10 +391,31 @@ class ImageService:
                 self._raise_if_cancelled(payload)
                 candidate["request_url"] = self._candidate_request_url(candidate, payload, operation)
                 self.store_timeout_hint(payload, candidate)
+                task_id = str(payload.get("_task_id") or "").strip()
+                logger.info(
+                    "[image] candidate request task_id=%s operation=%s api_id=%s api_name=%s configured_api_type=%s effective_api_type=%s attempt=%d/%d url=%s",
+                    task_id,
+                    operation,
+                    candidate.get("id"),
+                    candidate.get("name"),
+                    candidate.get("configured_api_type") or candidate.get("api_type"),
+                    candidate.get("effective_api_type") or candidate.get("api_type"),
+                    attempt_index + 1,
+                    retries + 1,
+                    candidate.get("request_url"),
+                )
                 urls, expires_at, response_meta = self._run_provider(candidate, payload, operation, deadline)
                 self._raise_if_cancelled(payload)
                 if not urls:
                     raise ProviderRequestError("provider returned an empty image list")
+                logger.info(
+                    "[image] candidate success task_id=%s api_id=%s api_name=%s effective_api_type=%s urls=%d",
+                    task_id,
+                    candidate.get("id"),
+                    candidate.get("name"),
+                    candidate.get("effective_api_type") or candidate.get("api_type"),
+                    len(urls),
+                )
                 return True, urls, expires_at, response_meta, None
             except TaskCancelled:
                 raise
@@ -366,6 +454,16 @@ class ImageService:
                 break
             except Exception as exc:  # noqa: BLE001 - caller records the final failure
                 last_error = exc
+                logger.warning(
+                    "[image] candidate failed task_id=%s api_id=%s api_name=%s effective_api_type=%s attempt=%d/%d error=%s",
+                    str(payload.get("_task_id") or "").strip(),
+                    candidate.get("id"),
+                    candidate.get("name"),
+                    candidate.get("effective_api_type") or candidate.get("api_type"),
+                    attempt_index + 1,
+                    retries + 1,
+                    exc,
+                )
                 if isinstance(exc, ProviderTimeoutError):
                     api_type = str(candidate.get("api_type") or "").strip().lower()
                     message = (
@@ -373,15 +471,20 @@ class ImageService:
                         if api_type == "async"
                         else "节点请求超时，可能已被上游接收；已停止自动重试和切换节点以避免重复扣费"
                     )
+                    timeout_details = {
+                        "api_id": candidate["id"],
+                        "api_name": candidate["name"],
+                        "request_url": candidate.get("request_url"),
+                        "error": str(exc),
+                    }
+                    if isinstance(exc, ImageServiceError) and exc.details:
+                        timeout_details.update(exc.details)
+                        timeout_details["provider_error"] = str(exc)
+                        timeout_details["request_url"] = candidate.get("request_url")
                     timeout_exc = UpstreamTaskFailed(
                         message,
                         status_code=504,
-                        details={
-                            "api_id": candidate["id"],
-                            "api_name": candidate["name"],
-                            "request_url": candidate.get("request_url"),
-                            "error": str(exc),
-                        },
+                        details=timeout_details,
                     )
                     timeout_exc.provider = candidate
                     timeout_exc.candidate = candidate
@@ -439,6 +542,11 @@ class ImageService:
     @staticmethod
     def _is_known_async_relay(base_url: Any) -> bool:
         host = (urlparse(str(base_url or "")).hostname or "").lower()
+        return host in KNOWN_ASYNC_RELAY_HOSTS
+
+    @staticmethod
+    def _is_fnuu_provider(provider: dict[str, Any]) -> bool:
+        host = (urlparse(str(provider.get("base_url") or "")).hostname or "").lower()
         return host in KNOWN_ASYNC_RELAY_HOSTS
 
     def _candidate_request_url(self, provider: dict[str, Any], payload: dict[str, Any], operation: str) -> str:
@@ -594,15 +702,10 @@ class ImageService:
             )
         elif operation == "edit":
             url = self._openai_endpoint(provider["base_url"], "images/edits")
-            image_bytes = self._openai_edit_image_png(payload["image"])
-            mask_bytes = self._build_openai_mask(payload["image"], payload["mask"], payload.get("selection"))
-            files = {
-                "image": ("image.png", image_bytes, "image/png"),
-                "mask": ("mask.png", mask_bytes, "image/png"),
-            }
+            files = self._openai_edit_files(payload)
             data = {
                 "model": model,
-                "prompt": payload["prompt"],
+                "prompt": payload.get("edit_reference_prompt") or payload["prompt"],
                 "size": payload["size"],
                 "n": str(payload["n"]),
             }
@@ -630,7 +733,7 @@ class ImageService:
             url = self._openai_endpoint(provider["base_url"], "images/edits")
             files = []
             for i, ref in enumerate(payload["reference_images"]):
-                raw, mime = self._decode_data_url(ref, "参考图")
+                raw, mime, _ = self._reference_image_bytes(ref, "参考图")
                 files.append(("image[]", (f"ref{i}.{self._ext_for_mime(mime)}", raw, mime)))
             data = {"model": model, "prompt": payload["prompt"], "n": str(payload["n"])}
             if payload["size"] != "auto":
@@ -673,16 +776,75 @@ class ImageService:
     def _xai_edit_body(self, provider: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
         body: dict[str, Any] = {
             "model": provider.get("model") or DEFAULT_MODEL,
-            "prompt": payload["prompt"],
+            "prompt": payload.get("edit_reference_prompt") or payload["prompt"],
             "n": payload["n"],
         }
+        refs = (
+            self._edit_image_sequence(payload)
+            if payload.get("marked_image") or payload.get("edit_reference_image") or payload.get("image")
+            else payload.get("reference_images") or []
+        )
+        if len(refs) > 1:
+            body["images"] = [
+                {"type": "image_url", "url": self._reference_for_json_image(ref, f"images[{i}]")}
+                for i, ref in enumerate(refs)
+            ]
+        else:
+            body["image"] = {"type": "image_url", "url": self._reference_for_json_image(refs[0], "image")}
+        return body
+
+    def _openai_edit_files(self, payload: dict[str, Any]) -> Any:
+        sequence = self._edit_image_sequence(payload)
+        if len(sequence) == 1:
+            image_bytes, _mime, _filename = self._reference_image_bytes(sequence[0], "edit_reference_image")
+            return {
+                "image": ("edit-reference.png", image_bytes, "image/png"),
+            }
+
+        files = []
+        names = self._edit_image_names(payload)
+        for name, data_url in zip(names, sequence):
+            raw, mime, _ = self._reference_image_bytes(data_url, name)
+            files.append(("image[]", (f"{name}.{self._ext_for_mime(mime)}", raw, mime)))
+        return files
+
+    @staticmethod
+    def _edit_image_sequence(payload: dict[str, Any]) -> list[str]:
+        source = payload.get("source_image")
+        marked = payload.get("marked_image") or payload.get("edit_reference_image") or payload.get("image")
+        refs = payload.get("reference_images") or []
+        if source:
+            return [source, marked, *refs]
+        return [marked, *refs]
+
+    @staticmethod
+    def _edit_image_names(payload: dict[str, Any]) -> list[str]:
+        refs = payload.get("reference_images") or []
+        if payload.get("source_image"):
+            return ["source", "marked", *[f"ref{i}" for i in range(len(refs))]]
+        return ["marked", *[f"ref{i}" for i in range(len(refs))]]
+
+    def _add_edit_images_to_json_body(self, body: dict[str, Any], payload: dict[str, Any]) -> None:
+        sequence = self._edit_image_sequence(payload)
+        marked = self._reference_for_json_image(
+            payload.get("marked_image") or payload.get("edit_reference_image") or payload.get("image"),
+            "marked_image",
+        )
+        body["image"] = marked
+        body["marked_image"] = marked
+        if payload.get("source_image"):
+            body["source_image"] = self._reference_for_json_image(payload["source_image"], "source_image")
         refs = payload.get("reference_images") or []
         if refs:
-            body["images"] = [{"type": "image_url", "url": ref} for ref in refs]
-            return body
-        source = payload.get("composite") or payload.get("image")
-        body["image"] = {"type": "image_url", "url": source}
-        return body
+            body["reference_images"] = [
+                self._reference_for_json_image(ref, f"reference_images[{index}]")
+                for index, ref in enumerate(refs)
+            ]
+        if len(sequence) > 1:
+            body["images"] = [
+                self._reference_for_json_image(ref, f"images[{index}]")
+                for index, ref in enumerate(sequence)
+            ]
 
     def _adapt_openai_generation_body(
         self, provider: dict[str, Any], body: dict[str, Any], payload: dict[str, Any]
@@ -761,7 +923,7 @@ class ImageService:
     @staticmethod
     def _extract_image_response_meta(data: dict[str, Any]) -> dict[str, Any]:
         meta: dict[str, Any] = {}
-        for key in ("created", "background", "output_format", "quality", "size", "usage"):
+        for key in ("created", "background", "output_format", "quality", "size", "usage", "non_json_url_fallback"):
             if key in data:
                 meta[key] = data[key]
         return meta
@@ -807,78 +969,27 @@ class ImageService:
             )
         return urls
 
-    def _build_openai_mask(
-        self, image_data_url: str, mask_data_url: str, selection: dict[str, Any] | None
-    ) -> bytes:
-        """Produce an OpenAI-compatible mask PNG.
-
-        The editor paints the *target* region opaque on a transparent canvas,
-        but OpenAI treats *transparent* pixels as the area to edit, so the alpha
-        is inverted. When the editor reports the image's letterbox rect inside
-        its canvas (``selection.box``) the mask is cropped to it and resized to
-        the source image so the edited region lines up pixel-for-pixel.
-        """
-        try:
-            from PIL import Image
-        except ImportError as exc:  # pragma: no cover - dependency guard
-            raise ProviderRequestError(
-                "局部编辑需要 Pillow 依赖，请先安装 backend/requirements.txt",
-                status_code=500,
-            ) from exc
-
-        image_bytes, _ = self._decode_data_url(image_data_url, "image")
-        mask_bytes, _ = self._decode_data_url(mask_data_url, "mask")
-        source = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
-        width, height = source.size
-        mask_img = Image.open(io.BytesIO(mask_bytes)).convert("RGBA")
-
-        box = selection.get("box") if isinstance(selection, dict) else None
-        canvas = selection.get("canvas") if isinstance(selection, dict) else None
-        canvas_size: tuple[int, int] | None = None
-        if isinstance(canvas, dict):
-            try:
-                canvas_width = int(canvas["width"])
-                canvas_height = int(canvas["height"])
-                if canvas_width > 0 and canvas_height > 0:
-                    canvas_size = (canvas_width, canvas_height)
-            except (KeyError, TypeError, ValueError):
-                canvas_size = None
-
-        should_crop = mask_img.size != (width, height) and (
-            canvas_size is None or mask_img.size == canvas_size
-        )
-        if should_crop and isinstance(box, dict):
-            try:
-                x, y = int(box["x"]), int(box["y"])
-                w, h = int(box["width"]), int(box["height"])
-            except (KeyError, TypeError, ValueError):
-                x = y = w = h = 0
-            if w > 0 and h > 0:
-                mask_img = mask_img.crop((x, y, x + w, y + h))
-
-        if mask_img.size != (width, height):
-            mask_img = mask_img.resize((width, height))
-
-        alpha = mask_img.split()[3].point(lambda value: 255 - value)
-        out = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        out.putalpha(alpha)
-        buffer = io.BytesIO()
-        out.save(buffer, format="PNG")
-        return buffer.getvalue()
-
-    def _openai_edit_image_png(self, image_data_url: str) -> bytes:
-        try:
-            from PIL import Image
-        except ImportError as exc:  # pragma: no cover - dependency guard
-            raise ProviderRequestError(
-                "局部编辑需要 Pillow 依赖，请先安装 backend/requirements.txt",
-                status_code=500,
-            ) from exc
-        image_bytes, _ = self._decode_data_url(image_data_url, "image")
-        source = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
-        buffer = io.BytesIO()
-        source.save(buffer, format="PNG")
-        return buffer.getvalue()
+    @staticmethod
+    def _edit_reference_prompt(prompt: str, has_source: bool = False, reference_count: int = 0) -> str:
+        if has_source:
+            roles = [
+                "Image 1 is the clean source image to edit.",
+                "Image 2 is the same source image with colored semi-transparent marks indicating the target edit regions. Different colors may correspond to different edit instructions from the user.",
+            ]
+            if reference_count:
+                roles.append(
+                    "Images 3 and later are references only for style, identity, object, material, or composition."
+                )
+        else:
+            roles = [
+                "Image 1 is the source image with colored semi-transparent marks indicating the target edit regions. Different colors may correspond to different edit instructions from the user.",
+            ]
+            if reference_count:
+                roles.append(
+                    "Images 2 and later are references only for style, identity, object, material, or composition."
+                )
+        roles.append("Modify only the marked area while preserving unmarked areas as much as possible.")
+        return f"{EDIT_REFERENCE_PROMPT_INSTRUCTION}\n{' '.join(roles)}\n\nUser prompt: {prompt}"
 
     @staticmethod
     def _openai_endpoint(base_url: str, path: str) -> str:
@@ -893,32 +1004,30 @@ class ImageService:
         self, provider: dict[str, Any], payload: dict[str, Any], operation: str, deadline: float | None = None
     ) -> tuple[list[str], Any, dict[str, Any]]:
         base = self._async_base_url(provider["base_url"])
-        body: dict[str, Any] = {
-            "model": provider.get("model") or DEFAULT_MODEL,
-            "prompt": payload["prompt"],
-            "n": payload["n"],
-        }
-        if payload["size"] != "auto":
-            body["size"] = payload["size"]
-        if payload.get("quality"):
-            body["quality"] = payload["quality"]
-        if payload.get("reference_images"):
-            body["reference_images"] = payload["reference_images"]
-        if operation == "edit":
-            body["image"] = payload["image"]
-            body["mask"] = payload["mask"]
-            body["edit_mode"] = payload.get("edit_mode", "mask")
-            if payload.get("composite"):
-                body["composite"] = payload["composite"]
-            if payload.get("selection") is not None:
-                body["selection"] = payload["selection"]
+        is_fnuu = self._is_fnuu_provider(provider)
+        if is_fnuu:
+            post_kwargs = self._fnuu_async_submit_kwargs(provider, payload, operation)
+        else:
+            body: dict[str, Any] = {
+                "model": provider.get("model") or DEFAULT_MODEL,
+                "prompt": payload.get("edit_reference_prompt") if operation == "edit" else payload["prompt"],
+                "n": payload["n"],
+            }
+            if payload["size"] != "auto":
+                body["size"] = payload["size"]
+            if payload.get("quality"):
+                body["quality"] = payload["quality"]
+            if payload.get("reference_images") and operation != "edit":
+                body["reference_images"] = payload["reference_images"]
+            if operation == "edit":
+                self._add_edit_images_to_json_body(body, payload)
+            post_kwargs = {
+                "headers": self._auth_headers(provider, json_content=True),
+                "json": body,
+                "timeout": self._provider_timeout(provider),
+            }
 
-        response = self._http_post(
-            f"{base}/async/images",
-            headers=self._auth_headers(provider, json_content=True),
-            json=body,
-            timeout=self._provider_timeout(provider),
-        )
+        response = self._http_post(f"{base}/async/images", **post_kwargs)
         data = self._parse_response_json(response, provider)
         self._ensure_success_status(response, data, provider)
         submit_data = self._unwrap_response_data_object(data)
@@ -931,7 +1040,11 @@ class ImageService:
             )
 
         task_id = str(payload.get("_task_id") or "").strip()
-        poll_url = self._resolve_async_poll_url(base, str(upstream_task_id), submit_data.get("poll_url"))
+        poll_url = (
+            f"{base.rstrip('/')}/async/task/{upstream_task_id}"
+            if is_fnuu
+            else self._resolve_async_poll_url(base, str(upstream_task_id), submit_data.get("poll_url"))
+        )
         if task_id:
             self.store.update(
                 task_id,
@@ -995,7 +1108,7 @@ class ImageService:
                     last_poll_error=None,
                 )
             if status == "completed":
-                urls = status_data.get("urls") if isinstance(status_data.get("urls"), list) else []
+                urls = self._extract_async_image_urls(status_data)
                 if not urls:
                     exc = UpstreamTaskFailed(
                         "上游任务已完成但未返回图片 URL",
@@ -1017,6 +1130,85 @@ class ImageService:
                 exc.candidate = provider
                 raise exc
             time.sleep(self.async_poll_interval)
+
+    def _fnuu_async_submit_kwargs(
+        self, provider: dict[str, Any], payload: dict[str, Any], operation: str
+    ) -> dict[str, Any]:
+        prompt = payload.get("edit_reference_prompt") if operation == "edit" else payload["prompt"]
+        body: dict[str, Any] = {
+            "model": provider.get("model") or DEFAULT_MODEL,
+            "prompt": prompt,
+            "n": payload["n"],
+        }
+        if payload["size"] != "auto":
+            body["size"] = payload["size"]
+
+        refs = self._edit_image_sequence(payload) if operation == "edit" else payload.get("reference_images") or []
+        if refs:
+            if len(refs) == 1 and self._is_local_reference(refs[0]):
+                raw, mime, filename = self._reference_image_bytes(refs[0], "image")
+                return {
+                    "headers": self._auth_headers(provider),
+                    "data": {key: str(value) for key, value in body.items()},
+                    "files": {"image": (filename or f"image.{self._ext_for_mime(mime)}", raw, mime)},
+                    "timeout": self._provider_timeout(provider),
+                }
+            images = [
+                self._reference_for_json_image(ref, f"image[{index}]", max_bytes=FNUU_MAX_IMAGE_BYTES)
+                for index, ref in enumerate(refs)
+            ]
+            body["image"] = images[0] if len(images) == 1 else images
+
+        return {
+            "headers": self._auth_headers(provider, json_content=True),
+            "json": body,
+            "timeout": self._provider_timeout(provider),
+        }
+
+    def _extract_async_image_urls(self, data: dict[str, Any]) -> list[str]:
+        urls: list[str] = []
+        seen: set[str] = set()
+
+        def add(candidate: Any) -> None:
+            if not isinstance(candidate, str):
+                return
+            text = candidate.strip()
+            if not text:
+                return
+            if text.startswith("data:image/") and ";base64," in text:
+                value = text
+            elif text.startswith(("http://", "https://")):
+                value = text
+            else:
+                for found in self._extract_image_urls_from_text(text):
+                    if found not in seen:
+                        seen.add(found)
+                        urls.append(found)
+                return
+            if value not in seen:
+                seen.add(value)
+                urls.append(value)
+
+        def visit(value: Any) -> None:
+            if isinstance(value, str):
+                add(value)
+                return
+            if isinstance(value, list):
+                for item in value:
+                    visit(item)
+                return
+            if isinstance(value, dict):
+                b64 = value.get("b64_json")
+                if isinstance(b64, str) and b64.strip():
+                    add(f"data:image/png;base64,{b64.strip()}")
+                for key in ("url", "urls", "result", "data", "image", "images", "output"):
+                    if key in value:
+                        visit(value.get(key))
+
+        for key in ("urls", "result", "data", "image", "images", "output"):
+            if key in data:
+                visit(data.get(key))
+        return urls
 
     @staticmethod
     def _unwrap_response_data_object(data: dict[str, Any]) -> dict[str, Any]:
@@ -1056,6 +1248,7 @@ class ImageService:
             "operation": task.get("operation"),
             "status": task.get("status"),
             "urls": task.get("urls") or [],
+            "reference_images": task.get("reference_images") or [],
             "attempts": task.get("attempts") or [],
             "expires_at": task.get("expires_at"),
             "max_wait_seconds": task.get("max_wait_seconds"),
@@ -1082,7 +1275,11 @@ class ImageService:
         json_content: bool = False,
         request_id: str | None = None,
     ) -> dict[str, str]:
-        headers = {"Authorization": f"Bearer {provider['api_key']}"}
+        headers = {
+            "Authorization": f"Bearer {provider['api_key']}",
+            "Accept": "application/json",
+            "User-Agent": "gpt-img2-creater/0.1",
+        }
         if json_content:
             headers["Content-Type"] = "application/json"
         if request_id:
@@ -1121,15 +1318,44 @@ class ImageService:
         try:
             data = response.json()
         except Exception as exc:
+            text = str(getattr(response, "text", "") or "")
+            urls = self._extract_image_urls_from_text(text)
+            if urls:
+                logger.info(
+                    "[image] non-json response fallback api_id=%s api_name=%s status_code=%s urls=%d",
+                    provider.get("id"),
+                    provider.get("name"),
+                    getattr(response, "status_code", None),
+                    len(urls),
+                )
+                return {
+                    "status": "completed",
+                    "urls": urls,
+                    "data": [{"url": url} for url in urls],
+                    "non_json_url_fallback": True,
+                    "raw_text": text[:1000],
+                }
+            details = self._non_json_response_details(response, provider, text, exc)
+            logger.warning(
+                "[image] non-json response api_id=%s api_name=%s status=%s content_type=%s server=%s cf_ray=%s html_title=%s",
+                provider.get("id"),
+                provider.get("name"),
+                details.get("http_status"),
+                details.get("content_type"),
+                details.get("server"),
+                details.get("cf_ray"),
+                details.get("html_title"),
+            )
+            if details.get("gateway_timeout"):
+                raise ProviderTimeoutError(
+                    "API 节点网关超时，返回 HTML 而不是 OpenAI JSON",
+                    status_code=504,
+                    details=details,
+                ) from exc
             raise ProviderRequestError(
                 "API 节点返回的不是合法 JSON",
                 status_code=502,
-                details={
-                    "api_id": provider["id"],
-                    "api_name": provider["name"],
-                    "status_code": getattr(response, "status_code", None),
-                    "text": getattr(response, "text", ""),
-                },
+                details=details,
             ) from exc
         if not isinstance(data, dict):
             raise ProviderRequestError(
@@ -1139,8 +1365,121 @@ class ImageService:
             )
         return data
 
+    def _non_json_response_details(
+        self,
+        response: Any,
+        provider: dict[str, Any],
+        text: str,
+        parse_error: Exception,
+    ) -> dict[str, Any]:
+        status_code = getattr(response, "status_code", None)
+        content_type = self._response_header(response, "Content-Type")
+        server = self._response_header(response, "Server")
+        cf_ray = self._response_header(response, "CF-RAY")
+        html_title = self._extract_html_title(text)
+        is_html = self._is_html_response(text, content_type)
+        cloudflare = bool(cf_ray or "cloudflare" in server.lower())
+        gateway_timeout = self._is_gateway_timeout_response(status_code, html_title, text)
+        details: dict[str, Any] = {
+            "api_id": provider["id"],
+            "api_name": provider["name"],
+            "status_code": status_code,
+            "http_status": status_code,
+            "content_type": content_type,
+            "parse_error": str(parse_error),
+            "text_preview": text[:1000],
+            "text": getattr(response, "text", ""),
+            "is_html_response": is_html,
+        }
+        if server:
+            details["server"] = server
+        if cf_ray:
+            details["cf_ray"] = cf_ray
+        if html_title:
+            details["html_title"] = html_title
+        if cloudflare:
+            details["cloudflare"] = True
+        if gateway_timeout:
+            details["gateway_timeout"] = True
+        if is_html:
+            gateway = "Cloudflare/网关返回了 HTML 页面，响应没有按 OpenAI 兼容接口返回 JSON"
+            if gateway_timeout:
+                gateway += "；这是网关超时，不是后端 JSON 解析失败"
+            if cloudflare:
+                gateway += "；如果中转站没有调用日志，通常表示请求在 Cloudflare/网关层被拦截或超时"
+            details["gateway_hint"] = gateway
+        return details
+
+    @staticmethod
+    def _response_header(response: Any, name: str) -> str:
+        headers = getattr(response, "headers", {}) or {}
+        if not hasattr(headers, "get"):
+            return ""
+        return str(headers.get(name) or headers.get(name.lower()) or headers.get(name.upper()) or "").strip()
+
+    @staticmethod
+    def _extract_html_title(text: str) -> str:
+        match = _HTML_TITLE_RE.search(str(text or ""))
+        if not match:
+            return ""
+        return html.unescape(re.sub(r"\s+", " ", match.group(1)).strip())
+
+    @staticmethod
+    def _is_html_response(text: str, content_type: str = "") -> bool:
+        lowered_type = str(content_type or "").lower()
+        if "html" in lowered_type:
+            return True
+        lowered = str(text or "").lstrip()[:200].lower()
+        return lowered.startswith("<!doctype html") or lowered.startswith("<html") or "<html" in lowered
+
+    @staticmethod
+    def _is_gateway_timeout_response(status_code: Any, html_title: str = "", text: str = "") -> bool:
+        try:
+            code = int(status_code)
+        except (TypeError, ValueError):
+            code = 0
+        if code in {504, 522, 524}:
+            return True
+        timeout_text = f"{html_title} {str(text or '')[:500]}".lower()
+        return "gateway timeout" in timeout_text or "timeout occurred" in timeout_text or "timed out" in timeout_text
+
+    @staticmethod
+    def _extract_image_urls_from_text(text: str) -> list[str]:
+        urls: list[str] = []
+        seen: set[str] = set()
+        for match in _IMAGE_URL_RE.finditer(str(text or "")):
+            candidate = html.unescape(match.group(0).strip()).rstrip(".,;:]}")
+            if not candidate:
+                continue
+            if candidate.lower().startswith("data:image/"):
+                if ";base64," not in candidate:
+                    continue
+            else:
+                parsed = urlparse(candidate)
+                if parsed.scheme not in {"http", "https"}:
+                    continue
+                if not ImageService._looks_like_image_url(parsed):
+                    continue
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            urls.append(candidate)
+        return urls
+
+    @staticmethod
+    def _looks_like_image_url(parsed: Any) -> bool:
+        path = str(parsed.path or "").lower()
+        if path.endswith(_IMAGE_EXTENSIONS):
+            return True
+        query = unquote(str(parsed.query or "").lower())
+        if "image/" in query:
+            return True
+        return any(marker in query for marker in ("format=png", "format=jpg", "format=jpeg", "format=webp"))
+
     def _ensure_success_status(self, response: Any, data: dict[str, Any], provider: dict[str, Any]) -> None:
         status_code = int(getattr(response, "status_code", 200) or 200)
+        if data.get("non_json_url_fallback") and data.get("data"):
+            return
         if 200 <= status_code < 300:
             return
         error = data.get("error")
@@ -1267,6 +1606,31 @@ class ImageService:
             persisted.append(self._persist_one_result(provider, history_id, url, index))
         return persisted
 
+    def _persist_reference_images(self, history_id: str, refs: list[str]) -> list[str]:
+        if not refs:
+            return []
+        if not self.persist_results:
+            return refs
+        target_dir_id = str(history_id)
+        target_dir = self.result_dir / target_dir_id / "references"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        persisted: list[str] = []
+        for index, ref in enumerate(refs):
+            text = str(ref or "").strip()
+            if text.startswith(("http://", "https://")):
+                persisted.append(text)
+                continue
+            raw, mime, _ = self._reference_image_bytes(ref, f"reference_images[{index}]")
+            ext = self._ext_for_mime(mime)
+            filename = f"ref-{index}-{uuid.uuid4().hex[:8]}.{ext}"
+            (target_dir / filename).write_bytes(raw)
+            persisted.append(f"/api/results/{target_dir_id}/references/{filename}")
+        return persisted
+
+    @staticmethod
+    def _all_urls_are_persisted_results(urls: list[str]) -> bool:
+        return bool(urls) and all(str(url).startswith("/api/results/") for url in urls)
+
     def _persist_one_result(self, provider: dict[str, Any], history_id: str, url: str, index: int) -> str:
         raw: bytes
         mime = "image/png"
@@ -1298,6 +1662,7 @@ class ImageService:
         operation: str,
         status: str,
         urls: list[str],
+        reference_images: list[str],
         provider: dict[str, Any],
         task_id: str,
         attempts: list[dict[str, Any]],
@@ -1327,6 +1692,7 @@ class ImageService:
             "n": payload.get("n"),
             "status": status,
             "urls": urls,
+            "reference_images": reference_images,
             "api_id": provider.get("id"),
             "api_name": provider.get("name"),
             "attempts": attempts,
@@ -1352,25 +1718,18 @@ class ImageService:
         timeout = self._remaining(deadline, self._provider_timeout(provider))
         body: dict[str, Any] = {
             "model": model,
-            "prompt": payload["prompt"],
+            "prompt": payload.get("edit_reference_prompt") if operation == "edit" else payload["prompt"],
             "n": payload["n"],
         }
         if payload["size"] != "auto":
             body["size"] = payload["size"]
         if payload.get("quality"):
             body["quality"] = payload["quality"]
-        if payload.get("reference_images"):
+        if payload.get("reference_images") and operation != "edit":
             body["reference_images"] = payload["reference_images"]
 
-        # Local edits: send image + mask inline as data URLs (same as async relay).
         if operation == "edit":
-            body["image"] = payload["image"]
-            body["mask"] = payload["mask"]
-            body["edit_mode"] = payload.get("edit_mode", "mask")
-            if payload.get("composite"):
-                body["composite"] = payload["composite"]
-            if payload.get("selection") is not None:
-                body["selection"] = payload["selection"]
+            self._add_edit_images_to_json_body(body, payload)
 
         url = provider["base_url"].rstrip("/")
         response = self._http_post(
@@ -1395,14 +1754,15 @@ class ImageService:
         model = provider.get("model") or DEFAULT_MODEL
         timeout = self._remaining(deadline, self._provider_timeout(provider))
         url = self._openai_endpoint(provider["base_url"], "chat/completions")
-        refs = payload.get("reference_images") or []
+        refs = self._edit_image_sequence(payload) if operation == "edit" else payload.get("reference_images") or []
+        prompt = payload.get("edit_reference_prompt") if operation == "edit" else payload["prompt"]
         if refs:
-            content = [{"type": "text", "text": payload["prompt"]}]
+            content = [{"type": "text", "text": prompt}]
             for ref in refs:
                 content.append({"type": "image_url", "image_url": {"url": ref}})
             messages = [{"role": "user", "content": content}]
         else:
-            messages = [{"role": "user", "content": payload["prompt"]}]
+            messages = [{"role": "user", "content": prompt}]
         body: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -1512,11 +1872,9 @@ class ImageService:
             raise GenerationValidationError(f"{field_name} 必须是 data:image/*;base64 格式", status_code=400)
         return text
 
-    @staticmethod
-    def _normalize_reference_images(value: Any) -> list[str]:
-        """Validate the optional reference-image list (data URLs). The per-user
-        upload cap is enforced on the frontend; here we just keep a sane upper
-        bound (8) so a crafted request can't attach an unbounded number."""
+    def _normalize_reference_images(self, value: Any) -> list[str]:
+        """Validate optional reference images while preserving their transport
+        form: data URL, public URL, local result URL, or local file path."""
         if value is None:
             return []
         if not isinstance(value, list):
@@ -1526,10 +1884,120 @@ class ImageService:
             text = str(item or "").strip()
             if not text:
                 continue
-            if not text.startswith("data:image/") or ";base64," not in text:
-                raise GenerationValidationError("参考图必须是 data:image/*;base64 格式", status_code=400)
-            refs.append(text)
+            if text.startswith("data:image/") and ";base64," in text:
+                refs.append(text)
+                continue
+            if self._is_public_image_url(text):
+                refs.append(text)
+                continue
+            if text.startswith("/api/results/"):
+                self._local_result_url_to_path(text, "参考图")
+                refs.append(text)
+                continue
+            if self._looks_like_local_file_reference(text):
+                self._local_file_reference_path(text, "参考图")
+                refs.append(text)
+                continue
+            raise GenerationValidationError(
+                "参考图必须是 data:image/*;base64、本地 /api/results/ 链接、公网图片 URL 或本地图片路径",
+                status_code=400,
+            )
         return refs
+
+    @staticmethod
+    def _is_public_image_url(value: str) -> bool:
+        parsed = urlparse(str(value or ""))
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+    @staticmethod
+    def _looks_like_local_file_reference(value: str) -> bool:
+        text = str(value or "").strip()
+        if not text or text.startswith(("http://", "https://", "data:")):
+            return False
+        return Path(text).expanduser().is_file()
+
+    def _is_local_reference(self, value: str) -> bool:
+        text = str(value or "").strip()
+        return text.startswith("/api/results/") or self._looks_like_local_file_reference(text)
+
+    def _reference_for_json_image(self, value: str, field_name: str, max_bytes: int | None = None) -> str:
+        text = str(value or "").strip()
+        if text.startswith("data:image/") and ";base64," in text:
+            raw, _ = self._decode_data_url(text, field_name)
+            self._ensure_reference_size(raw, field_name, max_bytes)
+            return text
+        if self._is_public_image_url(text):
+            return text
+        raw, mime, _ = self._reference_image_bytes(text, field_name, max_bytes=max_bytes)
+        encoded = base64.b64encode(raw).decode("ascii")
+        return f"data:{mime};base64,{encoded}"
+
+    def _reference_image_bytes(
+        self,
+        value: str,
+        field_name: str,
+        max_bytes: int | None = None,
+    ) -> tuple[bytes, str, str]:
+        text = str(value or "").strip()
+        if text.startswith("data:image/") and ";base64," in text:
+            raw, mime = self._decode_data_url(text, field_name)
+            self._ensure_reference_size(raw, field_name, max_bytes)
+            return raw, mime, f"{field_name}.{self._ext_for_mime(mime)}"
+        if text.startswith("/api/results/"):
+            path = self._local_result_url_to_path(text, field_name)
+            return self._local_image_path_bytes(path, field_name, max_bytes=max_bytes)
+        if self._is_public_image_url(text):
+            raise GenerationValidationError(f"{field_name} 是公网 URL，不能作为 multipart 文件上传", status_code=400)
+        path = self._local_file_reference_path(text, field_name)
+        return self._local_image_path_bytes(path, field_name, max_bytes=max_bytes)
+
+    def _local_result_url_to_data_url(self, value: str, field_name: str) -> str:
+        raw, mime, _ = self._reference_image_bytes(value, field_name)
+        encoded = base64.b64encode(raw).decode("ascii")
+        return f"data:{mime};base64,{encoded}"
+
+    def _local_result_url_to_path(self, value: str, field_name: str) -> Path:
+        parsed = urlparse(str(value or ""))
+        path = unquote(parsed.path or "")
+        prefix = "/api/results/"
+        if not path.startswith(prefix):
+            raise GenerationValidationError(f"{field_name} 只能引用本地 /api/results/ 图片", status_code=400)
+        relative = path[len(prefix) :].lstrip("/")
+        if not relative:
+            raise GenerationValidationError(f"{field_name} 本地图片路径为空", status_code=400)
+        root = self.result_dir.resolve()
+        candidate = (root / relative).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError as exc:
+            raise GenerationValidationError(f"{field_name} 本地图片路径非法", status_code=400) from exc
+        if not candidate.is_file():
+            raise GenerationValidationError(f"{field_name} 本地图片不存在", status_code=400)
+        return candidate
+
+    def _local_file_reference_path(self, value: str, field_name: str) -> Path:
+        candidate = Path(str(value or "").strip()).expanduser().resolve()
+        if not candidate.is_file():
+            raise GenerationValidationError(f"{field_name} 本地图片不存在", status_code=400)
+        return candidate
+
+    def _local_image_path_bytes(
+        self,
+        path: Path,
+        field_name: str,
+        max_bytes: int | None = None,
+    ) -> tuple[bytes, str, str]:
+        mime = mimetypes.guess_type(path.name)[0] or "image/png"
+        if not mime.startswith("image/"):
+            raise GenerationValidationError(f"{field_name} 本地文件不是图片", status_code=400)
+        raw = path.read_bytes()
+        self._ensure_reference_size(raw, field_name, max_bytes)
+        return raw, mime, path.name
+
+    @staticmethod
+    def _ensure_reference_size(raw: bytes, field_name: str, max_bytes: int | None = None) -> None:
+        if max_bytes is not None and len(raw) > max_bytes:
+            raise GenerationValidationError(f"{field_name} 图片大小不能超过 12MB", status_code=400)
 
     @staticmethod
     def _normalize_history_id(value: Any) -> str | None:

@@ -191,6 +191,7 @@ Content-Type: application/json
 可选字段：
 
 - `quality`: `auto` / `low` / `medium` / `high`（OpenAI 兼容节点透传）
+- `reference_images`: 可选参考图数组，支持 `data:image/*;base64,...`、公网图片 URL、本地 `/api/results/...` 链接或本地图片路径（最多 8 张；前端上限可在设置中配置）
 
 ### 响应
 
@@ -222,43 +223,24 @@ Content-Type: application/json
 
 ```json
 {
-  "prompt": "Only modify the masked area and replace it with a glass control panel",
-  "image": "data:image/png;base64,...",
-  "mask": "data:image/png;base64,...",
+  "prompt": "Only modify the colored marked area and replace it with a glass control panel",
+  "source_image": "data:image/png;base64,...",
+  "marked_image": "data:image/png;base64,...",
+  "reference_images": ["data:image/png;base64,..."],
   "size": "1024x1024",
-  "n": 1,
-  "edit_mode": "mask",
-  "selection": {
-    "type": "brush",
-    "canvas": {
-      "width": 720,
-      "height": 520
-    },
-    "bbox": {
-      "x": 10,
-      "y": 20,
-      "width": 120,
-      "height": 160
-    }
-  }
+  "n": 1
 }
 ```
 
 字段说明：
 
-- `prompt`: 必填，描述希望如何修改遮罩区域
-- `image`: 必填，原图 `data URL`
-- `mask`: 必填，遮罩图 `data URL`
+- `prompt`: 必填，描述希望如何修改彩色标注区域
+- `source_image`: 可选，干净原图 `data URL`。前端局部编辑会自动提交。
+- `marked_image`: 必填，已经叠加半透明彩色标注的整张原图 `data URL`。前端会在提交前把原图和涂抹/框选笔迹合成为这一张图。
+- `reference_images`: 可选参考图数组，仅用于风格、人物、物体、材质或构图参考，不作为待编辑原图。
+- `image`: 兼容旧请求的别名；未提供 `marked_image` 时按已标注图处理。
 - `size`: 必填，输出尺寸
 - `n`: 必填，生成张数
-- `edit_mode`: 当前支持 `mask` 或 `selection`
-- `selection`: 可选，前端附带的选区元数据
-
-关于 `selection`：
-
-- `type`: `brush` 或 `rect`
-- `canvas`: 前端画布尺寸
-- `bbox`: 当前 mask 的最小包围盒
 
 ### 响应
 
@@ -268,8 +250,11 @@ Content-Type: application/json
 
 ### 后端行为
 
-- `openai` 节点：以 `multipart/form-data` 调用 `POST {base_url}/v1/images/edits`，把原图与遮罩作为 `image`、`mask` 文件上传。遮罩由后端用 Pillow 依据 `selection.box` 裁剪回原图区域、缩放到原图尺寸，并反转透明区域（OpenAI 约定：透明处即编辑区）。
-- `async` 节点：以 JSON 调用 `POST {base_url}/async/images`，在请求体中附带 `image`、`mask`、`edit_mode`、`selection`。
+- 后端不再接收、生成或转发单独的 `mask`。它只校验并转发干净原图、已标注图和可选参考图。
+- 后端会在 prompt 前加入图片含义说明：Image 1 为干净原图，Image 2 为同一张原图的半透明彩色标注图，Images 3+ 为参考图；不同颜色可对应用户在提示词中描述的不同修改意图。
+- `openai` 节点：以 `multipart/form-data` 调用 `POST {base_url}/v1/images/edits`。只有单张旧版 `image` 时上传 `image`；包含干净原图或参考图时按 `image[]` 顺序上传原图、标注图、参考图。
+- `custom` 和通用 `async` 节点：以 JSON 提交，局部编辑时携带 `image`/`marked_image`、可选 `source_image`、`reference_images` 和顺序数组 `images`，不转发 `mask`、`edit_mode`、`selection`。
+- 已知 `fnuu.net` 异步中转：只按其手册使用 `image` 字段提交参考图/垫图。文生图参考图会放入 `image`；局部编辑会按“干净原图、标注图、参考图”的顺序放入 `image` 数组。不会发送 `source_image`、`marked_image`、`reference_images`、`images` 或 `mask` 字段。
 
 ## 5. 查询任务状态
 
@@ -313,7 +298,7 @@ GET /api/status?task_id={task_id}
 
 - `api_id`/`api_name` 表示 worker 最终命中（或正在尝试）的节点，可能为 `null`（任务刚入队时）。
 - `attempts` 记录每个被尝试节点是否成功，便于排查容灾路径。
-- `urls` 只在 `completed` 时有意义；OpenAI 兼容节点通常是 `data:` URL，异步中转节点通常是远程 URL。
+- `urls` 只在 `completed` 时有意义。运行时默认会把生成结果下载/写入后端会话目录并返回 `/api/results/...`；关闭持久化或测试环境中也可能直接返回 `data:` URL 或上游远程 URL。
 - `max_wait_seconds` 表示前端本次轮询可等待的秒数。OpenAI 兼容同步请求会取节点 `timeout_seconds` 与后端 `generation_timeout` 的较大值；异步中转进入云端生成后返回 `null`，表示持续等待直到完成、失败或手动停止。
 - 任务不存在或已过期返回 `404`。
 
@@ -334,7 +319,7 @@ GET /api/edit-drafts/{history_id}
 PUT /api/edit-drafts/{history_id}
 ```
 
-草稿保存到对应会话目录下的 `edit-draft.json`，包含上传原图、蒙版、工具状态和画笔参数。切回局部编辑历史节点时前端会恢复这些痕迹。
+草稿保存到对应会话目录下的 `edit-draft.json`，包含上传原图、内部绘制笔迹、工具状态和画笔参数。切回局部编辑历史节点时前端会恢复这些痕迹；该内部笔迹不会作为独立请求字段提交给生图接口。
 
 ### 6.3 提示词模板
 
@@ -356,7 +341,7 @@ DELETE /api/prompt-templates/{id}
 - `prompt` 为空
 - `size` 不是 `1024x1024` 这类格式
 - `n` 不是正整数
-- `image` 或 `mask` 不是合法的 `data:image/*;base64,...`
+- `image` 不是合法的 `data:image/*;base64,...`
 - `ordered_ids` 不是完整的节点 ID 列表
 
 ### 404 Not Found
@@ -368,7 +353,7 @@ DELETE /api/prompt-templates/{id}
 
 ### 413 Payload Too Large
 
-- 请求体超过 `25MB`（局部编辑会内联原图 + 遮罩的 base64，注意原图大小）
+- 请求体超过 `25MB`（局部编辑会内联已标注原图的 base64，注意原图大小）
 
 ### 502 Bad Gateway
 
@@ -376,7 +361,8 @@ DELETE /api/prompt-templates/{id}
 
 - 所有启用节点均失败
 - 上游接口超时
-- 上游返回了非 JSON 响应
+- 上游返回了非 JSON 响应；如果响应正文中能提取到明确图片 URL，后端会兜底作为成功图片，否则会把 HTTP 状态、Content-Type、HTML 标题和响应片段记录到 `attempts[].details`
+- 上游网关或 Cloudflare 返回 `504/522/524` HTML 超时页；这通常表示请求未到达模型服务或在网关层超时，不是本地 JSON 解析错误
 - 上游返回了 4xx/5xx，或响应缺少图片数据（OpenAI 的 `data[].b64_json`/`url`，或异步中转的 `task_id`）
 
 ## 8. 上游图片服务契约
@@ -405,7 +391,7 @@ POST {base_url}/v1/images/edits         # multipart/form-data
 }
 ```
 
-局部编辑使用 `multipart/form-data`，字段：`model`、`prompt`、`size`、`n`、`image`（文件）、`mask`（文件，PNG，透明处即编辑区）。
+局部编辑使用 `multipart/form-data`，字段：`model`、`prompt`、`size`、`n`。只有旧版单图请求时上传 `image`；新版局部编辑上传 `image[]`，顺序为干净原图、彩色标注图、可选参考图，不发送上游 `mask` 文件。
 
 响应（两类接口一致）：
 
@@ -428,16 +414,25 @@ api_type = openai 或 auto
 model    = grok-imagine-image-quality（或服务商实际开放的 Grok Imagine 模型名）
 ```
 
-当模型名以 `grok-imagine-image` 开头或 `base_url` 为 `https://api.x.ai` 时，后端仍请求 `POST /v1/images/generations`，但会把前端 `size` 转换为 xAI 风格的 `aspect_ratio` 和 `resolution`，并不发送任意 `size` 字段。当前已按 OpenAI 兼容路径适配文生图；Grok 局部编辑不保证兼容当前 multipart edits，如需使用 xAI JSON 形态编辑接口需要单独增加适配。
+当模型名以 `grok-imagine-image` 开头或 `base_url` 为 `https://api.x.ai` 时，后端仍请求 `POST /v1/images/generations`，但会把前端 `size` 转换为 xAI 风格的 `aspect_ratio` 和 `resolution`，并不发送任意 `size` 字段。局部编辑和参考图生成会请求 `POST /v1/images/edits`，但使用 xAI JSON 图片字段：单张编辑图放入 `image.url`，多张参考图放入 `images[]`，不走 multipart 文件上传。
 
 ### 8.3 自定义异步中转（`api_type = async`）
 
 ```text
 POST {base_url}/async/images
-GET  {base_url}/async/images/{task_id}
+GET  {base_url}/async/images/{task_id}   # 通用默认或上游 poll_url
+GET  {base_url}/async/task/{task_id}     # fnuu.net
 ```
 
-提交体为 JSON，局部编辑时在 `model/prompt/size/n` 基础上增加 `image`、`mask`、`edit_mode`、`selection`；后端在 worker 内提交后轮询 `GET` 直至 `completed`/`failed`。
+通用异步中转提交体为 JSON。局部编辑时在 `model/prompt/size/n` 基础上增加 `image`/`marked_image`、可选 `source_image`、`reference_images` 和顺序数组 `images`；后端在 worker 内提交后轮询 `GET` 直至 `completed`/`failed`。
+
+`fnuu.net` 会按已知接入手册走专用兼容：
+
+- 提交地址固定为 `POST {base_url}/async/images`
+- 轮询地址固定为 `GET {base_url}/async/task/{task_id}`
+- 文生图参考图、局部编辑原图/标注图/参考图都使用 `image` 字段
+- `image` 支持 `data:image/*;base64,...`、公网图片 URL 或数组；单张本地 `/api/results/...`/本地路径会以 `multipart/form-data` 的 `image` 文件上传
+- 单张图片大小按 fnuu 要求限制为 `12MB`
 
 提交成功响应必须包含 `task_id`，可选包含 `poll_url`：
 
@@ -449,4 +444,6 @@ GET  {base_url}/async/images/{task_id}
 }
 ```
 
-如果返回 `poll_url`，后端按该地址轮询；否则默认轮询 `GET {base_url}/async/images/{task_id}`。轮询响应可直接返回状态对象，也可包在 `data` 对象内。`status=completed` 时从 `urls` 数组取图片；`status=failed` 时读取 `error`。拿到 `task_id` 后后端不会再提交第二次任务，单次轮询超时只更新状态并继续轮询，避免已扣费任务丢失。
+通用中转如果返回 `poll_url`，后端按该地址轮询；否则默认轮询 `GET {base_url}/async/images/{task_id}`。`fnuu.net` 不使用返回的 `/async/images/...` 轮询路径，而是按手册固定请求 `/async/task/{task_id}`。
+
+轮询响应可直接返回状态对象，也可包在 `data` 对象内。`status=completed` 时后端会从 `urls`、`result`、`data`、`image`、`images`、`output` 等字段递归提取图片 URL 或 `b64_json`；`status=failed` 时读取 `error` 并展示具体原因。拿到 `task_id` 后后端不会再提交第二次任务，单次轮询超时或临时非 JSON 只更新状态并继续轮询，避免已扣费任务丢失。

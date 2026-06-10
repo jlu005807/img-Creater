@@ -42,7 +42,7 @@ const form = reactive({
 
 const promptChars = computed(() => form.prompt.length)
 
-// ---- reference images (generate mode) ----
+// ---- reference images ----
 const referenceImages = ref([]) // array of data URLs
 const refInputRef = ref(null)
 
@@ -71,7 +71,6 @@ function addReferenceFiles(fileList) {
 function addPromptReferenceFiles(fileList) {
   const files = Array.from(fileList || []).filter((file) => file.type?.startsWith('image/'))
   if (!files.length) return false
-  switchMode('generate')
   addReferenceFiles(files)
   ElMessage.success('已添加为参考图')
   return true
@@ -96,6 +95,12 @@ function onRefInput(event) {
 
 function removeReference(index) {
   referenceImages.value.splice(index, 1)
+}
+
+function persistedReferenceImages(result) {
+  return Array.isArray(result?.reference_images)
+    ? result.reference_images.filter((url) => typeof url === 'string' && !url.startsWith('data:'))
+    : []
 }
 
 const mode = ref('generate')
@@ -170,6 +175,7 @@ const status = computed(() => activeEntry.value?._status || 'idle')
 const task = computed(() => activeEntry.value?.task || null)
 const images = computed(() => activeEntry.value?.urls || [])
 const currentImage = computed(() => images.value[0] || '')
+const currentImageIsPersisted = computed(() => String(currentImage.value || '').startsWith('/api/results/'))
 const attempts = computed(() => activeEntry.value?.attempts || [])
 const expiresAt = computed(() => activeEntry.value?.expiresAt ?? null)
 const errorMessage = computed(() => activeEntry.value?.errorMessage || '')
@@ -212,6 +218,7 @@ const resultStyle = computed(() =>
 )
 
 const expiresLabel = computed(() => {
+  if (currentImageIsPersisted.value) return ''
   const raw = Number(expiresAt.value)
   if (!Number.isFinite(raw) || raw <= 0) return ''
   const ms = raw < 1e12 ? raw * 1000 : raw
@@ -259,6 +266,12 @@ function attemptProtocolLabel(attempt) {
   return effective || configured
 }
 
+function compactDetail(value, limit = 320) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim()
+  if (!text) return ''
+  return text.length > limit ? `${text.slice(0, limit)}...` : text
+}
+
 function attemptErrorText(attempt) {
   if (!attempt || attempt.ok) return ''
   const parts = []
@@ -277,6 +290,17 @@ function attemptErrorText(attempt) {
         else if (message || code) parts.push(String(message || code))
       }
     }
+    const httpStatus = details.http_status || details.status_code
+    if (httpStatus) parts.push(`HTTP ${httpStatus}`)
+    if (details.gateway_timeout) parts.push('网关超时：上游返回 HTML，未返回可解析的 OpenAI JSON 结果')
+    if (details.gateway_hint) parts.push(details.gateway_hint)
+    else if (details.cloudflare) parts.push('Cloudflare/网关返回 HTML，未返回 OpenAI JSON')
+    if (details.html_title) parts.push(`HTML title: ${details.html_title}`)
+    if (details.server) parts.push(`Server: ${details.server}`)
+    if (details.cf_ray) parts.push(`CF-Ray: ${details.cf_ray}`)
+    if (details.parse_error && !details.is_html_response) parts.push(`JSON parse error: ${details.parse_error}`)
+    if (details.content_type) parts.push(`Content-Type: ${details.content_type}`)
+    if (details.text_preview) parts.push(`响应片段: ${compactDetail(details.text_preview)}`)
   }
   return [...new Set(parts.filter(Boolean))].join(' · ')
 }
@@ -484,6 +508,7 @@ async function submitTask(reuseId = null) {
     }
     editDraft = regionEditorRef.value?.exportDraft?.()
   }
+  const currentReferenceImages = [...referenceImages.value]
 
   // Reuse an existing history entry on retry (overwrite), else create a new one.
   let entryId = reuseId
@@ -504,6 +529,7 @@ async function submitTask(reuseId = null) {
       attempts: [],
       expiresAt: null,
       editDraft,
+      referenceImages: currentReferenceImages,
     })
   } else {
     const entry = addEntry({
@@ -520,6 +546,7 @@ async function submitTask(reuseId = null) {
       attempts: [],
       expiresAt: null,
       editDraft,
+      referenceImages: currentReferenceImages,
     })
     entryId = entry.id
   }
@@ -540,15 +567,13 @@ async function submitTask(reuseId = null) {
       mode.value === 'edit'
         ? await editImage({
             ...basePayload,
-            image: editPayload.image,
-            mask: editPayload.mask,
-            composite: editPayload.composite,
-            edit_mode: 'mask',
-            selection: editPayload.selection,
+            source_image: editPayload.source_image,
+            marked_image: editPayload.marked_image,
+            ...(currentReferenceImages.length ? { reference_images: currentReferenceImages } : {}),
           })
         : await generateImages({
             ...basePayload,
-            ...(referenceImages.value.length ? { reference_images: referenceImages.value } : {}),
+            ...(currentReferenceImages.length ? { reference_images: currentReferenceImages } : {}),
           })
 
     const nextTask = {
@@ -623,6 +648,7 @@ async function pollStatusOnce(entryId) {
           _status: 'completed',
           attempts: nextAttempts,
           expiresAt: result.expires_at ?? null,
+          referenceImages: persistedReferenceImages(result),
           maxWaitSeconds: result.max_wait_seconds ?? entry.maxWaitSeconds ?? null,
           elapsedSeconds: elapsedForEntry(entry),
         })
@@ -840,6 +866,7 @@ async function recallHistory(entry) {
   displayHistoryId.value = entry.id
   form.prompt = entry.prompt || ''
   if (entry.size) parseSize(entry.size)
+  referenceImages.value = Array.isArray(entry.referenceImages) ? [...entry.referenceImages] : []
   if (entry.mode) mode.value = entry.mode
   if (entry.mode === 'edit') {
     await restoreEditDraftForEntry(entry)
@@ -1149,8 +1176,8 @@ watch(
             <p class="mt-1 text-right text-xs text-[var(--studio-muted)]">{{ promptChars }} / {{ settings.maxPromptChars }}</p>
           </div>
 
-          <!-- Reference images (generate mode) -->
-          <div v-if="mode === 'generate'" class="mt-4">
+          <!-- Reference images -->
+          <div class="mt-4">
             <div class="mb-2 flex items-center justify-between">
               <span class="text-sm font-semibold">参考图（可选）</span>
               <span class="text-xs text-[var(--studio-muted)]">{{ referenceImages.length }} / {{ settings.maxReferenceImages }}</span>
@@ -1217,7 +1244,7 @@ watch(
               <p class="mt-1 font-black">{{ maskState.hasImage ? '已上传' : '未上传' }}</p>
             </div>
             <div class="rounded-md border border-[var(--studio-line)] bg-[var(--studio-surface-soft)] p-3">
-              <p class="text-xs text-[var(--studio-muted)]">蒙版</p>
+              <p class="text-xs text-[var(--studio-muted)]">标注</p>
               <p class="mt-1 font-black">{{ maskState.hasMask ? '已选择' : '未选择' }}</p>
             </div>
           </div>
@@ -1401,7 +1428,7 @@ watch(
             <div>
               <el-icon class="text-4xl text-[var(--studio-teal)]"><Picture /></el-icon>
               <p class="mt-3 text-lg font-black">等待结果</p>
-              <p class="mt-2 max-w-md text-sm leading-6 text-[var(--studio-muted)]">文生图会直接展示生成结果；局部编辑会基于原图和蒙版区域返回修改后的图片。</p>
+              <p class="mt-2 max-w-md text-sm leading-6 text-[var(--studio-muted)]">文生图会直接展示生成结果；局部编辑会基于原图和白色标注区域返回修改后的图片。</p>
             </div>
           </div>
         </div>
@@ -1420,7 +1447,7 @@ watch(
           placeholder="描述要生成或修改的画面…"
         />
       </div>
-      <div v-if="mode === 'generate' && referenceImages.length" class="mt-3 flex flex-wrap gap-2">
+      <div v-if="referenceImages.length" class="mt-3 flex flex-wrap gap-2">
         <div
           v-for="(ref, i) in referenceImages"
           :key="i"

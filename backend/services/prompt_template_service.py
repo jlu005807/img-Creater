@@ -49,7 +49,7 @@ DEFAULT_TEMPLATES = [
     {
         "id": "seed-local-edit",
         "title": "局部编辑：自然替换",
-        "text": "Edit only the masked area. Replace it with a realistic glass control panel, preserve the original camera angle, lighting direction, shadows, reflections, edge detail, and overall photographic style. Do not change unmasked areas.",
+        "text": "Edit only the colored semi-transparent marked regions. Replace them with a realistic glass control panel, preserve the original camera angle, lighting direction, shadows, reflections, edge detail, and overall photographic style. Do not change unmarked areas.",
     },
     {
         "id": "seed-portrait-basketball-direct-flash",

@@ -37,14 +37,13 @@ def edit_image():
         payload = _json_payload()
         result = _image_service().submit_edit_generation(
             prompt=payload.get("prompt", ""),
-            image=payload.get("image", ""),
-            mask=payload.get("mask", ""),
+            image=payload.get("image"),
+            source_image=payload.get("source_image"),
+            marked_image=payload.get("marked_image"),
+            reference_images=payload.get("reference_images"),
             size=payload.get("size", "1024x1024"),
             n=payload.get("n", 1),
-            edit_mode=payload.get("edit_mode", "mask"),
-            selection=payload.get("selection"),
             quality=payload.get("quality"),
-            composite=payload.get("composite"),
             history_id=payload.get("history_id"),
         )
         # 编辑任务与文生图一样走后台 worker，前端继续用 /status 轮询同一个 task_id。

@@ -6,16 +6,18 @@ from flask_cors import CORS
 
 
 def create_app() -> Flask:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
     app = Flask(__name__)
     # Surface app-level INFO logs (e.g. the detection startup status) on the
     # console when launched via run.ps1.
     app.logger.setLevel(logging.INFO)
+    logging.getLogger("backend.services.image_service").setLevel(logging.INFO)
     # Local single-user tool: only the Vite dev origin needs cross-origin access.
     allowed = os.getenv("FRONTEND_ORIGIN", "http://127.0.0.1:5173,http://localhost:5173").split(",")
     CORS(app, resources={r"/api/*": {"origins": [o.strip() for o in allowed if o.strip()]}})
 
-    # Cap request bodies so oversized base64 image/mask uploads can't exhaust
-    # memory; edits carry the original image + mask inline.
+    # Cap request bodies so oversized base64 image uploads can't exhaust
+    # memory; edits carry one already-marked image inline.
     app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
 
     # One app-scoped ImageService so its requests.Session connection pool is
