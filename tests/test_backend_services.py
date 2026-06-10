@@ -1771,6 +1771,46 @@ class OpenAIProviderTests(TestCase):
             manifest = json.loads((result_dir / "history-refs" / "session.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["reference_images"], result["reference_images"])
 
+    def test_reference_images_are_persisted_when_task_is_submitted_even_if_generation_fails(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service, _ = self._config_service(
+                tmp_dir,
+                [
+                    {
+                        "name": "Primary",
+                        "base_url": "https://api.openai.com",
+                        "api_key": "key-1",
+                        "model": "gpt-image-2",
+                        "status": True,
+                    }
+                ],
+            )
+            reference = _png_data_url((3, 5), (20, 120, 220, 255))
+            http_client = FakeHttpClient(post_responses=[Timeout("read timed out")])
+            result_dir = Path(tmp_dir) / "results"
+            service = _service(config_service, http_client, result_dir=result_dir)
+
+            submit = service.submit_generation(
+                prompt="blend this",
+                size="1024x1024",
+                n=1,
+                reference_images=[reference],
+                history_id="history-refs",
+            )
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(len(submit["reference_images"]), 1)
+            self.assertTrue(submit["reference_images"][0].startswith("/api/results/history-refs/references/"))
+            saved_name = submit["reference_images"][0].rsplit("/", 1)[1]
+            saved_ref = Image.open(result_dir / "history-refs" / "references" / saved_name).convert("RGBA")
+            self.assertEqual(saved_ref.size, (3, 5))
+            self.assertEqual(saved_ref.getpixel((0, 0)), (20, 120, 220, 255))
+            manifest = json.loads((result_dir / "history-refs" / "session.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["status"], "failed")
+            self.assertEqual(manifest["reference_images"], submit["reference_images"])
+            self.assertEqual(manifest["urls"], [])
+
     def test_persisted_reference_image_urls_can_be_reused_for_generation(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_service, _ = self._config_service(
@@ -2912,7 +2952,10 @@ class AsyncRelayProviderTests(TestCase):
                 [call[0] for call in http_client.gets],
                 ["https://fnuu.net/async/task/up-1", "https://cdn.example.com/fnuu.png"],
             )
-            self.assertFalse((result_dir / "session-fnuu" / "session.json").exists())
+            manifest = json.loads((result_dir / "session-fnuu" / "session.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["status"], "failed")
+            self.assertEqual(manifest["urls"], [])
+            self.assertIn("结果下载失败", manifest["response_meta"]["error"])
 
     def test_cancelled_async_task_does_not_fallback_to_another_protocol_or_node(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

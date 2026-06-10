@@ -197,10 +197,28 @@ class ImageService:
         payload = dict(payload)
         payload["_task_id"] = task_id
         history_id = str(payload.get("history_id") or "").strip() or None
+        reference_urls: list[str] = []
+        if history_id:
+            reference_urls = self._persist_reference_images(history_id, payload.get("reference_images") or [])
+            if reference_urls:
+                payload["reference_images"] = reference_urls
         max_wait_seconds = self._initial_wait_seconds(providers)
         self.store.update(task_id, max_wait_seconds=max_wait_seconds)
         if history_id:
-            self.store.update(task_id, history_id=history_id)
+            self.store.update(task_id, history_id=history_id, reference_images=reference_urls)
+            self._persist_session_manifest(
+                session_id=history_id,
+                payload=payload,
+                operation=operation,
+                status="queued",
+                urls=[],
+                reference_images=reference_urls,
+                provider={},
+                task_id=task_id,
+                attempts=[],
+                expires_at=None,
+                response_meta={},
+            )
         logger.info(
             "[image] task queued task_id=%s operation=%s history_id=%s providers=%d size=%s n=%s references=%d",
             task_id,
@@ -226,6 +244,7 @@ class ImageService:
             "operation": operation,
             "history_id": history_id,
             "max_wait_seconds": max_wait_seconds,
+            "reference_images": reference_urls,
         }
 
     # ------------------------------------------------------------------ worker
@@ -338,6 +357,14 @@ class ImageService:
                 return
 
             logger.warning("[image] task failed task_id=%s operation=%s attempts=%d error=all providers failed", task_id, operation, len(attempts))
+            self._persist_failed_session_manifest(
+                history_id=history_id,
+                payload=payload,
+                operation=operation,
+                task_id=task_id,
+                attempts=list(attempts),
+                error="所有 API 节点均失败",
+            )
             self.store.update(
                 task_id,
                 status="failed",
@@ -346,14 +373,39 @@ class ImageService:
             )
         except TaskCancelled:
             logger.info("[image] task cancelled task_id=%s operation=%s", task_id, operation)
+            self._persist_failed_session_manifest(
+                history_id=history_id,
+                payload=payload,
+                operation=operation,
+                task_id=task_id,
+                attempts=list(attempts),
+                error="任务已手动停止",
+                status="cancelled",
+            )
             return
         except UpstreamTaskFailed as exc:
             if not self.store.is_cancelled(task_id):
                 attempts.append(self._failed_attempt(getattr(exc, "provider", {}) or {}, exc, getattr(exc, "candidate", None)))
+                self._persist_failed_session_manifest(
+                    history_id=history_id,
+                    payload=payload,
+                    operation=operation,
+                    task_id=task_id,
+                    attempts=list(attempts),
+                    error=exc.message,
+                )
                 self.store.update(task_id, status="failed", attempts=list(attempts), error=exc.message)
                 logger.warning("[image] task failed task_id=%s operation=%s error=%s", task_id, operation, exc.message)
         except Exception as exc:  # noqa: BLE001 - never let the worker die silently
             if not self.store.is_cancelled(task_id):
+                self._persist_failed_session_manifest(
+                    history_id=history_id,
+                    payload=payload,
+                    operation=operation,
+                    task_id=task_id,
+                    attempts=list(attempts),
+                    error=str(exc),
+                )
                 self.store.update(task_id, status="failed", attempts=list(attempts), error=str(exc))
                 logger.exception("[image] task crashed task_id=%s operation=%s error=%s", task_id, operation, exc)
 
@@ -1620,6 +1672,10 @@ class ImageService:
             if text.startswith(("http://", "https://")):
                 persisted.append(text)
                 continue
+            if text.startswith("/api/results/") and self._result_url_belongs_to_history(text, target_dir_id):
+                self._local_result_url_to_path(text, f"reference_images[{index}]")
+                persisted.append(text)
+                continue
             raw, mime, _ = self._reference_image_bytes(ref, f"reference_images[{index}]")
             ext = self._ext_for_mime(mime)
             filename = f"ref-{index}-{uuid.uuid4().hex[:8]}.{ext}"
@@ -1630,6 +1686,17 @@ class ImageService:
     @staticmethod
     def _all_urls_are_persisted_results(urls: list[str]) -> bool:
         return bool(urls) and all(str(url).startswith("/api/results/") for url in urls)
+
+    @staticmethod
+    def _result_url_belongs_to_history(value: str, history_id: str) -> bool:
+        parsed = urlparse(str(value or ""))
+        path = unquote(parsed.path or "")
+        prefix = "/api/results/"
+        if not path.startswith(prefix):
+            return False
+        relative = path[len(prefix) :].lstrip("/")
+        first = relative.split("/", 1)[0]
+        return first == str(history_id)
 
     def _persist_one_result(self, provider: dict[str, Any], history_id: str, url: str, index: int) -> str:
         raw: bytes
@@ -1704,6 +1771,33 @@ class ImageService:
         tmp_path = manifest_path.with_suffix(".json.tmp")
         tmp_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         tmp_path.replace(manifest_path)
+
+    def _persist_failed_session_manifest(
+        self,
+        *,
+        history_id: str | None,
+        payload: dict[str, Any],
+        operation: str,
+        task_id: str,
+        attempts: list[dict[str, Any]],
+        error: str,
+        status: str = "failed",
+    ) -> None:
+        if not history_id:
+            return
+        self._persist_session_manifest(
+            session_id=history_id,
+            payload=payload,
+            operation=operation,
+            status=status,
+            urls=[],
+            reference_images=list(payload.get("reference_images") or []),
+            provider={},
+            task_id=task_id,
+            attempts=attempts,
+            expires_at=None,
+            response_meta={"error": error} if error else {},
+        )
 
     # ------------------------------------------------------- custom direct URL
 

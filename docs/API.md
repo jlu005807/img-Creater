@@ -203,12 +203,15 @@ Content-Type: application/json
   "data": {
     "task_id": "5f3c…",
     "status": "queued",
-    "operation": "generate"
+    "operation": "generate",
+    "history_id": "local-history-id",
+    "reference_images": ["/api/results/local-history-id/references/ref-0-ab12cd34.png"],
+    "max_wait_seconds": 180
   }
 }
 ```
 
-命中的节点（`api_id`/`api_name`）与每个节点是否成功的 `attempts` 记录会在任务执行完成后，通过 `GET /api/status` 返回。
+如果请求里带了 `history_id` 和 `reference_images`，后端会在提交阶段先把参考图保存到 `history/<history_id>/references/`，并在 202 响应的 `reference_images` 中返回固定后的 `/api/results/...` URL。命中的节点（`api_id`/`api_name`）与每个节点是否成功的 `attempts` 记录会在任务执行完成后，通过 `GET /api/status` 返回。
 
 ## 4. 局部编辑
 

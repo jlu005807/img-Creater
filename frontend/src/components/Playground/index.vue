@@ -584,12 +584,17 @@ async function submitTask(reuseId = null) {
       configuredApiType: result.configured_api_type,
       effectiveApiType: result.effective_api_type,
     }
+    const acceptedReferenceImages = persistedReferenceImages(result)
+    if (acceptedReferenceImages.length) {
+      referenceImages.value = [...acceptedReferenceImages]
+    }
     updateEntry(entryId, {
       task: nextTask,
       attempts: result.attempts || [],
       _status: result.status || 'queued',
       maxWaitSeconds: result.max_wait_seconds ?? null,
       errorMessage: '',
+      referenceImages: acceptedReferenceImages.length ? acceptedReferenceImages : currentReferenceImages,
     })
     schedulePoll(entryId, nextTask)
   } catch (error) {

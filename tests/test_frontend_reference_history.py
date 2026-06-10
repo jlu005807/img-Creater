@@ -18,6 +18,15 @@ class ReferenceHistorySourceTests(TestCase):
         self.assertIn("referenceImages: persistedReferenceImages(result)", playground_source)
         self.assertIn("function persistedReferenceImages", playground_source)
 
+    def test_submit_acceptance_updates_history_with_persisted_reference_urls(self):
+        playground_source = PLAYGROUND.read_text(encoding="utf-8")
+
+        self.assertIn("const acceptedReferenceImages = persistedReferenceImages(result)", playground_source)
+        self.assertIn(
+            "referenceImages: acceptedReferenceImages.length ? acceptedReferenceImages : currentReferenceImages",
+            playground_source,
+        )
+
 
 if __name__ == "__main__":
     main()
