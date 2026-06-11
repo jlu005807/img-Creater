@@ -2523,6 +2523,35 @@ class AsyncRelayProviderTests(TestCase):
             self.assertEqual(http_client.gets, [])
             self.assertEqual(result["attempts"][0]["effective_api_type"], "async")
 
+    def test_async_relay_submit_errors_are_not_retried_even_when_retry_count_is_configured(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "Relay",
+                    "base_url": "https://fnuu.net",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "async",
+                    "status": True,
+                    "retry_count": 3,
+                }
+            )
+            http_client = FakeHttpClient(
+                post_responses=[
+                    BadJsonResponse(502, "<html>temporary upstream error</html>"),
+                    BadJsonResponse(502, "<html>should-not-post-again</html>"),
+                ]
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="a red house", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual([call[0] for call in http_client.posts], ["https://fnuu.net/async/images"])
+            self.assertEqual(http_client.gets, [])
+
     def test_async_relay_keeps_polling_after_upstream_task_is_accepted(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
@@ -2607,6 +2636,50 @@ class AsyncRelayProviderTests(TestCase):
             )
             self.assertEqual(result["poll_count"], 2)
             self.assertEqual(result["last_poll_status"], "completed")
+
+    def test_fnuu_async_poll_404_switches_to_returned_poll_url_without_resubmitting(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "Relay",
+                    "base_url": "https://fnuu.net",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "async",
+                    "status": True,
+                    "retry_count": 3,
+                }
+            )
+            http_client = FakeHttpClient(
+                post_responses=[
+                    FakeResponse(
+                        200,
+                        {
+                            "task_id": "up-1",
+                            "status": "queued",
+                            "poll_url": "/async/images/up-1",
+                        },
+                    )
+                ],
+                get_responses=[
+                    FakeResponse(404, {"error": {"message": "not found"}}),
+                    FakeResponse(200, {"status": "completed", "result": ["https://cdn.example.com/a.png"]}),
+                ],
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="a red house", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual([call[0] for call in http_client.posts], ["https://fnuu.net/async/images"])
+            self.assertEqual(
+                [call[0] for call in http_client.gets],
+                ["https://fnuu.net/async/task/up-1", "https://fnuu.net/async/images/up-1"],
+            )
+            self.assertEqual(result["poll_url"], "https://fnuu.net/async/images/up-1")
+            self.assertEqual(result["poll_count"], 2)
 
     def test_async_relay_unwraps_data_object_status_payloads(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

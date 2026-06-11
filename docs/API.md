@@ -433,6 +433,7 @@ GET  {base_url}/async/task/{task_id}     # fnuu.net
 
 - 提交地址固定为 `POST {base_url}/async/images`
 - 轮询地址固定为 `GET {base_url}/async/task/{task_id}`
+- 如果 `/async/task/{task_id}` 返回 404，后端会尝试提交响应中的 `poll_url` 或通用 `/async/images/{task_id}` 作为备用 GET 轮询地址，但不会重新 `POST /async/images`
 - 文生图参考图、局部编辑原图/标注图/参考图都使用 `image` 字段
 - `image` 支持 `data:image/*;base64,...`、公网图片 URL 或数组；单张本地 `/api/results/...`/本地路径会以 `multipart/form-data` 的 `image` 文件上传
 - 单张图片大小按 fnuu 要求限制为 `12MB`
@@ -449,4 +450,4 @@ GET  {base_url}/async/task/{task_id}     # fnuu.net
 
 通用中转如果返回 `poll_url`，后端按该地址轮询；否则默认轮询 `GET {base_url}/async/images/{task_id}`。`fnuu.net` 不使用返回的 `/async/images/...` 轮询路径，而是按手册固定请求 `/async/task/{task_id}`。
 
-轮询响应可直接返回状态对象，也可包在 `data` 对象内。`status=completed` 时后端会从 `urls`、`result`、`data`、`image`、`images`、`output` 等字段递归提取图片 URL 或 `b64_json`；`status=failed` 时读取 `error` 并展示具体原因。拿到 `task_id` 后后端不会再提交第二次任务，单次轮询超时或临时非 JSON 只更新状态并继续轮询，避免已扣费任务丢失。
+轮询响应可直接返回状态对象，也可包在 `data` 对象内。`status=completed` 时后端会从 `urls`、`result`、`data`、`image`、`images`、`output` 等字段递归提取图片 URL 或 `b64_json`；`status=failed` 时读取 `error` 并展示具体原因。异步提交属于可能计费的任务创建请求，因此后端会忽略该候选的 `retry_count`，每次用户生成只 `POST /async/images` 一次。拿到 `task_id` 后后端不会再提交第二次任务，单次轮询超时或临时非 JSON 只更新状态并继续轮询，避免已扣费任务丢失。

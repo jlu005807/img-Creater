@@ -660,6 +660,8 @@ class ImageService:
 
     @staticmethod
     def _provider_retry_count(provider: dict[str, Any]) -> int:
+        if str(provider.get("api_type") or "").strip().lower() == "async":
+            return 0
         try:
             return max(0, int(provider.get("retry_count", 0)))
         except (TypeError, ValueError):
@@ -1092,11 +1094,16 @@ class ImageService:
             )
 
         task_id = str(payload.get("_task_id") or "").strip()
-        poll_url = (
-            f"{base.rstrip('/')}/async/task/{upstream_task_id}"
-            if is_fnuu
-            else self._resolve_async_poll_url(base, str(upstream_task_id), submit_data.get("poll_url"))
-        )
+        returned_poll_url = self._resolve_async_poll_url(base, str(upstream_task_id), submit_data.get("poll_url"))
+        if is_fnuu:
+            poll_urls = [f"{base.rstrip('/')}/async/task/{upstream_task_id}"]
+            for candidate_url in (returned_poll_url, f"{base.rstrip('/')}/async/images/{upstream_task_id}"):
+                if candidate_url not in poll_urls:
+                    poll_urls.append(candidate_url)
+        else:
+            poll_urls = [returned_poll_url]
+        poll_index = 0
+        poll_url = poll_urls[poll_index]
         if task_id:
             self.store.update(
                 task_id,
@@ -1114,6 +1121,45 @@ class ImageService:
             if task_id and self.store.is_cancelled(task_id):
                 raise TaskCancelled()
             poll_count += 1
+
+            def handle_poll_error(exc: ProviderRequestError) -> bool:
+                nonlocal poll_index, poll_url
+                if self._is_poll_not_found_error(exc):
+                    if poll_index + 1 < len(poll_urls):
+                        poll_index += 1
+                        poll_url = poll_urls[poll_index]
+                        if task_id:
+                            self.store.update(
+                                task_id,
+                                poll_count=poll_count,
+                                poll_url=poll_url,
+                                last_poll_status="poll_url_fallback",
+                                last_poll_error=str(exc),
+                            )
+                        return True
+                    failed = UpstreamTaskFailed(
+                        f"异步任务轮询 HTTP 404，所有已知轮询地址均找不到任务: {exc}",
+                        status_code=502,
+                        details={
+                            "api_id": provider["id"],
+                            "api_name": provider["name"],
+                            "poll_urls": poll_urls,
+                            "last_poll_url": poll_url,
+                            "error": str(exc),
+                        },
+                    )
+                    failed.provider = provider
+                    failed.candidate = provider
+                    raise failed
+                if task_id:
+                    self.store.update(
+                        task_id,
+                        poll_count=poll_count,
+                        last_poll_status="poll_error",
+                        last_poll_error=str(exc),
+                    )
+                return False
+
             try:
                 status_response = self._http_get(
                     poll_url,
@@ -1128,13 +1174,7 @@ class ImageService:
             try:
                 status_data = self._parse_response_json(status_response, provider)
             except ProviderRequestError as exc:
-                if task_id:
-                    self.store.update(
-                        task_id,
-                        poll_count=poll_count,
-                        last_poll_status="poll_error",
-                        last_poll_error=str(exc),
-                    )
+                handle_poll_error(exc)
                 time.sleep(self.async_poll_interval)
                 continue
             status_data = self._unwrap_response_data_object(status_data)
@@ -1143,13 +1183,7 @@ class ImageService:
                 try:
                     self._ensure_success_status(status_response, status_data, provider)
                 except ProviderRequestError as exc:
-                    if task_id:
-                        self.store.update(
-                            task_id,
-                            poll_count=poll_count,
-                            last_poll_status="poll_error",
-                            last_poll_error=str(exc),
-                        )
+                    handle_poll_error(exc)
                     time.sleep(self.async_poll_interval)
                     continue
             if task_id:
@@ -1562,6 +1596,17 @@ class ImageService:
                 "error": message,
             },
         )
+
+    @staticmethod
+    def _is_poll_not_found_error(exc: Exception) -> bool:
+        if not isinstance(exc, ImageServiceError):
+            return False
+        details = getattr(exc, "details", {}) or {}
+        try:
+            status_code = int(details.get("http_status") or details.get("status_code") or 0)
+        except (TypeError, ValueError):
+            status_code = 0
+        return status_code == 404
 
     @staticmethod
     def _error_message_from_payload(error: Any) -> str:
