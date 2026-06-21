@@ -2,7 +2,13 @@
 
 `img-Creater` 是一个本地运行的桌面端图片工作台，用来管理多个图片生成 API 节点（兼容 OpenAI 协议的 gpt-image-2 等），并在文生图之外支持局部编辑流程。
 
+该项目参考了 [AIWatch](https://github.com/yuzujr/AIWatch) 的图片编辑交互与效果，后续可以继续完善，并向无限画布式工作台演进。
+
 当前版本只实现 PC 端体验，采用工作台式布局：顶栏放标题、主题切换与设置入口（齿轮 → 弹窗）；下方左侧是会话历史队列，中间是生成控制台与局部编辑画布，右侧是任务状态与结果画廊。
+
+如果不想进行完整的本地部署，只想用自己的 API 快速生图，也可以尝试另一个轻量项目 [Simple-img-rawer](https://github.com/jlu005807/Simple-img-rawer)。它是一个已部署到 [GitHub Pages](https://jlu005807.github.io/Simple-img-rawer/) 的静态生图页面，只提供请求功能，API Key 保存在浏览器本地，不上传云端。
+
+tip: 该项目为纯vibe coding产物，感谢 Opus4.8 以及 gpt5.5 的大力支持
 
 ## 当前能力
 
@@ -17,6 +23,7 @@
 - 结果画廊：按实际宽高比完整展示（不裁剪），支持全屏灯箱预览与可靠的跨域下载。
 - 生成历史：左侧会话队列含实时状态标记，支持模糊搜索、时间筛选、失败重试覆盖、复用参数、回看结果；成功结果会按会话目录写入后端 `history/`。
 - 作品集：顶部「作品集」页面读取后端已完成会话，以照片墙展示所有成功图片，支持放大预览和下载。
+- AI 生成检测（Beta）：可选安装检测依赖后，在本地使用传统信号处理方法辅助判断图片是否由 AI 生成。
 - 设置：弹窗式，含 API 设置、偏好（最大字数 / 参考图上限）、提示词模板管理。
 - 提示词：示例按钮会从设置中的模板随机抽取；当前输入非空时会确认是否覆盖。支持放大编辑、字数外显、可配置上限（默认 3000）。
 - 主题：浅色 / 深色双主题（首启跟随系统，可手动切换并记忆）。
@@ -44,9 +51,12 @@ backend/
   routes/
     configs.py
     generation.py
+    detection.py
+    prompt_templates.py
   services/
     config_service.py
     image_service.py
+    prompt_template_service.py
     task_store.py          # 进程内任务表
 
 frontend/
@@ -54,6 +64,8 @@ frontend/
     api/                   # client / configs / generation
     components/
       APIConfig/           # API 节点管理
+      Detector/            # AI 生成检测（Beta）
+      Gallery/             # 作品集
       Playground/          # 生成控制台 + 历史 + 结果画廊
       RegionEditor/        # 局部编辑画布
       Settings/            # 设置弹窗（API / 偏好 / 提示词模板）
@@ -72,6 +84,11 @@ docs/
   ARCHITECTURE.md
   ROADMAP.md
 
+detection/
+  README.md                # 可选 AI 生成检测模块说明
+  requirements.txt         # 检测模块额外依赖
+  analyzers/               # 频域、噪声、水印、元数据等分析器
+
 tests/
   test_backend_routes.py
   test_backend_services.py
@@ -82,13 +99,13 @@ tests/
 - Windows PowerShell
 - Python `3.10+`
 - Node.js `18+`
-- npm `9+`
+- npm（随 Node.js 安装；脚本会检查是否可用）
 
 ## 快速开始
 
 ### 方式一：一键脚本（推荐）
 
-脚本会检查环境、创建虚拟环境、安装前后端依赖，然后同时启动前后端并自动打开浏览器。
+安装脚本会检查环境、创建虚拟环境并安装主应用的前后端依赖。运行脚本会先释放本机 `5000` 和 `5173` 端口上的旧开发进程，再同时启动后端 Flask 与前端 Vite，并自动打开浏览器。
 
 Windows（PowerShell，在项目根目录）：
 
@@ -108,6 +125,26 @@ chmod +x install.sh run.sh   # 首次需要赋予执行权限
 ```
 
 安装脚本会校验 Python `3.10+` 与 Node.js `18+`，缺失时给出明确提示。
+
+> 注意：`run.ps1` / `run.sh` 会尝试停止占用 `5000` 或 `5173` 端口的旧进程。如果这两个端口上运行着其它项目，请先手动停止或调整端口后再运行。
+
+### 可选：启用 AI 生成检测（Beta）
+
+AI 生成检测（Beta）是可选功能，不影响文生图、局部编辑和作品集等主流程。默认安装脚本只安装主应用依赖；如需启用右上角「检测」入口，请在完成主安装后额外安装检测依赖：
+
+Windows：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r detection\requirements.txt
+```
+
+Linux / macOS：
+
+```bash
+.venv/bin/python -m pip install -r detection/requirements.txt
+```
+
+不安装检测依赖时，后端会继续正常启动，`/api/detect/health` 会返回检测能力不可用。
 
 ### 方式二：手动步骤
 
@@ -282,6 +319,12 @@ GET  {base_url}/async/task/{task_id}     # fnuu.net
 ```powershell
 cd frontend
 npm.cmd run build
+```
+
+可选检测模块测试：
+
+```powershell
+.venv\Scripts\python.exe -m unittest discover detection/tests
 ```
 
 ## 常见问题

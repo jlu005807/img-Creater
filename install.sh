@@ -9,6 +9,21 @@ cd "$(dirname "$0")"
 step() { printf '\n==> %s\n' "$1"; }
 ok()   { printf '[OK] %s\n' "$1"; }
 fail() { printf '[ERROR] %s\n' "$1" >&2; exit 1; }
+assert_version_at_least() {
+  local version="$1"
+  local min_major="$2"
+  local min_minor="$3"
+  local name="$4"
+  local major="${version%%.*}"
+  local rest="${version#*.}"
+  local minor="${rest%%.*}"
+  if ! [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]]; then
+    fail "Could not parse $name version: $version"
+  fi
+  if (( major < min_major || (major == min_major && minor < min_minor) )); then
+    fail "$name $min_major.$min_minor+ is required; found $version."
+  fi
+}
 
 step 'Checking prerequisites'
 PYTHON=""
@@ -16,8 +31,13 @@ for cmd in python3 python; do
   if command -v "$cmd" >/dev/null 2>&1; then PYTHON="$cmd"; break; fi
 done
 [ -n "$PYTHON" ] || fail 'Python not found. Install Python 3.10+ and re-run.'
+py_version="$("$PYTHON" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")')"
+assert_version_at_least "$py_version" 3 10 "Python"
 ok "Python: $($PYTHON --version 2>&1)"
 
+command -v node >/dev/null 2>&1 || fail 'Node.js not found. Install Node.js 18+ and re-run.'
+node_version="$(node -p 'process.versions.node')"
+assert_version_at_least "$node_version" 18 0 "Node.js"
 command -v npm >/dev/null 2>&1 || fail 'npm not found. Install Node.js 18+ and re-run.'
 ok "Node: $(node --version)  npm: $(npm --version)"
 
