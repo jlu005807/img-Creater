@@ -564,10 +564,11 @@ async function submitTask(reuseId = null) {
     entryId = entry.id
   }
   displayHistoryId.value = entryId
+  // 显示焦点切到本次提交的条目后，本地草稿缓冲一律作废——即使是文生图提交，
+  // 否则残留的脏缓冲会在之后被冲刷到不相关的新条目上。
+  discardEditDraftBuffer()
   if (editDraft) {
-    // 草稿已随本次提交挂到该记录上（对已完成记录的再编辑即 clone-on-edit 的新记录），
-    // 本地缓冲随提交结束。
-    discardEditDraftBuffer()
+    // 草稿已随本次提交挂到该记录上（对已完成记录的再编辑即 clone-on-edit 的新记录）。
     persistEditDraftNow(entryId, editDraft)
   }
   startClock()
@@ -591,8 +592,6 @@ async function submitTask(reuseId = null) {
             ...basePayload,
             ...(currentReferenceImages.length ? { reference_images: currentReferenceImages } : {}),
           })
-    if (disposed) return
-
     const nextTask = {
       apiId: result.api_id,
       taskId: result.task_id,
@@ -601,18 +600,30 @@ async function submitTask(reuseId = null) {
       configuredApiType: result.configured_api_type,
       effectiveApiType: result.effective_api_type,
     }
-    const acceptedReferenceImages = persistedReferenceImages(result)
-    if (acceptedReferenceImages.length) {
-      referenceImages.value = [...acceptedReferenceImages]
+    if (!findHistoryEntry(entryId)) {
+      // 条目在提交期间被删除：任务已被后端接收，直接尽力取消，避免继续计费生成。
+      cancelGenerationTask(result.task_id).catch(() => {})
+      return
     }
-    updateEntry(entryId, {
+    const acceptedReferenceImages = persistedReferenceImages(result)
+    const entryFields = {
       task: nextTask,
       attempts: result.attempts || [],
       _status: result.status || 'queued',
       maxWaitSeconds: result.max_wait_seconds ?? null,
       errorMessage: '',
       referenceImages: acceptedReferenceImages.length ? acceptedReferenceImages : currentReferenceImages,
-    })
+    }
+    if (disposed) {
+      // 组件已卸载但任务已被接收：仍要把 taskId 记到共享历史上，
+      // 下次挂载由 restoreRunningTasks 恢复轮询，而不是误判失败诱导重复提交。
+      updateEntry(entryId, entryFields)
+      return
+    }
+    if (acceptedReferenceImages.length) {
+      referenceImages.value = [...acceptedReferenceImages]
+    }
+    updateEntry(entryId, entryFields)
     schedulePoll(entryId, nextTask)
   } catch (error) {
     if (disposed) return
@@ -830,6 +841,11 @@ async function stopActiveTask() {
     ElMessage.success('已停止本地等待')
   } catch (error) {
     if (error === 'cancel') return
+    // 确认框打开期间任务已完成：结果已在手，不能被过期 404 覆盖成失败。
+    if (findHistoryEntry(entry.id)?._status === 'completed') {
+      ElMessage.info('任务已完成，无需停止')
+      return
+    }
     if (isTaskExpiredError(error)) {
       stopWithError(entry.id, TASK_EXPIRED_MESSAGE)
       return
@@ -909,7 +925,8 @@ function persistCurrentEditDraft() {
   if (!editDraftDirty) return
   const entry = findHistoryEntry(displayHistoryId.value)
   // 已完成的历史记录不能被工作草稿覆盖：保留缓冲，提交时挂到新记录上。
-  if (!entry || entry._status === 'completed') return
+  // 非编辑模式的条目（如文生图）也不能收编辑草稿。
+  if (!entry || entry._status === 'completed' || entry.mode !== 'edit') return
   const draft = regionEditorRef.value?.exportDraft?.()
   editDraftDirty = false
   if (!draft) return
@@ -994,9 +1011,12 @@ async function deleteHistory(entry) {
       confirmButtonText: '删除',
       cancelButtonText: '取消',
     })
-    if (isRunningStatus(entry._status) && entry.task?.taskId) {
+    // historyItems 传入的是渲染时的浅拷贝；确认框打开期间提交可能刚拿到
+    // taskId，必须按当前活动条目决定是否取消。
+    const live = findHistoryEntry(entry.id) || entry
+    if (isRunningStatus(live._status) && live.task?.taskId) {
       try {
-        await cancelGenerationTask(entry.task.taskId)
+        await cancelGenerationTask(live.task.taskId)
       } catch {
         /* 停止任务失败也继续删除，取消属于尽力而为 */
       }

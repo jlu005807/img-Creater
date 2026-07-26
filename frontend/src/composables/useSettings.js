@@ -12,12 +12,20 @@ const MINIMUMS = {
   maxReferenceImages: 1,
 }
 
+// 后端 reference_images 上限为 8（超过直接 400），设置里不允许配得更高。
+const MAXIMUMS = {
+  maxReferenceImages: 8,
+}
+
 // el-input-number emits null on clear; never let null/invalid numbers stick.
 function sanitize(values) {
   const next = { ...DEFAULTS, ...values }
   for (const key of Object.keys(MINIMUMS)) {
     const value = Number(next[key])
     next[key] = Number.isFinite(value) && value >= MINIMUMS[key] ? value : DEFAULTS[key]
+    if (key in MAXIMUMS && next[key] > MAXIMUMS[key]) {
+      next[key] = MAXIMUMS[key]
+    }
   }
   return next
 }

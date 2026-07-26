@@ -707,7 +707,8 @@ function onCanvasKeydown(event) {
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
     event.preventDefault()
     event.stopPropagation()
-    if (canUndo.value) undo()
+    // 笔画进行中不可撤销：会弹出未提交的惰性快照，破坏 pointercancel 回滚。
+    if (canUndo.value && !drawing) undo()
   }
 }
 

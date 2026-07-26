@@ -120,8 +120,9 @@ class ImageService:
         self.run_async = run_async
         self.persist_results = persist_results
         self.result_dir = Path(result_dir) if result_dir is not None else DEFAULT_RESULT_DIR
-        self._manifest_locks: dict[str, threading.Lock] = {}
-        self._manifest_locks_guard = threading.Lock()
+        # 写 session.json 的读-改-写用单一全局锁串行化即可：写入很短且都在
+        # 本地磁盘，按会话细分的锁表反而会随 task_id 无限增长。
+        self._manifest_write_lock = threading.Lock()
 
     # ------------------------------------------------------------------ submit
 
@@ -1873,7 +1874,7 @@ class ImageService:
     ) -> None:
         if not self.persist_results:
             return
-        with self._manifest_lock(str(session_id)):
+        with self._manifest_write_lock:
             now = self._now()
             target_dir = self.result_dir / str(session_id)
             target_dir.mkdir(parents=True, exist_ok=True)
@@ -1916,14 +1917,6 @@ class ImageService:
             tmp_path = manifest_path.with_name(f"session.json.{uuid.uuid4().hex}.tmp")
             tmp_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             tmp_path.replace(manifest_path)
-
-    def _manifest_lock(self, session_id: str) -> threading.Lock:
-        with self._manifest_locks_guard:
-            lock = self._manifest_locks.get(session_id)
-            if lock is None:
-                lock = threading.Lock()
-                self._manifest_locks[session_id] = lock
-            return lock
 
     def _persist_failed_session_manifest(
         self,

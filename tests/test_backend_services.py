@@ -2182,6 +2182,30 @@ class ReferenceImageTests(TestCase):
             self.assertEqual(len(kwargs["files"]), 2)
             self.assertTrue(all(f[0] == "image[]" for f in kwargs["files"]))
 
+    def test_more_than_eight_reference_images_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "Primary",
+                    "base_url": "https://api.openai.com",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "status": True,
+                }
+            )
+            service = _service(config_service, FakeHttpClient())
+
+            from backend.services.image_service import GenerationValidationError
+
+            with self.assertRaises(GenerationValidationError):
+                service.submit_generation(
+                    prompt="too many refs",
+                    size="1024x1024",
+                    n=1,
+                    reference_images=[_png_data_url((2, 2))] * 9,
+                )
+
 
 class ChatProviderTests(TestCase):
     def test_chat_completions_posts_and_extracts_images(self):

@@ -4,6 +4,7 @@ import { backendRouteMissingMessage, isBackendRouteMissing } from '../api/client
 
 const STORAGE_KEY = 'studio-generation-history'
 const MAX_ENTRIES = 30
+const RUNNING_STATUSES = new Set(['submitting', 'queued', 'processing'])
 
 // Shared singleton so the drawer and the gallery see the same list.
 const history = ref(load())
@@ -92,6 +93,18 @@ export function useGenerationHistory() {
     if (!Array.isArray(sessions) || !sessions.length) return []
     const existingById = new Map(history.value.map((entry) => [entry.id, entry]))
     for (const session of sessions) {
+      // 正在跑新任务的本地条目不能被后端 manifest 覆盖：重新生成期间
+      // manifest 仍保留上一次完成的内容（旧 task_id / 旧图），直接合并会
+      // 把运行态改写成 completed 并中断轮询恢复。
+      const existing = existingById.get(session.id)
+      if (
+        existing &&
+        RUNNING_STATUSES.has(existing._status) &&
+        existing.task?.taskId &&
+        existing.task.taskId !== session.task_id
+      ) {
+        continue
+      }
       const urls = Array.isArray(session.urls) ? session.urls : []
       const entry = {
         id: session.id,

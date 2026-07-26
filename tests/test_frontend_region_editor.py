@@ -33,7 +33,7 @@ class RegionEditorSourceTests(TestCase):
         self.assertIn("@pointercancel", source)
 
         # Ctrl+Z undo is wired, unreadable files surface an error.
-        self.assertIn("if (canUndo.value) undo()", source)
+        self.assertIn("if (canUndo.value && !drawing) undo()", source)
         self.assertIn("无法读取该图片文件", source)
 
     def test_mask_change_emission_is_lightweight_and_draft_is_pulled_on_demand(self):
@@ -61,7 +61,7 @@ class PlaygroundEditDraftBufferTests(TestCase):
         # the heavy draft is pulled once via exportDraft() at flush time.
         self.assertIn("scheduleEditDraftFlush()", source)
         self.assertIn("EDIT_DRAFT_FLUSH_MS", source)
-        self.assertNotIn("nextState.draft", source)
+        self.assertNotRegex(source, r"nextState\??\.draft")
         # Completed entries are clone-on-edit: their stored draft is never
         # overwritten; the working draft attaches to the new entry at submit.
         self.assertIn("entry._status === 'completed'", source)
