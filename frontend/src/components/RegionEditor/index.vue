@@ -47,9 +47,18 @@ let lastPoint = null
 let previewRect = null
 let hoverPoint = null
 let undoStack = []
-// Pixel scale: 1 canvas px = how many image px
-let canvasScale = 1
+// Lazy undo snapshot: captured on pointerdown, pushed only on first real mutation.
+let pendingSnapshot = null
+let pendingSnapshotCommitted = false
 let imageRevision = 0
+let redrawPending = false
+let resizeObserver = null
+let observedZoomCanvas = null
+let dprQuery = null
+// canvas -> CSS size cache so redraws avoid per-frame layout reads.
+const displaySizes = new WeakMap()
+// Reusable overlay layers, one per view (see drawMarkOverlay).
+const overlayLayers = { panel: null, zoom: null }
 
 const cursorStyle = computed(() => {
   if (!imageDataUrl.value) return 'default'
@@ -90,8 +99,10 @@ function readImageFile(file) {
   if (!file) return
   if (!file.type.startsWith('image/')) { ElMessage.warning('请选择图片文件'); return }
   const reader = new FileReader()
+  reader.onerror = () => { ElMessage.error('无法读取该图片文件，可能是浏览器不支持的格式') }
   reader.onload = () => {
     const img = new Image()
+    img.onerror = () => { ElMessage.error('无法读取该图片文件，可能是浏览器不支持的格式') }
     img.onload = async () => {
       imageDataUrl.value = reader.result
       fileName.value = file.name
@@ -113,7 +124,6 @@ function initMaskCanvas() {
   maskCanvas.height = PANEL_HEIGHT
   maskContext = maskCanvas.getContext('2d')
   maskContext.clearRect(0, 0, PANEL_WIDTH, PANEL_HEIGHT)
-  canvasScale = 1
   comparePosition.value = 100
   hasMask.value = false
   undoStack = []
@@ -139,13 +149,40 @@ async function loadImageDataUrl(dataUrl, nextFileName = '') {
   return true
 }
 
+// Size the backing store to CSS size * devicePixelRatio, then map the context
+// back to the logical space so all drawing code keeps using logical coords.
+function prepareCanvas(canvas, logicalWidth, logicalHeight) {
+  const dpr = window.devicePixelRatio || 1
+  let size = displaySizes.get(canvas)
+  if (!size || !size.width || !size.height) {
+    const rect = canvas.getBoundingClientRect()
+    size = { width: rect.width || logicalWidth, height: rect.height || logicalHeight }
+    displaySizes.set(canvas, size)
+  }
+  const width = Math.max(1, Math.round(size.width * dpr))
+  const height = Math.max(1, Math.round(size.height * dpr))
+  if (canvas.width !== width) canvas.width = width
+  if (canvas.height !== height) canvas.height = height
+  const ctx = canvas.getContext('2d')
+  ctx.setTransform(width / logicalWidth, 0, 0, height / logicalHeight, 0, 0)
+  return ctx
+}
+
+// Coalesce high-frequency redraw requests (pointermove) into one frame.
+function requestRedraw() {
+  if (redrawPending) return
+  redrawPending = true
+  requestAnimationFrame(() => {
+    redrawPending = false
+    drawScene()
+    if (zoomOpen.value) drawZoomScene()
+  })
+}
+
 function drawScene() {
   const canvas = canvasRef.value
   if (!canvas) return
-  canvas.width = PANEL_WIDTH
-  canvas.height = PANEL_HEIGHT
-  const ctx = canvas.getContext('2d')
-  const styles = getComputedStyle(canvas)
+  const ctx = prepareCanvas(canvas, PANEL_WIDTH, PANEL_HEIGHT)
   ctx.clearRect(0, 0, PANEL_WIDTH, PANEL_HEIGHT)
 
   if (!imageElement) {
@@ -157,18 +194,13 @@ function drawScene() {
   }
 
   // Fit image into the panel.
-  const scale = Math.min(PANEL_WIDTH / imageElement.width, PANEL_HEIGHT / imageElement.height)
-  canvasScale = scale
-  const dw = imageElement.width * scale
-  const dh = imageElement.height * scale
-  const dx = (PANEL_WIDTH - dw) / 2
-  const dy = (PANEL_HEIGHT - dh) / 2
+  const { dw, dh, dx, dy } = imageFitRect(PANEL_WIDTH, PANEL_HEIGHT)
 
   // Image.
   ctx.drawImage(imageElement, dx, dy, dw, dh)
 
   // Semi-transparent colored mark overlay, clipped for before/after compare.
-  drawMarkOverlay(ctx, PANEL_WIDTH, PANEL_HEIGHT, dx, dy, dw, dh, dx, dy, dw, dh, compareRatio())
+  drawMarkOverlay(ctx, 'panel', PANEL_WIDTH, PANEL_HEIGHT, dx, dy, dw, dh, dx, dy, dw, dh, compareRatio())
   drawCompareDivider(ctx, dx, dy, dw, dh)
 
   // Selection preview (rect drag outline).
@@ -203,9 +235,7 @@ function drawScene() {
 function drawZoomScene() {
   const canvas = zoomCanvasRef.value
   if (!canvas || !imageElement) return
-  canvas.width = ZOOM_CANVAS
-  canvas.height = ZOOM_HEIGHT
-  const ctx = canvas.getContext('2d')
+  const ctx = prepareCanvas(canvas, ZOOM_CANVAS, ZOOM_HEIGHT)
   const zoomRect = imageFitRect(ZOOM_CANVAS, ZOOM_HEIGHT)
   const panelRect = imageFitRect(PANEL_WIDTH, PANEL_HEIGHT)
   const { dw, dh, dx, dy } = zoomRect
@@ -214,7 +244,7 @@ function drawZoomScene() {
   ctx.drawImage(imageElement, dx, dy, dw, dh)
 
   // Draw the mark layer scaled up, clipped for before/after compare.
-  drawMarkOverlay(ctx, ZOOM_CANVAS, ZOOM_HEIGHT, panelRect.dx, panelRect.dy, panelRect.dw, panelRect.dh, dx, dy, dw, dh, compareRatio())
+  drawMarkOverlay(ctx, 'zoom', ZOOM_CANVAS, ZOOM_HEIGHT, panelRect.dx, panelRect.dy, panelRect.dw, panelRect.dh, dx, dy, dw, dh, compareRatio())
   drawCompareDivider(ctx, dx, dy, dw, dh)
 
   if (previewRect) {
@@ -270,13 +300,23 @@ function compareRatio() {
   return clamp(Number(comparePosition.value || 0), 0, 100) / 100
 }
 
-function drawMarkOverlay(ctx, width, height, sx, sy, sw, sh, dx, dy, dw, dh, ratio = 1) {
+function getOverlayLayer(layerKey, width, height) {
+  let layer = overlayLayers[layerKey]
+  if (!layer) {
+    layer = document.createElement('canvas')
+    overlayLayers[layerKey] = layer
+  }
+  if (layer.width !== width) layer.width = width
+  if (layer.height !== height) layer.height = height
+  return layer
+}
+
+function drawMarkOverlay(ctx, layerKey, width, height, sx, sy, sw, sh, dx, dy, dw, dh, ratio = 1) {
   const clippedRatio = clamp(ratio, 0, 1)
   if (!maskCanvas || clippedRatio <= 0 || sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return
-  const layer = document.createElement('canvas')
-  layer.width = width
-  layer.height = height
+  const layer = getOverlayLayer(layerKey, width, height)
   const layerContext = layer.getContext('2d')
+  layerContext.clearRect(0, 0, width, height)
   layerContext.globalAlpha = OVERLAY_ALPHA
   layerContext.drawImage(maskCanvas, sx, sy, sw, sh, dx, dy, dw, dh)
   ctx.save()
@@ -357,6 +397,25 @@ function pushUndo() {
   canUndo.value = true
 }
 
+function captureSnapshot() {
+  if (!maskContext) return
+  pendingSnapshot = maskContext.getImageData(0, 0, PANEL_WIDTH, PANEL_HEIGHT)
+  pendingSnapshotCommitted = false
+}
+
+function commitSnapshot() {
+  if (!pendingSnapshot || pendingSnapshotCommitted) return
+  undoStack.push(pendingSnapshot)
+  if (undoStack.length > UNDO_LIMIT) undoStack.shift()
+  canUndo.value = true
+  pendingSnapshotCommitted = true
+}
+
+function releaseSnapshot() {
+  pendingSnapshot = null
+  pendingSnapshotCommitted = false
+}
+
 function undo() {
   if (!maskContext || !undoStack.length) return
   const snapshot = undoStack.pop()
@@ -365,13 +424,16 @@ function undo() {
   recomputeHasMask()
   previewRect = null
   drawScene()
+  if (zoomOpen.value) drawZoomScene()
   emitMaskState()
 }
 
 function pointerDown(event, isZoom = false) {
   if (!imageElement) return
-  ;(isZoom ? zoomCanvasRef : canvasRef).value?.setPointerCapture?.(event.pointerId)
-  pushUndo()
+  const canvas = (isZoom ? zoomCanvasRef : canvasRef).value
+  canvas?.setPointerCapture?.(event.pointerId)
+  canvas?.focus?.({ preventScroll: true })
+  captureSnapshot()
   drawing = true
   const pt = isZoom ? zoomToPanel(getZoomPoint(event)) : getCanvasPoint(event)
   startPoint = pt
@@ -393,23 +455,52 @@ function pointerMove(event, isZoom = false) {
       lastPoint = raw
     }
   }
-  drawScene()
-  if (isZoom) drawZoomScene()
+  requestRedraw()
 }
 
 function pointerUp(isZoom = false) {
+  const wasDrawing = drawing
   if (drawing && imageElement && tool.value === 'rect' && previewRect) {
     if (previewRect.width > 3 && previewRect.height > 3) {
-      maskContext.fillStyle = markerColorRgba(1)
-      maskContext.fillRect(previewRect.x, previewRect.y, previewRect.width, previewRect.height)
-      hasMask.value = true
+      // Clamp the committed rect to the image fit rect so letterbox padding stays clean.
+      const fit = imageFitRect(PANEL_WIDTH, PANEL_HEIGHT)
+      const x = Math.max(previewRect.x, fit.dx)
+      const y = Math.max(previewRect.y, fit.dy)
+      const width = Math.min(previewRect.x + previewRect.width, fit.dx + fit.dw) - x
+      const height = Math.min(previewRect.y + previewRect.height, fit.dy + fit.dh) - y
+      if (width > 0 && height > 0) {
+        commitSnapshot()
+        maskContext.fillStyle = markerColorRgba(1)
+        maskContext.fillRect(x, y, width, height)
+      }
     }
   }
-  if (drawing && tool.value === 'eraser') recomputeHasMask()
   drawing = false
   startPoint = null
   lastPoint = null
   previewRect = null
+  releaseSnapshot()
+  if (wasDrawing) recomputeHasMask()
+  drawScene()
+  if (isZoom) drawZoomScene()
+  emitMaskState()
+}
+
+// A browser-claimed gesture (scroll/zoom) aborts the stroke: roll back any
+// partial paint and drop the uncommitted snapshot.
+function pointerCancel(isZoom = false) {
+  if (drawing && pendingSnapshot && pendingSnapshotCommitted && maskContext) {
+    maskContext.putImageData(pendingSnapshot, 0, 0)
+    undoStack.pop()
+    canUndo.value = undoStack.length > 0
+  }
+  drawing = false
+  startPoint = null
+  lastPoint = null
+  previewRect = null
+  hoverPoint = null
+  releaseSnapshot()
+  recomputeHasMask()
   drawScene()
   if (isZoom) drawZoomScene()
   emitMaskState()
@@ -423,7 +514,20 @@ function pointerLeave() {
 }
 
 function paintLine(from, to) {
+  // Skip segments fully inside the letterbox padding; clip the rest to the image.
+  const fit = imageFitRect(PANEL_WIDTH, PANEL_HEIGHT)
+  const radius = brushSize.value / 2
+  const intersectsFit =
+    Math.min(from.x, to.x) - radius < fit.dx + fit.dw &&
+    Math.max(from.x, to.x) + radius > fit.dx &&
+    Math.min(from.y, to.y) - radius < fit.dy + fit.dh &&
+    Math.max(from.y, to.y) + radius > fit.dy
+  if (!intersectsFit) return
+  commitSnapshot()
   maskContext.save()
+  maskContext.beginPath()
+  maskContext.rect(fit.dx, fit.dy, fit.dw, fit.dh)
+  maskContext.clip()
   if (tool.value === 'eraser') maskContext.globalCompositeOperation = 'destination-out'
   maskContext.strokeStyle = markerColorRgba(1)
   maskContext.lineWidth = brushSize.value
@@ -434,7 +538,6 @@ function paintLine(from, to) {
   maskContext.lineTo(to.x, to.y)
   maskContext.stroke()
   maskContext.restore()
-  if (tool.value !== 'eraser') hasMask.value = true
 }
 
 function normalizeRect(from, to) {
@@ -447,16 +550,33 @@ function normalizeRect(from, to) {
 }
 
 function clearMask() {
-  if (!maskContext) return
+  if (!maskContext || !hasMask.value) return
   pushUndo()
   maskContext.clearRect(0, 0, PANEL_WIDTH, PANEL_HEIGHT)
   hasMask.value = false
   previewRect = null
   drawScene()
+  if (zoomOpen.value) drawZoomScene()
   emitMaskState()
 }
 
-function recomputeHasMask() { hasMask.value = Boolean(getMaskBoundingBox()) }
+function recomputeHasMask() { hasMask.value = maskHasContent() }
+
+// Scan only the image fit rect, exiting on the first opaque pixel.
+function maskHasContent() {
+  if (!maskContext || !imageElement) return false
+  const fit = imageFitRect(PANEL_WIDTH, PANEL_HEIGHT)
+  const x = clamp(Math.floor(fit.dx), 0, PANEL_WIDTH)
+  const y = clamp(Math.floor(fit.dy), 0, PANEL_HEIGHT)
+  const width = clamp(Math.ceil(fit.dx + fit.dw), 0, PANEL_WIDTH) - x
+  const height = clamp(Math.ceil(fit.dy + fit.dh), 0, PANEL_HEIGHT) - y
+  if (width <= 0 || height <= 0) return false
+  const pixels = maskContext.getImageData(x, y, width, height).data
+  for (let i = 3; i < pixels.length; i += 4) {
+    if (pixels[i] > 0) return true
+  }
+  return false
+}
 
 function exportDraft() {
   if (!imageDataUrl.value || !imageElement || !maskCanvas) return null
@@ -533,22 +653,6 @@ function emitMaskState() {
   })
 }
 
-function getMaskBoundingBox() {
-  if (!maskContext) return null
-  const pixels = maskContext.getImageData(0, 0, PANEL_WIDTH, PANEL_HEIGHT).data
-  let minX = PANEL_WIDTH, minY = PANEL_HEIGHT, maxX = 0, maxY = 0
-  for (let y = 0; y < PANEL_HEIGHT; y++) {
-    for (let x = 0; x < PANEL_WIDTH; x++) {
-      if (pixels[(y * PANEL_WIDTH + x) * 4 + 3] > 0) {
-        minX = Math.min(minX, x); minY = Math.min(minY, y)
-        maxX = Math.max(maxX, x); maxY = Math.max(maxY, y)
-      }
-    }
-  }
-  if (minX === PANEL_WIDTH) return null
-  return { x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1 }
-}
-
 function exportPayload() {
   if (!imageDataUrl.value || !maskCanvas || !maskContext || !hasMask.value) return null
   const markedImage = buildMarkedImageDataUrl()
@@ -598,17 +702,67 @@ function onCanvasKeydown(event) {
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
     event.preventDefault()
     event.stopPropagation()
+    if (canUndo.value) undo()
   }
+}
+
+function onCanvasResize(entries) {
+  for (const entry of entries) {
+    const rect = entry.contentRect
+    displaySizes.set(entry.target, { width: rect.width, height: rect.height })
+  }
+  requestRedraw()
+}
+
+// matchMedia resolution queries fire once per DPR value, so re-bind on each change.
+function bindDprListener() {
+  dprQuery?.removeEventListener('change', onDprChange)
+  dprQuery = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`)
+  dprQuery.addEventListener('change', onDprChange)
+}
+
+function onDprChange() {
+  bindDprListener()
+  requestRedraw()
+}
+
+// The dialog is destroy-on-close, so the zoom canvas is a fresh element each
+// time and must be observed on open and released on close.
+function onZoomOpened() {
+  if (resizeObserver && zoomCanvasRef.value && observedZoomCanvas !== zoomCanvasRef.value) {
+    observedZoomCanvas = zoomCanvasRef.value
+    resizeObserver.observe(observedZoomCanvas)
+  }
+  drawZoomScene()
 }
 
 // Zoom popup: draw once when opened.
 watch(zoomOpen, (val) => {
-  if (val) nextTick(drawZoomScene)
+  if (val) {
+    nextTick(onZoomOpened)
+  } else if (observedZoomCanvas) {
+    resizeObserver?.unobserve(observedZoomCanvas)
+    observedZoomCanvas = null
+  }
 })
 watch(theme, () => { drawScene(); if (zoomOpen.value) drawZoomScene() })
 watch(comparePosition, () => { drawScene(); if (zoomOpen.value) drawZoomScene() })
-onMounted(drawScene)
-onBeforeUnmount(() => { undoStack = [] })
+onMounted(() => {
+  if (typeof ResizeObserver !== 'undefined') {
+    resizeObserver = new ResizeObserver(onCanvasResize)
+    if (canvasRef.value) resizeObserver.observe(canvasRef.value)
+  }
+  bindDprListener()
+  drawScene()
+})
+onBeforeUnmount(() => {
+  resizeObserver?.disconnect()
+  resizeObserver = null
+  observedZoomCanvas = null
+  dprQuery?.removeEventListener('change', onDprChange)
+  dprQuery = null
+  undoStack = []
+})
 
 defineExpose({ exportPayload, exportDraft, restoreDraft, clearMask, clearAll })
 </script>
@@ -670,10 +824,11 @@ defineExpose({ exportPayload, exportDraft, restoreDraft, clearMask, clearAll })
       tabindex="0"
       class="aspect-[400/360] w-full rounded-md border bg-[var(--studio-canvas)] outline-none transition-colors"
       :class="isDragOver ? 'border-[var(--studio-coral)]' : 'border-[var(--studio-line)]'"
-      :style="{ cursor: cursorStyle }"
+      :style="{ cursor: cursorStyle, touchAction: 'none' }"
       @pointerdown.prevent="(e) => pointerDown(e, false)"
       @pointermove.prevent="(e) => pointerMove(e, false)"
       @pointerup.prevent="() => pointerUp(false)"
+      @pointercancel="() => pointerCancel(false)"
       @pointerleave.prevent="pointerLeave"
       @keydown="onCanvasKeydown"
       @dragover.prevent="isDragOver = true"
@@ -693,7 +848,7 @@ defineExpose({ exportPayload, exportDraft, restoreDraft, clearMask, clearAll })
     </p>
 
     <!-- Zoom modal -->
-    <el-dialog v-model="zoomOpen" title="放大编辑" width="1120px" destroy-on-close @opened="drawZoomScene">
+    <el-dialog v-model="zoomOpen" title="放大编辑" width="1120px" destroy-on-close @opened="onZoomOpened">
       <div class="space-y-4">
         <div class="flex items-start justify-between gap-4">
           <div class="min-w-0">
@@ -761,11 +916,12 @@ defineExpose({ exportPayload, exportDraft, restoreDraft, clearMask, clearAll })
           <canvas
             ref="zoomCanvasRef"
             tabindex="0"
-            class="w-full rounded-md border border-[var(--studio-line)] bg-[var(--studio-canvas)] outline-none"
-            :style="{ cursor: cursorStyle }"
+            class="aspect-[900/640] w-full rounded-md border border-[var(--studio-line)] bg-[var(--studio-canvas)] outline-none"
+            :style="{ cursor: cursorStyle, touchAction: 'none' }"
             @pointerdown.prevent="(e) => pointerDown(e, true)"
             @pointermove.prevent="(e) => pointerMove(e, true)"
             @pointerup.prevent="() => pointerUp(true)"
+            @pointercancel="() => pointerCancel(true)"
             @pointerleave.prevent="pointerLeave"
             @keydown="onCanvasKeydown"
           />
