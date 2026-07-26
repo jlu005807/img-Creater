@@ -10,7 +10,7 @@ import { useTheme } from '../../composables/useTheme'
 const emit = defineEmits(['close'])
 
 const activeTab = ref('api')
-const { settings, resetSettings } = useSettings()
+const { settings, resetSettings, DEFAULTS } = useSettings()
 const { themeMode, setThemeMode } = useTheme()
 const {
   templates,
@@ -101,12 +101,12 @@ function fillTpl(t) {
       <div class="max-w-lg space-y-5">
         <label class="block">
           <span class="mb-1 block text-sm font-semibold">提示词最大字数</span>
-          <el-input-number v-model="settings.maxPromptChars" :min="1" :step="100" controls-position="right" />
+          <el-input-number v-model="settings.maxPromptChars" :min="1" :step="100" :value-on-clear="DEFAULTS.maxPromptChars" controls-position="right" />
           <p class="mt-1 text-xs text-[var(--studio-muted)]">默认 3000，超出后输入框不再接受更多字符。</p>
         </label>
         <label class="block">
           <span class="mb-1 block text-sm font-semibold">参考图上传上限</span>
-          <el-input-number v-model="settings.maxReferenceImages" :min="1" :step="1" controls-position="right" />
+          <el-input-number v-model="settings.maxReferenceImages" :min="1" :step="1" :value-on-clear="DEFAULTS.maxReferenceImages" controls-position="right" />
           <p class="mt-1 text-xs text-[var(--studio-muted)]">文生图时可上传的参考图数量上限，默认 3。</p>
         </label>
         <div class="block">

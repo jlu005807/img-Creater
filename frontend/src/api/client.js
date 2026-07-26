@@ -21,6 +21,7 @@ apiClient.interceptors.response.use(
     const message = error.response?.data?.error?.message || error.message || '网络请求失败'
     const normalized = new Error(message)
     normalized.status = error.response?.status
+    normalized.code = error.code
     normalized.details = error.response?.data?.error?.details || {}
     return Promise.reject(normalized)
   },

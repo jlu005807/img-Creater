@@ -142,10 +142,8 @@ function editConfig(item) {
 }
 
 async function selectConfig(item) {
-  if (editingId.value === item.id) {
-    resetForm()
-    return
-  }
+  // Already editing this node: keep unsaved input; cancel only via 取消编辑.
+  if (editingId.value === item.id) return
   editConfig(item)
   await loadEditingKey({ visible: false })
 }
@@ -194,20 +192,24 @@ async function toggleSecret(item) {
 }
 
 async function loadEditingKey({ visible }) {
-  if (!editingId.value) return
-  secretLoadingId.value = editingId.value
+  const id = editingId.value
+  if (!id) return
+  secretLoadingId.value = id
   try {
-    const secret = await getConfigSecret(editingId.value)
+    const secret = await getConfigSecret(id)
+    // The user may have switched rows while awaiting; never apply a stale secret.
+    if (editingId.value !== id) return
     form.api_key = secret.api_key || ''
     editingSecretVisible.value = visible
   } catch (error) {
+    if (editingId.value !== id) return
     if (isBackendRouteMissing(error)) {
-      await handleSecretNotFound(editingId.value)
+      await handleSecretNotFound(id)
       return
     }
     ElMessage.error(error.message || '读取 API Key 失败')
   } finally {
-    secretLoadingId.value = null
+    if (secretLoadingId.value === id) secretLoadingId.value = null
   }
 }
 

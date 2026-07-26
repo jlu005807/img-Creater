@@ -49,24 +49,30 @@ function markLegacyMigrated() {
   }
 }
 
+// Returns how many legacy items were migrated; failures are skipped so one bad
+// item can never block template loading forever.
 async function migrateLegacyTemplatesIfNeeded(currentTemplates) {
-  if (legacyMigrationDone()) return currentTemplates
+  if (legacyMigrationDone()) return 0
   const legacyTemplates = readLegacyTemplates()
   if (!legacyTemplates.length) {
     markLegacyMigrated()
-    return currentTemplates
+    return 0
   }
 
   const existingTexts = new Set(currentTemplates.map((item) => item.text))
-  const migrated = []
+  let migratedCount = 0
   for (const item of legacyTemplates) {
     if (existingTexts.has(item.text)) continue
-    const created = await createPromptTemplate({ title: item.title, text: item.text })
-    migrated.push(created)
-    existingTexts.add(created.text)
+    try {
+      const created = await createPromptTemplate({ title: item.title, text: item.text })
+      migratedCount += 1
+      existingTexts.add(created.text)
+    } catch {
+      /* skip legacy items that fail to migrate */
+    }
   }
   markLegacyMigrated()
-  return migrated.length ? [...migrated, ...currentTemplates] : currentTemplates
+  return migratedCount
 }
 
 async function loadTemplates({ force = false } = {}) {
@@ -74,8 +80,14 @@ async function loadTemplates({ force = false } = {}) {
   templatesLoading.value = true
   loadPromise = (async () => {
     const loaded = await listPromptTemplates()
-    const next = await migrateLegacyTemplatesIfNeeded(Array.isArray(loaded) ? loaded : [])
+    let next = Array.isArray(loaded) ? loaded : []
     templates.value = next
+    const migratedCount = await migrateLegacyTemplatesIfNeeded(next)
+    if (migratedCount > 0) {
+      const refreshed = await listPromptTemplates()
+      next = Array.isArray(refreshed) ? refreshed : next
+      templates.value = next
+    }
     return next
   })()
   try {

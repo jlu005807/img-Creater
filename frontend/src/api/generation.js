@@ -1,11 +1,15 @@
 import { apiClient } from './client'
 
+// Submission bodies can carry base64 images; the default 30s timeout aborts
+// slow uploads the backend actually accepted, causing phantom failures.
+const SUBMIT_TIMEOUT_MS = 120000
+
 export function generateImages(payload) {
-  return apiClient.post('/generate', payload)
+  return apiClient.post('/generate', payload, { timeout: SUBMIT_TIMEOUT_MS })
 }
 
 export function editImage(payload) {
-  return apiClient.post('/edit', payload)
+  return apiClient.post('/edit', payload, { timeout: SUBMIT_TIMEOUT_MS })
 }
 
 export function getGenerationStatus({ apiId, taskId }) {

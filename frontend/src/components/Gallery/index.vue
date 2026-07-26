@@ -88,6 +88,7 @@ onMounted(loadGallery)
             <el-image
               :src="item.url"
               fit="cover"
+              lazy
               :preview-src-list="previewUrls"
               :initial-index="index"
               preview-teleported
