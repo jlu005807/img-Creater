@@ -1072,7 +1072,10 @@ class ImageService:
             if payload.get("quality"):
                 body["quality"] = payload["quality"]
             if payload.get("reference_images") and operation != "edit":
-                body["reference_images"] = payload["reference_images"]
+                body["reference_images"] = [
+                    self._reference_for_json_image(ref, f"reference_images[{index}]")
+                    for index, ref in enumerate(payload["reference_images"])
+                ]
             if operation == "edit":
                 self._add_edit_images_to_json_body(body, payload)
             post_kwargs = {
@@ -1405,7 +1408,15 @@ class ImageService:
             data = response.json()
         except Exception as exc:
             text = str(getattr(response, "text", "") or "")
-            urls = self._extract_image_urls_from_text(text)
+            # Gateway-timeout pages must win over URL mining: their HTML can
+            # embed unrelated asset URLs, and treating them as a completed
+            # result would also skip the anti-double-billing timeout handling.
+            is_gateway_timeout = self._is_gateway_timeout_response(
+                getattr(response, "status_code", None),
+                self._extract_html_title(text),
+                text,
+            )
+            urls = [] if is_gateway_timeout else self._extract_image_urls_from_text(text)
             if urls:
                 logger.info(
                     "[image] non-json response fallback api_id=%s api_name=%s status_code=%s urls=%d",
@@ -1865,7 +1876,10 @@ class ImageService:
         if payload.get("quality"):
             body["quality"] = payload["quality"]
         if payload.get("reference_images") and operation != "edit":
-            body["reference_images"] = payload["reference_images"]
+            body["reference_images"] = [
+                self._reference_for_json_image(ref, f"reference_images[{index}]")
+                for index, ref in enumerate(payload["reference_images"])
+            ]
 
         if operation == "edit":
             self._add_edit_images_to_json_body(body, payload)
@@ -1897,8 +1911,11 @@ class ImageService:
         prompt = payload.get("edit_reference_prompt") if operation == "edit" else payload["prompt"]
         if refs:
             content = [{"type": "text", "text": prompt}]
-            for ref in refs:
-                content.append({"type": "image_url", "image_url": {"url": ref}})
+            for index, ref in enumerate(refs):
+                # refs may be local /api/results/ URLs (persisted references) —
+                # upstream cannot fetch those, so inline them as data URLs.
+                image_url = self._reference_for_json_image(ref, f"images[{index}]")
+                content.append({"type": "image_url", "image_url": {"url": image_url}})
             messages = [{"role": "user", "content": content}]
         else:
             messages = [{"role": "user", "content": prompt}]
@@ -1956,10 +1973,53 @@ class ImageService:
             if urls:
                 return urls
 
+        # 3) choices[].message — the actual Chat Completions shape. Providers
+        # return image URLs/data URIs inside message.content (string or
+        # content-part list) or a message.images array.
+        choices = data.get("choices")
+        if isinstance(choices, list):
+            urls = []
+            seen: set[str] = set()
+
+            def add_url(candidate: Any) -> None:
+                text = str(candidate or "").strip()
+                if text and text not in seen:
+                    seen.add(text)
+                    urls.append(text)
+
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    continue
+                message = choice.get("message")
+                if not isinstance(message, dict):
+                    continue
+                content = message.get("content")
+                if isinstance(content, str):
+                    for url in self._extract_image_urls_from_text(content):
+                        add_url(url)
+                elif isinstance(content, list):
+                    for part in content:
+                        if not isinstance(part, dict):
+                            continue
+                        if part.get("type") == "image_url":
+                            image_url = part.get("image_url")
+                            add_url(image_url.get("url") if isinstance(image_url, dict) else image_url)
+                        elif isinstance(part.get("text"), str):
+                            for url in self._extract_image_urls_from_text(part["text"]):
+                                add_url(url)
+                for image in message.get("images") or []:
+                    if isinstance(image, dict):
+                        image_url = image.get("image_url")
+                        add_url(image_url.get("url") if isinstance(image_url, dict) else image.get("url"))
+                    elif isinstance(image, str):
+                        add_url(image)
+            if urls:
+                return urls
+
         # This is genuinely a non-image chat — that's a provider error for an
         # image tool.
         raise ProviderRequestError(
-            "Chat Completions 响应中未找到图片数据 (data/output)",
+            "Chat Completions 响应中未找到图片数据 (data/output/choices)",
             status_code=502,
             details={"api_id": provider["id"], "api_name": provider["name"], "response": data},
         )

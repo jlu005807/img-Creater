@@ -450,6 +450,39 @@ class OpenAIProviderTests(TestCase):
             self.assertEqual(result["urls"], ["https://cdn.example.com/result.png?sig=abc"])
             self.assertEqual(result["response_meta"]["non_json_url_fallback"], True)
 
+    def test_openai_generation_gateway_timeout_page_with_image_urls_is_not_a_result(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service, _ = self._config_service(
+                tmp_dir,
+                [
+                    {
+                        "name": "Compat",
+                        "base_url": "https://api.example.com",
+                        "api_key": "key-1",
+                        "model": "gpt-image-2",
+                        "api_type": "openai",
+                        "status": True,
+                    }
+                ],
+            )
+            # A 504 gateway page that happens to embed an asset image must not
+            # be mistaken for a completed generation.
+            http_client = FakeHttpClient(
+                post_responses=[
+                    BadJsonResponse(
+                        504,
+                        '<html><title>Gateway Timeout</title><img src="https://cdn.gateway.com/logo.png"></html>',
+                    )
+                ]
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="hi", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["urls"], [])
+
     def test_openai_generation_extracts_extensionless_signed_image_url_from_non_json_response_text(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_service, _ = self._config_service(
@@ -1971,6 +2004,41 @@ class CustomProviderTests(TestCase):
             self.assertEqual(result["urls"], ["https://cdn/pic.png"])
             self.assertEqual(http_client.posts[0][0], "https://my-proxy.example.com/api/v2/img")
 
+    def test_custom_provider_inlines_local_reference_urls_as_data_urls(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "Direct",
+                    "base_url": "https://my-proxy.example.com/api/v2/img",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "custom",
+                    "status": True,
+                }
+            )
+            result_dir = Path(tmp_dir) / "history"
+            http_client = FakeHttpClient(
+                post_responses=[FakeResponse(200, {"data": [{"b64_json": "QUJD"}]})]
+            )
+            service = _service(config_service, http_client, result_dir=result_dir, persist_results=True)
+
+            submit = service.submit_generation(
+                prompt="use the reference",
+                size="1024x1024",
+                n=1,
+                reference_images=[_png_data_url((4, 4))],
+                history_id="custom-refs-1",
+            )
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "completed")
+            refs = http_client.posts[0][1]["json"]["reference_images"]
+            self.assertEqual(len(refs), 1)
+            # Persisted /api/results/ URLs are local-only; the outgoing body
+            # must carry data URLs upstream can actually read.
+            self.assertTrue(refs[0].startswith("data:image/png;base64,"))
+
     def test_custom_url_is_not_auto_switched_to_async_endpoint(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
@@ -2143,6 +2211,124 @@ class ChatProviderTests(TestCase):
             body = http_client.posts[0][1]["json"]
             self.assertEqual(body["model"], "gpt-image-2")
             self.assertEqual(body["messages"], [{"role": "user", "content": "hi"}])
+
+    def test_chat_completions_extracts_images_from_choices_message_content(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "Chat",
+                    "base_url": "https://api.openai.com",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "chat",
+                    "status": True,
+                }
+            )
+            http_client = FakeHttpClient(
+                post_responses=[
+                    FakeResponse(
+                        200,
+                        {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": "Here it is: https://cdn.example.com/out.png done",
+                                    }
+                                }
+                            ]
+                        },
+                    )
+                ]
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="hi", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["urls"], ["https://cdn.example.com/out.png"])
+
+    def test_chat_completions_extracts_images_from_choices_content_parts_and_images(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "Chat",
+                    "base_url": "https://api.openai.com",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "chat",
+                    "status": True,
+                }
+            )
+            http_client = FakeHttpClient(
+                post_responses=[
+                    FakeResponse(
+                        200,
+                        {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "content": [
+                                            {"type": "text", "text": "result"},
+                                            {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}},
+                                        ],
+                                        "images": [{"image_url": {"url": "https://cdn.example.com/extra.png"}}],
+                                    }
+                                }
+                            ]
+                        },
+                    )
+                ]
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="hi", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(
+                result["urls"],
+                ["data:image/png;base64,QUJD", "https://cdn.example.com/extra.png"],
+            )
+
+    def test_chat_completions_inlines_local_reference_urls_as_data_urls(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "Chat",
+                    "base_url": "https://api.openai.com",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "chat",
+                    "status": True,
+                }
+            )
+            result_dir = Path(tmp_dir) / "history"
+            http_client = FakeHttpClient(
+                post_responses=[FakeResponse(200, {"data": [{"b64_json": "QUJD"}]})]
+            )
+            service = _service(config_service, http_client, result_dir=result_dir, persist_results=True)
+
+            submit = service.submit_generation(
+                prompt="use the reference",
+                size="1024x1024",
+                n=1,
+                reference_images=[_png_data_url((4, 4))],
+                history_id="chat-refs-1",
+            )
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "completed")
+            content = http_client.posts[0][1]["json"]["messages"][0]["content"]
+            image_parts = [part for part in content if part.get("type") == "image_url"]
+            self.assertEqual(len(image_parts), 1)
+            # The persisted local /api/results/ URL must be inlined as a data
+            # URL before leaving the machine — upstream cannot fetch it.
+            self.assertTrue(image_parts[0]["image_url"]["url"].startswith("data:image/png;base64,"))
 
 
 class AsyncRelayProviderTests(TestCase):
