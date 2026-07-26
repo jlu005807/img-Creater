@@ -320,6 +320,36 @@ class BackendRouteTests(TestCase):
         self.assertEqual(data[0]["reference_images"], ["/api/results/history-1/references/ref.png"])
         self.assertEqual(data[0]["prompt"], "a red house")
 
+    def test_result_file_route_serves_reference_subdirectory(self):
+        result_dir = Path(self.tmp_dir.name) / "history"
+        self.image_service.result_dir = result_dir
+        reference_dir = result_dir / "history-1" / "references"
+        reference_dir.mkdir(parents=True)
+        (result_dir / "history-1" / "image.png").write_bytes(b"result-bytes")
+        (reference_dir / "ref-0-abcd1234.png").write_bytes(b"reference-bytes")
+
+        image_response = self.client.get("/api/results/history-1/image.png")
+        reference_response = self.client.get("/api/results/history-1/references/ref-0-abcd1234.png")
+
+        self.assertEqual(image_response.status_code, 200)
+        self.assertEqual(image_response.data, b"result-bytes")
+        # The exact URL shape persisted by _persist_reference_images must be
+        # servable end-to-end, not just stored in the manifest.
+        self.assertEqual(reference_response.status_code, 200)
+        self.assertEqual(reference_response.data, b"reference-bytes")
+
+    def test_result_file_route_rejects_traversal_history_ids(self):
+        result_dir = Path(self.tmp_dir.name) / "history"
+        self.image_service.result_dir = result_dir
+        result_dir.mkdir(parents=True)
+        secret = Path(self.tmp_dir.name) / "secret.txt"
+        secret.write_text("api-keys", encoding="utf-8")
+
+        response = self.client.get("/api/results/%2e%2e/secret.txt")
+
+        self.assertEqual(response.status_code, 404)
+        self.assertNotIn(b"api-keys", response.data)
+
     def test_sessions_route_accepts_utf8_bom_manifests(self):
         result_dir = Path(self.tmp_dir.name) / "history"
         self.image_service.result_dir = result_dir

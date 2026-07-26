@@ -32,8 +32,21 @@ def create_app() -> Flask:
     def health_check():
         return jsonify({"ok": True, "service": "img-Creater-backend"})
 
-    @app.get("/api/results/<history_id>/<filename>")
+    # ``<path:filename>`` is required because reference images live one level
+    # deeper (``<history_id>/references/<file>``); the default converter cannot
+    # match the ``/`` and every persisted reference URL would 404.
+    @app.get("/api/results/<history_id>/<path:filename>")
     def result_file(history_id: str, filename: str):
+        from .services.image_service import ImageService
+
+        # history_id is user-controlled and joined into the served directory;
+        # only accept ids that survive the same normalization used when the
+        # session directory was created (rejects ``..`` and friends).
+        if ImageService._normalize_history_id(history_id) != history_id:
+            return (
+                jsonify({"success": False, "error": {"message": "无效的会话 ID", "details": {}}}),
+                404,
+            )
         service = app.config.get("IMAGE_SERVICE")
         result_dir = getattr(service, "result_dir", None)
         if result_dir is None:
