@@ -35,13 +35,33 @@ stop_port_processes() {
   kill -9 $pids 2>/dev/null || true
 }
 
+# Fetch a URL body with a 2s timeout. Prefers curl; falls back to the venv
+# python (urllib) so curl-less systems don't fail the startup health probe.
+fetch_url() {
+  local url="$1"
+  if command -v curl >/dev/null 2>&1; then
+    curl -sf --max-time 2 "$url" 2>/dev/null || true
+  else
+    "$VENV_PYTHON" - "$url" 2>/dev/null <<'PYEOF' || true
+import sys
+import urllib.request
+
+try:
+    with urllib.request.urlopen(sys.argv[1], timeout=2) as resp:
+        sys.stdout.write(resp.read().decode("utf-8", "replace"))
+except Exception:
+    pass
+PYEOF
+  fi
+}
+
 wait_http() {
   local url="$1"
   local expected="${2:-}"
   local max_wait="${3:-30}"
   local body=""
   for _ in $(seq 1 "$max_wait"); do
-    body="$(curl -sf "$url" 2>/dev/null || true)"
+    body="$(fetch_url "$url")"
     if [ -n "$body" ]; then
       if [ -z "$expected" ] || printf '%s' "$body" | grep -q "$expected"; then
         return 0

@@ -58,6 +58,13 @@ def analyze(image_bytes: bytes, cfg: dict[str, Any]) -> dict[str, Any]:
         signals["skipped"] = "non-jpeg input"
         return {"score": None, "signals": signals, "evidence": [], "error": None}
 
+    # Bound memory on huge inputs: JPEG artifacts are local to 8x8 blocks, so
+    # an 8px-aligned central crop keeps the recompression-dip signal intact
+    # while capping the float64 buffers (resampling would destroy it instead).
+    if max(rgb.size) > _MAX_CROP_EDGE:
+        rgb = _central_crop(rgb, _MAX_CROP_EDGE)
+        signals["cropped"] = True
+
     qtable_score = _qtable_distance_score(np, img, jcfg)
     signals["qtable_distance_score"] = None if qtable_score is None else round(qtable_score, 4)
 
@@ -79,6 +86,18 @@ def analyze(image_bytes: bytes, cfg: dict[str, Any]) -> dict[str, Any]:
         evidence.append("检测到多次 JPEG 压缩历史（更偏向真实）")
 
     return {"score": round(score, 4), "signals": signals, "evidence": evidence, "error": None}
+
+
+_MAX_CROP_EDGE = 2048
+
+
+def _central_crop(rgb, max_edge):
+    w, h = rgb.size
+    cw, ch = min(w, max_edge), min(h, max_edge)
+    # Align to the JPEG 8x8 block grid so recompression sees original blocks.
+    left = ((w - cw) // 2) // 8 * 8
+    top = ((h - ch) // 2) // 8 * 8
+    return rgb.crop((left, top, left + cw, top + ch))
 
 
 def _qtable_distance_score(np, img, jcfg):

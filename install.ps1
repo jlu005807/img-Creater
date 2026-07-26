@@ -62,7 +62,9 @@ if (-not (Test-Path $venvPython)) {
 if (-not (Test-Path $venvPython)) { Fail "venv python not found at $venvPython" }
 
 Write-Step 'Installing backend dependencies'
-& $venvPython -m pip install --upgrade pip 2>$null
+# pip self-upgrade is decorative; on Windows PowerShell 5.1 native stderr with
+# 2>$null under EAP=Stop raises NativeCommandError, so never let it kill the install.
+try { & $venvPython -m pip install --upgrade pip 2>$null } catch {}
 & $venvPython -m pip install -r backend\requirements.txt
 if ($LASTEXITCODE -ne 0) { Fail 'Backend dependency installation failed.' }
 Write-Ok 'Backend dependencies installed'

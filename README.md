@@ -19,7 +19,7 @@ tip: 该项目为纯vibe coding产物，感谢 Opus4.8 以及 gpt5.5 的大力�
 - 多接入协议：每个节点默认使用 **自动尝试协议**，也可固定为 **OpenAI 兼容**（`/v1/images`）、**Chat Completions**（`/v1/chat/completions`）、**自定义 URL**（直接请求）或 **异步中转**（`/async/images`）。
 - 多 API 节点：支持新增、编辑、删除、启用/禁用和拖拽排序；返回时 `api_key` 自动脱敏。
 - Fallback 容灾：后台 worker 按节点优先级依次尝试，直到某个节点成功产出图片。
-- 状态轮询：前端每 4 秒轮询一次任务状态；OpenAI 兼容同步请求至少等待 180 秒，异步中转拿到 `task_id` 后持续轮询直到完成、失败或手动停止。
+- 状态轮询：前端每 4 秒轮询一次任务状态；OpenAI 兼容同步请求至少等待 180 秒，异步中转拿到 `task_id` 后持续轮询直到完成、失败、手动停止或达到约 15 分钟上限（后端 `async_max_wait`，默认 900 秒）。
 - 结果画廊：按实际宽高比完整展示（不裁剪），支持全屏灯箱预览与可靠的跨域下载。
 - 生成历史：左侧会话队列含实时状态标记，支持模糊搜索、时间筛选、失败重试覆盖、复用参数、回看结果；成功结果会按会话目录写入后端 `history/`。
 - 作品集：顶部「作品集」页面读取后端已完成会话，以照片墙展示所有成功图片，支持放大预览和下载。
@@ -302,7 +302,7 @@ GET  {base_url}/async/images/{task_id}   # 通用默认或上游 poll_url
 GET  {base_url}/async/task/{task_id}     # fnuu.net
 ```
 
-异步中转提交成功后必须返回 `task_id`（可选 `poll_url`）。后端只提交一次任务：通用中转按 `poll_url` 或 `/async/images/{task_id}` 轮询；`fnuu.net` 会按接入手册轮询 `/async/task/{task_id}`。单次轮询超时或临时非 JSON 不会再次提交任务，也不会切换协议或后续节点，除非上游明确返回 `failed`、结果下载失败或用户手动停止。完成时会从 `urls`、`result` 等字段取图，并保存到对应会话目录。
+异步中转提交成功后必须返回 `task_id`（可选 `poll_url`）。后端只提交一次任务：通用中转按 `poll_url` 或 `/async/images/{task_id}` 轮询；`fnuu.net` 会按接入手册轮询 `/async/task/{task_id}`。单次轮询超时或临时非 JSON 不会再次提交任务，也不会切换协议或后续节点，除非上游明确返回 `failed`、结果下载失败、用户手动停止或轮询达到 `async_max_wait` 上限（默认 900 秒 ≈ 15 分钟）。完成时会从 `urls`、`result` 等字段取图，并保存到对应会话目录。
 
 文生图可附带 `reference_images`（参考图）；局部编辑会区分干净原图、标注图和参考图。详细字段见 [docs/API.md](docs/API.md)。
 

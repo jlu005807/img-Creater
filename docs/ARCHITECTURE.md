@@ -49,6 +49,7 @@ backend/
   routes/
     configs.py
     generation.py
+    detection.py
     prompt_templates.py
   services/
     config_service.py
@@ -104,9 +105,25 @@ history/
 - `POST /api/generate`
 - `POST /api/edit`
 - `GET /api/status`
+- `POST /api/tasks/{task_id}/cancel`
 - `GET /api/sessions`
+- `DELETE /api/sessions/{history_id}`（破坏性：直接删除会话目录，无二次确认）
+- `DELETE /api/sessions`（破坏性：清空全部会话目录，无二次确认）
 - `GET /api/edit-drafts/{history_id}`
 - `PUT /api/edit-drafts/{history_id}`
+
+### `routes/detection.py`
+
+职责：
+
+- 作为可选 AI 生成检测模块（Beta）的唯一 HTTP 适配层
+- 惰性导入根目录 `detection/` 包；依赖缺失或模块损坏时优雅降级，不影响主应用启动
+- 在主机边界做输入校验（base64 解码、20MB / 50MP 上限、解压炸弹防护）
+
+接口包括：
+
+- `GET /api/detect/health`（能力探测，始终 `200`）
+- `POST /api/detect`（提交检测；模块无法导入时返回 `503`）
 
 ### `services/config_service.py`
 
@@ -131,7 +148,7 @@ history/
 - 在 worker 线程内按节点优先级容灾执行
 - 按节点 `api_type` 适配上游协议：
   - `openai`：`/v1/images/generations`（JSON）、`/v1/images/edits`（multipart），把 `b64_json`/`url` 规整为可展示链接；编辑时上传干净原图、彩色标注图和参考图，不发送 `mask`
-  - `async`：提交 `/async/images` 后在 worker 内轮询直至完成；`fnuu.net` 固定轮询 `/async/task/{task_id}`
+  - `async`：提交 `/async/images` 后在 worker 内轮询直至完成、失败或达到 `async_max_wait` 上限（默认 900 秒 ≈ 15 分钟）；`fnuu.net` 固定轮询 `/async/task/{task_id}`
 - 把状态/结果写入 `TaskStore`
 - 把完成结果与 `session.json` 写入 `history/<session-id>/`
 
@@ -258,6 +275,7 @@ User fills prompt and options
   -> Worker: try enabled providers in order
        openai -> POST {base}/v1/images/generations -> b64_json/url
        async  -> POST {base}/async/images then poll until completed
+                (bounded by async_max_wait, default 900s)
                 fnuu.net polls GET {base}/async/task/{task_id}
   -> Worker writes status/urls/attempts into TaskStore
   -> Frontend polls GET /api/status?task_id every 4s

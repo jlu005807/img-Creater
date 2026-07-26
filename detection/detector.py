@@ -59,19 +59,54 @@ def detect_image(image_bytes: bytes, *, filename: str = "") -> dict[str, Any]:
             return _assemble(final, stages, evidence, started, report, available=True)
 
     # ---- Stage 2: multi-signal analysis ----
+    # Pixel-statistics analyzers only need image statistics, so cap the long
+    # edge to bound their float64 working buffers (~5GB at the 50MP input cap
+    # otherwise). jpeg keeps the ORIGINAL bytes: its format/quantization-table/
+    # block-artifact signals don't survive resample+re-encode (it bounds its
+    # own memory via a central crop instead).
+    pixel_bytes, downscaled = _pixel_analysis_bytes(image_bytes)
     module_scores: dict[str, float | None] = {}
     for name in ("frequency", "noise", "jpeg", "color"):
-        result = _run_analyzer(name, image_bytes, cfg)
+        data = image_bytes if name == "jpeg" else pixel_bytes
+        result = _run_analyzer(name, data, cfg)
         stages[name] = result
         module_scores[name] = result.get("score")
         evidence.extend(result.get("evidence", []))
 
     # ---- Stage 3: fusion ----
     fused = fuse_scores(module_scores, cfg["weights"], cfg["thresholds"])
-    return _assemble(fused, stages, evidence, started, report, available=True)
+    return _assemble(fused, stages, evidence, started, report, available=True, downscaled=downscaled)
 
 
 # --------------------------------------------------------------------------
+
+
+_DOWNSCALE_LONG_EDGE = 2048
+
+
+def _pixel_analysis_bytes(image_bytes: bytes) -> tuple[bytes, bool]:
+    """Return (bytes for the pixel-statistics analyzers, downscaled flag).
+
+    Long edge is capped at 2048px and re-encoded as lossless PNG so no new
+    compression artifacts are injected. Metadata/watermark always receive the
+    original bytes elsewhere. Any failure falls back to the original bytes —
+    the analyzers already tolerate large input, just with more memory.
+    """
+    try:
+        import io
+
+        from PIL import Image
+
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            if max(img.size) <= _DOWNSCALE_LONG_EDGE:
+                return image_bytes, False
+            small = img.convert("RGB")
+            small.thumbnail((_DOWNSCALE_LONG_EDGE, _DOWNSCALE_LONG_EDGE), Image.LANCZOS)
+            buf = io.BytesIO()
+            small.save(buf, format="PNG")
+            return buf.getvalue(), True
+    except Exception:  # noqa: BLE001 - never fail detection over the optimization
+        return image_bytes, False
 
 
 def _run_analyzer(name: str, image_bytes: bytes, cfg: dict[str, Any]) -> dict[str, Any]:
@@ -83,7 +118,7 @@ def _run_analyzer(name: str, image_bytes: bytes, cfg: dict[str, Any]) -> dict[st
         return {"score": None, "signals": {}, "evidence": [], "error": f"{type(exc).__name__}: {exc}"}
 
 
-def _assemble(core, stages, evidence, started, report, *, available) -> dict[str, Any]:
+def _assemble(core, stages, evidence, started, report, *, available, downscaled=False) -> dict[str, Any]:
     out = {
         "available": available,
         "verdict": core["verdict"],
@@ -92,6 +127,7 @@ def _assemble(core, stages, evidence, started, report, *, available) -> dict[str
         "stages": stages,
         "evidence": evidence,
         "used_weights": core.get("used_weights", {}),
+        "downscaled": downscaled,
         "elapsed_ms": _elapsed(started),
         "missing_deps": report["missing_required"],
         "missing_optional": report["missing_optional"],
