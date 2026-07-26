@@ -21,6 +21,7 @@ from .task_store import TaskStore, task_store as default_task_store
 _VALID_QUALITY = {"auto", "low", "medium", "high"}
 DEFAULT_RESULT_DIR = Path(__file__).resolve().parents[2] / "history"
 KNOWN_ASYNC_RELAY_HOSTS = {"fnuu.net", "www.fnuu.net"}
+ASYNC_POLL_FAILURE_LIMIT = 8
 FNUU_MAX_IMAGE_BYTES = 12 * 1024 * 1024
 XAI_IMAGE_HOSTS = {"api.x.ai"}
 EDIT_REFERENCE_PROMPT_INSTRUCTION = (
@@ -98,7 +99,7 @@ class ImageService:
         request_timeout: int = 30,
         generation_timeout: int = 180,
         async_poll_interval: float = 3.0,
-        async_max_wait: int = 300,
+        async_max_wait: int = 900,
         store: TaskStore | None = None,
         run_async: bool = True,
         result_dir: str | Path | None = DEFAULT_RESULT_DIR,
@@ -119,6 +120,8 @@ class ImageService:
         self.run_async = run_async
         self.persist_results = persist_results
         self.result_dir = Path(result_dir) if result_dir is not None else DEFAULT_RESULT_DIR
+        self._manifest_locks: dict[str, threading.Lock] = {}
+        self._manifest_locks_guard = threading.Lock()
 
     # ------------------------------------------------------------------ submit
 
@@ -502,6 +505,9 @@ class ImageService:
                     except UpstreamTaskFailed:
                         raise
                     except Exception as async_exc:  # noqa: BLE001 - record async fallback failure
+                        if isinstance(async_exc, ProviderTimeoutError):
+                            # 提交可能已被上游接收，禁止再切换节点重复提交
+                            self._raise_upstream_timeout(async_candidate, async_exc)
                         last_error = async_exc
                 break
             except Exception as exc:  # noqa: BLE001 - caller records the final failure
@@ -517,33 +523,36 @@ class ImageService:
                     exc,
                 )
                 if isinstance(exc, ProviderTimeoutError):
-                    api_type = str(candidate.get("api_type") or "").strip().lower()
-                    message = (
-                        "异步中转提交任务超时，可能已被上游接收；已停止自动重试和切换节点以避免重复扣费"
-                        if api_type == "async"
-                        else "节点请求超时，可能已被上游接收；已停止自动重试和切换节点以避免重复扣费"
-                    )
-                    timeout_details = {
-                        "api_id": candidate["id"],
-                        "api_name": candidate["name"],
-                        "request_url": candidate.get("request_url"),
-                        "error": str(exc),
-                    }
-                    if isinstance(exc, ImageServiceError) and exc.details:
-                        timeout_details.update(exc.details)
-                        timeout_details["provider_error"] = str(exc)
-                        timeout_details["request_url"] = candidate.get("request_url")
-                    timeout_exc = UpstreamTaskFailed(
-                        message,
-                        status_code=504,
-                        details=timeout_details,
-                    )
-                    timeout_exc.provider = candidate
-                    timeout_exc.candidate = candidate
-                    raise timeout_exc
+                    self._raise_upstream_timeout(candidate, exc)
                 if attempt_index >= retries:
                     break
         return False, [], None, {}, last_error
+
+    def _raise_upstream_timeout(self, candidate: dict[str, Any], exc: Exception) -> None:
+        api_type = str(candidate.get("api_type") or "").strip().lower()
+        message = (
+            "异步中转提交任务超时，可能已被上游接收；已停止自动重试和切换节点以避免重复扣费"
+            if api_type == "async"
+            else "节点请求超时，可能已被上游接收；已停止自动重试和切换节点以避免重复扣费"
+        )
+        timeout_details = {
+            "api_id": candidate["id"],
+            "api_name": candidate["name"],
+            "request_url": candidate.get("request_url"),
+            "error": str(exc),
+        }
+        if isinstance(exc, ImageServiceError) and exc.details:
+            timeout_details.update(exc.details)
+            timeout_details["provider_error"] = str(exc)
+            timeout_details["request_url"] = candidate.get("request_url")
+        timeout_exc = UpstreamTaskFailed(
+            message,
+            status_code=504,
+            details=timeout_details,
+        )
+        timeout_exc.provider = candidate
+        timeout_exc.candidate = candidate
+        raise timeout_exc
 
     def _provider_mode_candidates(self, provider: dict[str, Any]) -> list[dict[str, Any]]:
         modes = provider.get("modes")
@@ -998,7 +1007,7 @@ class ImageService:
             raise ProviderRequestError(
                 "OpenAI 响应缺少图片数据 (data)",
                 status_code=502,
-                details={"api_id": provider["id"], "api_name": provider["name"], "response": data},
+                details={"api_id": provider["id"], "api_name": provider["name"], "response": self._compact_error_payload(data)},
             )
         default_format = str(data.get("output_format") or "png").lower()
         urls: list[str] = []
@@ -1019,7 +1028,7 @@ class ImageService:
             raise ProviderRequestError(
                 "OpenAI 响应中没有可用的图片 (b64_json/url)",
                 status_code=502,
-                details={"api_id": provider["id"], "api_name": provider["name"], "response": data},
+                details={"api_id": provider["id"], "api_name": provider["name"], "response": self._compact_error_payload(data)},
             )
         return urls
 
@@ -1085,6 +1094,8 @@ class ImageService:
             }
 
         response = self._http_post(f"{base}/async/images", **post_kwargs)
+        # 提交成功后开始计时；超过 async_max_wait 则停止轮询（任务可能仍在上游计费）。
+        poll_start = time.monotonic()
         data = self._parse_response_json(response, provider)
         self._ensure_success_status(response, data, provider)
         submit_data = self._unwrap_response_data_object(data)
@@ -1119,10 +1130,35 @@ class ImageService:
             )
 
         poll_count = 0
+        consecutive_poll_failures = 0
+
+        def raise_poll_abort(message: str, last_error: Any) -> None:
+            failed = UpstreamTaskFailed(
+                message,
+                status_code=504,
+                details={
+                    "api_id": provider["id"],
+                    "api_name": provider["name"],
+                    "upstream_task_id": str(upstream_task_id),
+                    "poll_urls": poll_urls,
+                    "last_poll_url": poll_url,
+                    "error": str(last_error or ""),
+                },
+            )
+            failed.provider = provider
+            failed.candidate = provider
+            raise failed
+
         while True:
             task_id = str(payload.get("_task_id") or "").strip()
             if task_id and self.store.is_cancelled(task_id):
                 raise TaskCancelled()
+            if time.monotonic() - poll_start > self.async_max_wait:
+                raise_poll_abort(
+                    f"异步任务等待超过 {self.async_max_wait} 秒仍未完成，已停止轮询；"
+                    "上游任务可能仍在计费，请稍后在中转站确认",
+                    None,
+                )
             poll_count += 1
 
             def handle_poll_error(exc: ProviderRequestError) -> bool:
@@ -1169,7 +1205,14 @@ class ImageService:
                     headers=self._auth_headers(provider),
                     timeout=self._provider_timeout(provider),
                 )
-            except ProviderTimeoutError:
+            except ProviderTimeoutError as exc:
+                consecutive_poll_failures += 1
+                if consecutive_poll_failures >= ASYNC_POLL_FAILURE_LIMIT:
+                    raise_poll_abort(
+                        f"异步任务连续 {ASYNC_POLL_FAILURE_LIMIT} 次轮询失败，已停止轮询；"
+                        f"上游任务可能仍在计费，请稍后在中转站确认: {exc}",
+                        exc,
+                    )
                 if task_id:
                     self.store.update(task_id, poll_count=poll_count, last_poll_status="timeout")
                 time.sleep(self.async_poll_interval)
@@ -1177,7 +1220,14 @@ class ImageService:
             try:
                 status_data = self._parse_response_json(status_response, provider)
             except ProviderRequestError as exc:
-                handle_poll_error(exc)
+                if not handle_poll_error(exc):
+                    consecutive_poll_failures += 1
+                    if consecutive_poll_failures >= ASYNC_POLL_FAILURE_LIMIT:
+                        raise_poll_abort(
+                            f"异步任务连续 {ASYNC_POLL_FAILURE_LIMIT} 次轮询失败，已停止轮询；"
+                            f"上游任务可能仍在计费，请稍后在中转站确认: {exc}",
+                            exc,
+                        )
                 time.sleep(self.async_poll_interval)
                 continue
             status_data = self._unwrap_response_data_object(status_data)
@@ -1186,9 +1236,17 @@ class ImageService:
                 try:
                     self._ensure_success_status(status_response, status_data, provider)
                 except ProviderRequestError as exc:
-                    handle_poll_error(exc)
+                    if not handle_poll_error(exc):
+                        consecutive_poll_failures += 1
+                        if consecutive_poll_failures >= ASYNC_POLL_FAILURE_LIMIT:
+                            raise_poll_abort(
+                                f"异步任务连续 {ASYNC_POLL_FAILURE_LIMIT} 次轮询失败，已停止轮询；"
+                                f"上游任务可能仍在计费，请稍后在中转站确认: {exc}",
+                                exc,
+                            )
                     time.sleep(self.async_poll_interval)
                     continue
+            consecutive_poll_failures = 0
             if task_id:
                 self.store.update(
                     task_id,
@@ -1202,7 +1260,7 @@ class ImageService:
                     exc = UpstreamTaskFailed(
                         "上游任务已完成但未返回图片 URL",
                         status_code=502,
-                        details={"api_id": provider["id"], "api_name": provider["name"], "upstream": status_data},
+                        details={"api_id": provider["id"], "api_name": provider["name"], "upstream": self._compact_error_payload(status_data)},
                     )
                     exc.provider = provider
                     exc.candidate = provider
@@ -1213,7 +1271,7 @@ class ImageService:
                 exc = UpstreamTaskFailed(
                     message or "上游任务失败",
                     status_code=502,
-                    details={"api_id": provider["id"], "api_name": provider["name"], "upstream": status_data},
+                    details={"api_id": provider["id"], "api_name": provider["name"], "upstream": self._compact_error_payload(status_data)},
                 )
                 exc.provider = provider
                 exc.candidate = provider
@@ -1485,7 +1543,6 @@ class ImageService:
             "content_type": content_type,
             "parse_error": str(parse_error),
             "text_preview": text[:1000],
-            "text": getattr(response, "text", ""),
             "is_html_response": is_html,
         }
         if server:
@@ -1608,6 +1665,18 @@ class ImageService:
             },
         )
 
+    @classmethod
+    def _compact_error_payload(cls, value: Any) -> Any:
+        """Deep-copy an upstream payload for error details, truncating huge
+        strings (e.g. b64_json) so /api/status and session.json stay small."""
+        if isinstance(value, dict):
+            return {key: cls._compact_error_payload(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [cls._compact_error_payload(item) for item in value]
+        if isinstance(value, str) and len(value) > 2000:
+            return f"{value[:200]}…(截断 {len(value) - 200} 字符)"
+        return value
+
     @staticmethod
     def _is_poll_not_found_error(exc: Exception) -> bool:
         if not isinstance(exc, ImageServiceError):
@@ -1711,7 +1780,17 @@ class ImageService:
             return urls
         persisted: list[str] = []
         for index, url in enumerate(urls):
-            persisted.append(self._persist_one_result(provider, history_id, url, index))
+            try:
+                persisted.append(self._persist_one_result(provider, history_id, url, index))
+            except Exception as exc:  # noqa: BLE001 - 生成已成功，落盘失败时保留原始 URL 而不是整体失败
+                logger.warning(
+                    "[image] result persist failed history_id=%s index=%d url=%s error=%s",
+                    history_id,
+                    index,
+                    url if not str(url).startswith("data:") else "data:...",
+                    exc,
+                )
+                persisted.append(url)
         return persisted
 
     def _persist_reference_images(self, history_id: str, refs: list[str]) -> list[str]:
@@ -1794,39 +1873,57 @@ class ImageService:
     ) -> None:
         if not self.persist_results:
             return
-        now = self._now()
-        target_dir = self.result_dir / str(session_id)
-        target_dir.mkdir(parents=True, exist_ok=True)
-        manifest_path = target_dir / "session.json"
-        previous: dict[str, Any] = {}
-        if manifest_path.exists():
-            try:
-                loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    previous = loaded
-            except Exception:
-                previous = {}
-        manifest = {
-            "id": str(session_id),
-            "task_id": task_id,
-            "prompt": payload.get("prompt", ""),
-            "mode": operation,
-            "size": payload.get("size"),
-            "n": payload.get("n"),
-            "status": status,
-            "urls": urls,
-            "reference_images": reference_images,
-            "api_id": provider.get("id"),
-            "api_name": provider.get("name"),
-            "attempts": attempts,
-            "expires_at": expires_at,
-            "response_meta": response_meta or {},
-            "created_at": previous.get("created_at") or now,
-            "updated_at": now,
-        }
-        tmp_path = manifest_path.with_suffix(".json.tmp")
-        tmp_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        tmp_path.replace(manifest_path)
+        with self._manifest_lock(str(session_id)):
+            now = self._now()
+            target_dir = self.result_dir / str(session_id)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            manifest_path = target_dir / "session.json"
+            previous: dict[str, Any] = {}
+            if manifest_path.exists():
+                try:
+                    loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        previous = loaded
+                except Exception:
+                    previous = {}
+            if status != "completed" and previous.get("status") == "completed" and previous.get("urls"):
+                # 新的一次提交失败/未完成时不清掉已成功的结果，只在附加字段里
+                # 记录最近一次尝试，避免会话从 /api/sessions 列表里消失。
+                manifest = dict(previous)
+                manifest["last_task_id"] = task_id
+                manifest["last_status"] = status
+                manifest["last_error"] = (response_meta or {}).get("error") or None
+                manifest["last_attempts"] = attempts
+            else:
+                manifest = {
+                    "id": str(session_id),
+                    "task_id": task_id,
+                    "prompt": payload.get("prompt", ""),
+                    "mode": operation,
+                    "size": payload.get("size"),
+                    "n": payload.get("n"),
+                    "status": status,
+                    "urls": urls,
+                    "reference_images": reference_images,
+                    "api_id": provider.get("id"),
+                    "api_name": provider.get("name"),
+                    "attempts": attempts,
+                    "expires_at": expires_at,
+                    "response_meta": response_meta or {},
+                    "created_at": previous.get("created_at") or now,
+                    "updated_at": now,
+                }
+            tmp_path = manifest_path.with_name(f"session.json.{uuid.uuid4().hex}.tmp")
+            tmp_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            tmp_path.replace(manifest_path)
+
+    def _manifest_lock(self, session_id: str) -> threading.Lock:
+        with self._manifest_locks_guard:
+            lock = self._manifest_locks.get(session_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._manifest_locks[session_id] = lock
+            return lock
 
     def _persist_failed_session_manifest(
         self,
@@ -2021,7 +2118,7 @@ class ImageService:
         raise ProviderRequestError(
             "Chat Completions 响应中未找到图片数据 (data/output/choices)",
             status_code=502,
-            details={"api_id": provider["id"], "api_name": provider["name"], "response": data},
+            details={"api_id": provider["id"], "api_name": provider["name"], "response": self._compact_error_payload(data)},
         )
 
     # --------------------------------------------------------------- normalize
@@ -2078,8 +2175,10 @@ class ImageService:
             return []
         if not isinstance(value, list):
             raise GenerationValidationError("reference_images 必须是数组", status_code=400)
+        if len(value) > 8:
+            raise GenerationValidationError("参考图数量不能超过 8 张", status_code=400)
         refs: list[str] = []
-        for item in value[:8]:
+        for item in value:
             text = str(item or "").strip()
             if not text:
                 continue

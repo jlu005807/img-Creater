@@ -547,7 +547,7 @@ class OpenAIProviderTests(TestCase):
             self.assertEqual(result["status"], "failed")
             self.assertIn("合法 JSON", result["attempts"][0]["error"])
             details = result["attempts"][0]["details"]
-            self.assertIn("https://status.example.com/help", details["text"])
+            self.assertNotIn("text", details)
             self.assertIn("https://status.example.com/help", details["text_preview"])
             self.assertIn("Expecting value", details["parse_error"])
             self.assertIn("content_type", details)
@@ -2761,7 +2761,7 @@ class AsyncRelayProviderTests(TestCase):
                     FakeResponse(200, {"status": "completed", "urls": ["https://cdn.example.com/a.png"]}),
                 ],
             )
-            service = _service(config_service, http_client, async_max_wait=0)
+            service = _service(config_service, http_client, async_max_wait=60)
 
             original_monotonic = time.monotonic
             try:
@@ -2984,7 +2984,98 @@ class AsyncRelayProviderTests(TestCase):
 
             self.assertEqual(result["status"], "failed")
             self.assertIn("合法 JSON", result["attempts"][0]["error"])
-            self.assertIn("<html>upstream error</html>", result["attempts"][0]["details"]["text"])
+            self.assertIn("<html>upstream error</html>", result["attempts"][0]["details"]["text_preview"])
+
+    def test_inline_async_fallback_timeout_stops_all_further_submissions(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "Auto",
+                    "base_url": "https://auto.example.com",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "auto",
+                    "status": True,
+                }
+            )
+            config_service.create_config(
+                {
+                    "name": "Backup",
+                    "base_url": "https://backup.example.com",
+                    "api_key": "key-2",
+                    "model": "gpt-image-2",
+                    "api_type": "openai",
+                    "status": True,
+                }
+            )
+            # openai 尝试要求改用 /async/images，内联 async 提交超时——
+            # 任务可能已被上游接收，绝不能继续尝试后续候选/节点重复提交。
+            http_client = FakeHttpClient(
+                post_responses=[
+                    FakeResponse(
+                        503,
+                        {"error": {"message": "use POST /async/images", "code": "use_async_images"}},
+                    ),
+                    Timeout("async submit timed out"),
+                ]
+            )
+            service = _service(config_service, http_client)
+
+            submit = service.submit_generation(prompt="a red house", size="1024x1024", n=1)
+            result = service.poll_generation_status(task_id=submit["task_id"])
+
+            self.assertEqual(result["status"], "failed")
+            self.assertIn("重复扣费", result["error"])
+            self.assertEqual(
+                [call[0] for call in http_client.posts],
+                [
+                    "https://auto.example.com/v1/images/generations",
+                    "https://auto.example.com/async/images",
+                ],
+            )
+
+    def test_failed_resubmission_keeps_previous_completed_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+            config_service.create_config(
+                {
+                    "name": "Primary",
+                    "base_url": "https://api.example.com",
+                    "api_key": "key-1",
+                    "model": "gpt-image-2",
+                    "api_type": "openai",
+                    "status": True,
+                }
+            )
+            result_dir = Path(tmp_dir) / "history"
+            http_client = FakeHttpClient(
+                post_responses=[
+                    FakeResponse(200, {"data": [{"b64_json": "QUJD"}]}),
+                    FakeResponse(500, {"error": {"message": "boom"}}),
+                ]
+            )
+            service = _service(config_service, http_client, result_dir=result_dir)
+
+            first = service.submit_generation(
+                prompt="a red house", size="1024x1024", n=1, history_id="sess-keep"
+            )
+            first_result = service.poll_generation_status(task_id=first["task_id"])
+            self.assertEqual(first_result["status"], "completed")
+            completed_urls = first_result["urls"]
+
+            second = service.submit_generation(
+                prompt="a blue house", size="1024x1024", n=1, history_id="sess-keep"
+            )
+            second_result = service.poll_generation_status(task_id=second["task_id"])
+            self.assertEqual(second_result["status"], "failed")
+
+            manifest = json.loads((result_dir / "sess-keep" / "session.json").read_text(encoding="utf-8"))
+            # 重新生成失败不能清掉上一次成功的结果，会话必须仍出现在作品集里。
+            self.assertEqual(manifest["status"], "completed")
+            self.assertEqual(manifest["urls"], completed_urls)
+            self.assertEqual(manifest["last_status"], "failed")
+            self.assertEqual(manifest["last_task_id"], second["task_id"])
 
     def test_async_relay_completed_without_urls_fails_without_trying_paid_fallbacks(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -3159,7 +3250,7 @@ class AsyncRelayProviderTests(TestCase):
                 ["https://fnuu.net/async/task/up-1", "https://cdn.example.com/fnuu.png"],
             )
 
-    def test_async_relay_result_download_failure_fails_without_paid_fallbacks(self):
+    def test_async_relay_result_download_failure_keeps_remote_url_without_paid_fallbacks(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
             config_service.create_config(
@@ -3204,17 +3295,18 @@ class AsyncRelayProviderTests(TestCase):
             )
             result = service.poll_generation_status(task_id=submit["task_id"])
 
-            self.assertEqual(result["status"], "failed")
-            self.assertIn("结果下载失败", result["error"])
+            # 生成已经成功计费：落盘失败时保留可用的远端 URL 完成任务，
+            # 且绝不能为此再向备用节点付费重试。
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["urls"], ["https://cdn.example.com/fnuu.png"])
             self.assertEqual([call[0] for call in http_client.posts], ["https://fnuu.net/async/images"])
             self.assertEqual(
                 [call[0] for call in http_client.gets],
                 ["https://fnuu.net/async/task/up-1", "https://cdn.example.com/fnuu.png"],
             )
             manifest = json.loads((result_dir / "session-fnuu" / "session.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["status"], "failed")
-            self.assertEqual(manifest["urls"], [])
-            self.assertIn("结果下载失败", manifest["response_meta"]["error"])
+            self.assertEqual(manifest["status"], "completed")
+            self.assertEqual(manifest["urls"], ["https://cdn.example.com/fnuu.png"])
 
     def test_cancelled_async_task_does_not_fallback_to_another_protocol_or_node(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
