@@ -29,12 +29,10 @@ function referenceImagesForSession(session) {
 // only remote URLs are persisted; data: results stay in memory for this session.
 function sanitizeForStorage(entries) {
   return entries.map((entry) => {
-    const urls = entry.urls || []
     return {
       ...entry,
-      urls: persistedUrlList(urls),
+      urls: persistedUrlList(entry.urls),
       referenceImages: persistedUrlList(entry.referenceImages),
-      imageCount: urls.length,
       editDraft: undefined,
     }
   })
@@ -50,11 +48,9 @@ function persist() {
 
 export function useGenerationHistory() {
   function addEntry(entry) {
-    const urls = entry.urls || []
     const item = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       time: Date.now(),
-      imageCount: urls.length,
       _status: 'queued',
       ...entry,
     }
@@ -105,7 +101,6 @@ export function useGenerationHistory() {
         urls,
         referenceImages: referenceImagesForSession(session),
         apiName: session.api_name || '',
-        imageCount: urls.length,
         time: Date.parse(session.updated_at || session.created_at || '') || Date.now(),
         _status: 'completed',
         task: session.task_id ? { taskId: session.task_id, apiId: session.api_id, apiName: session.api_name } : null,
