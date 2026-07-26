@@ -151,6 +151,21 @@ def save_edit_draft(history_id: str):
         payload = _json_payload()
         if not payload:
             raise ImageServiceError("局部编辑草稿不能为空", status_code=400)
+        # 增量保存：payload 不带原图（image 缺失/为 null/为空）且磁盘上已有草稿时，
+        # 把新字段合并到已存草稿上（保留原图和 payload 未携带的字段）。合并在服务端完成、
+        # 落盘始终是完整草稿结构，因此 GET 对旧版整包草稿和合并后草稿的读取方式完全一致。
+        # 磁盘上没有旧草稿时按原样存储（首次保存仍应由前端携带完整草稿）。
+        if not payload.get("image") and draft_path.exists():
+            try:
+                with draft_path.open("r", encoding="utf-8-sig") as fh:
+                    existing = json.load(fh)
+            except (OSError, ValueError):
+                existing = None
+            if isinstance(existing, dict):
+                incremental = dict(payload)
+                # 空的 image 字段不能覆盖已存原图。
+                incremental.pop("image", None)
+                payload = {**existing, **incremental}
         draft_path.parent.mkdir(parents=True, exist_ok=True)
         with draft_path.open("w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False)

@@ -51,6 +51,8 @@ let undoStack = []
 let pendingSnapshot = null
 let pendingSnapshotCommitted = false
 let imageRevision = 0
+// Monotonic counter for lightweight mask-change emissions (see emitMaskState).
+let maskRevision = 0
 let redrawPending = false
 let resizeObserver = null
 let observedZoomCanvas = null
@@ -586,6 +588,8 @@ function exportDraft() {
     image: imageDataUrl.value,
     imageWidth: imageElement.width,
     imageHeight: imageElement.height,
+    // 原图版本号：原图未变化时父组件据此做增量保存，不再重复上传 base64 原图。
+    imageRevision,
     mask: maskCanvas.toDataURL('image/png'),
     hasMask: hasMask.value,
     tool: tool.value,
@@ -640,16 +644,17 @@ function clearAll() {
   emitMaskState()
 }
 
+// Per-stroke emissions stay lightweight: no mask PNG encode, no base64 image.
+// The parent pulls the heavy draft via exportDraft() on demand (debounced flush).
 function emitMaskState() {
+  maskRevision += 1
   emit('mask-change', {
     hasImage: Boolean(imageDataUrl.value),
     hasMask: hasMask.value,
     imageWidth: imageElement?.width || null,
     imageHeight: imageElement?.height || null,
     imageRevision,
-    markerColor: markerColor.value,
-    markerColorLabel: markerColorLabel.value,
-    draft: exportDraft(),
+    maskRevision,
   })
 }
 

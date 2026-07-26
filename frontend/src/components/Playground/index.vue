@@ -27,6 +27,7 @@ const POLL_INTERVAL_MS = 4000
 const POLL_FAILURE_LIMIT = 5
 const TASK_EXPIRED_MESSAGE = '任务已过期或后端已重启，请重新生成'
 const DRAFT_KEY = 'studio-form-draft'
+const EDIT_DRAFT_FLUSH_MS = 3000
 const HISTORY_WIDTH = '276px'
 
 const form = reactive({
@@ -150,8 +151,13 @@ const clockNow = ref(Date.now())
 
 const pollTimers = new Map()
 const pollFailures = new Map()
-const draftSaveTimers = new Map()
 let clockTimer = null
+// 局部编辑草稿的本地工作缓冲：画布本身持有内容，这里只记录“有未落盘改动”的脏标记
+// 和一个防抖定时器；到期/切换/提交时才调用 exportDraft() 拉取重草稿并持久化。
+let editDraftFlushTimer = null
+let editDraftDirty = false
+// 每个会话节点最近一次成功上传完整原图时的 imageRevision：原图未变化时增量保存可省略 base64 原图。
+const savedDraftImageRevisions = new Map()
 // Set on unmount so late-resolving awaits cannot re-arm timers in a dead instance.
 let disposed = false
 
@@ -458,8 +464,7 @@ function clearTimers() {
   pollTimers.forEach((timer) => window.clearTimeout(timer))
   pollTimers.clear()
   pollFailures.clear()
-  draftSaveTimers.forEach((timer) => window.clearTimeout(timer))
-  draftSaveTimers.clear()
+  discardEditDraftBuffer()
   if (clockTimer) window.clearInterval(clockTimer)
   clockTimer = null
 }
@@ -470,10 +475,11 @@ function clearPollTimer(entryId) {
   pollTimers.delete(entryId)
 }
 
-function clearDraftSaveTimer(entryId) {
-  const timer = draftSaveTimers.get(entryId)
-  if (timer) window.clearTimeout(timer)
-  draftSaveTimers.delete(entryId)
+// 丢弃本地草稿缓冲：切换到其它会话、提交成功或删除当前会话后调用。
+function discardEditDraftBuffer() {
+  if (editDraftFlushTimer) window.clearTimeout(editDraftFlushTimer)
+  editDraftFlushTimer = null
+  editDraftDirty = false
 }
 
 function startClock() {
@@ -559,6 +565,9 @@ async function submitTask(reuseId = null) {
   }
   displayHistoryId.value = entryId
   if (editDraft) {
+    // 草稿已随本次提交挂到该记录上（对已完成记录的再编辑即 clone-on-edit 的新记录），
+    // 本地缓冲随提交结束。
+    discardEditDraftBuffer()
     persistEditDraftNow(entryId, editDraft)
   }
   startClock()
@@ -877,9 +886,8 @@ function onMaskChange(nextState) {
   if (!nextState?.hasImage) {
     syncedEditImageRevision.value = 0
   }
-  if (!restoringEditDraft.value && mode.value === 'edit' && displayHistoryId.value && nextState?.draft) {
-    updateEntry(displayHistoryId.value, { editDraft: nextState.draft })
-    scheduleEditDraftSave(displayHistoryId.value, nextState.draft)
+  if (!restoringEditDraft.value && mode.value === 'edit' && nextState?.hasImage) {
+    scheduleEditDraftFlush()
   }
 }
 
@@ -890,30 +898,48 @@ async function downloadOne(url, index) {
   }
 }
 
+// Flush the local draft buffer: pull the heavy draft from the editor once and
+// persist it onto the currently displayed NOT-yet-completed entry. Completed
+// entries are clone-on-edit — their proven draft must stay intact, so the
+// buffer stays dirty until submit attaches it to a new entry (or the buffer
+// dies on recall of a different entry).
 function persistCurrentEditDraft() {
-  if (mode.value !== 'edit' || !displayHistoryId.value) return
+  if (editDraftFlushTimer) window.clearTimeout(editDraftFlushTimer)
+  editDraftFlushTimer = null
+  if (!editDraftDirty) return
+  const entry = findHistoryEntry(displayHistoryId.value)
+  // 已完成的历史记录不能被工作草稿覆盖：保留缓冲，提交时挂到新记录上。
+  if (!entry || entry._status === 'completed') return
   const draft = regionEditorRef.value?.exportDraft?.()
+  editDraftDirty = false
   if (!draft) return
-  updateEntry(displayHistoryId.value, { editDraft: draft })
-  persistEditDraftNow(displayHistoryId.value, draft)
+  updateEntry(entry.id, { editDraft: draft })
+  persistEditDraftNow(entry.id, draft)
 }
 
-function scheduleEditDraftSave(entryId, draft) {
-  if (!entryId || !draft) return
-  clearDraftSaveTimer(entryId)
-  draftSaveTimers.set(
-    entryId,
-    window.setTimeout(() => {
-      draftSaveTimers.delete(entryId)
-      persistEditDraftNow(entryId, draft)
-    }, 500),
-  )
+// 每一笔只标脏并重置防抖：到期后统一拉取一次 exportDraft() 再持久化。
+function scheduleEditDraftFlush() {
+  editDraftDirty = true
+  if (editDraftFlushTimer) window.clearTimeout(editDraftFlushTimer)
+  editDraftFlushTimer = window.setTimeout(() => {
+    editDraftFlushTimer = null
+    persistCurrentEditDraft()
+  }, EDIT_DRAFT_FLUSH_MS)
 }
 
 async function persistEditDraftNow(entryId, draft) {
   if (!entryId || !draft) return
+  const imageRevision = Number(draft.imageRevision || 0)
+  const skipImage =
+    Boolean(draft.image) && imageRevision > 0 && savedDraftImageRevisions.get(entryId) === imageRevision
+  const payload = { ...draft }
+  if (skipImage) {
+    // 原图未变化：增量保存只带 mask/元数据，后端与已存草稿合并，避免重复上传整幅 base64 原图。
+    delete payload.image
+  }
   try {
-    await saveEditDraft(entryId, draft)
+    await saveEditDraft(entryId, payload)
+    if (!skipImage && imageRevision > 0) savedDraftImageRevisions.set(entryId, imageRevision)
   } catch {
     // Draft persistence is best-effort; generation history remains usable.
   }
@@ -941,14 +967,19 @@ async function restoreEditDraftForEntry(entry) {
 
 // ---- history actions ----
 async function recallHistory(entry) {
+  const sameEntry = entry.id === displayHistoryId.value
+  // 重复点击当前会话时保留画布上的未落盘改动；切换到其它会话则丢弃本地缓冲，
+  // 之后再召回原纪录时看到的仍是其原始草稿。
+  const keepWorkingCanvas = sameEntry && editDraftDirty
   persistCurrentEditDraft()
+  if (!sameEntry) discardEditDraftBuffer()
   displayHistoryId.value = entry.id
   form.prompt = entry.prompt || ''
   if (entry.size) parseSize(entry.size)
   referenceImages.value = Array.isArray(entry.referenceImages) ? [...entry.referenceImages] : []
   if (entry.mode) mode.value = entry.mode
   if (entry.mode === 'edit') {
-    await restoreEditDraftForEntry(entry)
+    if (!keepWorkingCanvas) await restoreEditDraftForEntry(entry)
   } else {
     regionEditorRef.value?.clearAll?.()
     maskState.value = { hasImage: false, hasMask: false }
@@ -971,7 +1002,8 @@ async function deleteHistory(entry) {
       }
     }
     clearPollTimer(entry.id)
-    clearDraftSaveTimer(entry.id)
+    if (displayHistoryId.value === entry.id) discardEditDraftBuffer()
+    savedDraftImageRevisions.delete(entry.id)
     try {
       await deleteSession(entry.id)
     } catch {
@@ -995,6 +1027,7 @@ async function deleteHistory(entry) {
 
 function newConversation() {
   persistCurrentEditDraft()
+  discardEditDraftBuffer()
   displayHistoryId.value = null
   form.prompt = ''
   mode.value = 'generate'
@@ -1012,6 +1045,7 @@ async function clearAllHistory() {
       cancelButtonText: '取消',
     })
     clearTimers()
+    savedDraftImageRevisions.clear()
     const runningTasks = history.value.filter((entry) => isRunningStatus(entry._status) && entry.task?.taskId)
     if (runningTasks.length) {
       await Promise.allSettled(runningTasks.map((entry) => cancelGenerationTask(entry.task.taskId)))
@@ -1033,6 +1067,7 @@ async function clearAllHistory() {
 // Retry a failed entry with the same params and overwrite it (no new entry).
 async function retryHistory(entry) {
   persistCurrentEditDraft()
+  discardEditDraftBuffer()
   form.prompt = entry.prompt || ''
   if (entry.size) parseSize(entry.size)
   referenceImages.value = Array.isArray(entry.referenceImages) ? [...entry.referenceImages] : []
@@ -1119,6 +1154,8 @@ onMounted(async () => {
 })
 onBeforeUnmount(() => {
   disposed = true
+  // 卸载前落盘一次未保存的草稿（仅限未完成的编辑上下文，见 persistCurrentEditDraft）。
+  persistCurrentEditDraft()
   clearTimers()
   window.removeEventListener('pointermove', moveMonitor)
   window.removeEventListener('pointermove', moveResult)

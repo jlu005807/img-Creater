@@ -254,6 +254,64 @@ class BackendRouteTests(TestCase):
         self.assertEqual(read_response.status_code, 200)
         self.assertEqual(read_response.get_json()["data"], draft)
 
+    def test_edit_draft_incremental_put_merges_over_stored_full_draft(self):
+        """PUT without image merges over the stored draft, preserving the original image.
+
+        The merge happens server-side and the on-disk shape stays a complete
+        draft, so GET reads old full drafts and merged drafts identically.
+        """
+        self.image_service.result_dir = Path(self.tmp_dir.name) / "history"
+        full_draft = {
+            "version": 1,
+            "fileName": "source.png",
+            "image": "data:image/png;base64,aW1hZ2U=",
+            "imageRevision": 1,
+            "mask": "data:image/png;base64,bWFzaw==",
+            "tool": "brush",
+            "brushSize": 42,
+            "markerColor": "#ffffff",
+        }
+        first_response = self.client.put("/api/edit-drafts/history-1", json=full_draft)
+        self.assertEqual(first_response.status_code, 200)
+
+        incremental = {
+            "version": 1,
+            "image": "",
+            "imageRevision": 1,
+            "mask": "data:image/png;base64,bmV3bWFzaw==",
+            "tool": "rect",
+        }
+        second_response = self.client.put("/api/edit-drafts/history-1", json=incremental)
+        self.assertEqual(second_response.status_code, 200)
+
+        merged = self.client.get("/api/edit-drafts/history-1").get_json()["data"]
+        # Stored image survives an image-less save; empty image must not clobber it.
+        self.assertEqual(merged["image"], "data:image/png;base64,aW1hZ2U=")
+        self.assertEqual(merged["mask"], "data:image/png;base64,bmV3bWFzaw==")
+        self.assertEqual(merged["tool"], "rect")
+        # Fields the incremental payload omitted survive the merge.
+        self.assertEqual(merged["fileName"], "source.png")
+        self.assertEqual(merged["brushSize"], 42)
+        self.assertEqual(merged["markerColor"], "#ffffff")
+
+    def test_edit_draft_incremental_put_without_existing_draft_stores_payload_as_is(self):
+        """An image-less PUT with no draft on disk stores the payload as sent.
+
+        Chosen policy: 200 + store-as-is (not 400) for forward-compat with
+        clients that legitimately track image-less drafts; restore treats a
+        draft without an image as empty, so nothing breaks downstream.
+        """
+        self.image_service.result_dir = Path(self.tmp_dir.name) / "history"
+
+        response = self.client.put(
+            "/api/edit-drafts/history-slim",
+            json={"version": 1, "mask": "data:image/png;base64,bWFzaw=="},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        stored = self.client.get("/api/edit-drafts/history-slim").get_json()["data"]
+        self.assertEqual(stored, {"version": 1, "mask": "data:image/png;base64,bWFzaw=="})
+
     def test_missing_edit_draft_returns_null(self):
         self.image_service.result_dir = Path(self.tmp_dir.name) / "history"
 
