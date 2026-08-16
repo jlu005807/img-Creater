@@ -1,4 +1,5 @@
 import tempfile
+import json
 from pathlib import Path
 from unittest import TestCase, main
 
@@ -448,6 +449,136 @@ class BackendRouteTests(TestCase):
 
         self.assertEqual(all_response.status_code, 200)
         self.assertFalse((result_dir / "history-2").exists())
+
+class SessionPaginationContractTests(TestCase):
+    """Stage 0 contract tests for the planned pagination API."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.config_service = ConfigService(config_path=Path(self.tmp_dir.name) / "configs.json")
+        self.image_service = FakeImageService()
+        self.app = create_app()
+        self.app.config.update(TESTING=True, CONFIG_SERVICE=self.config_service, IMAGE_SERVICE=self.image_service)
+        self.client = self.app.test_client()
+
+    def tearDown(self):
+        self.tmp_dir.cleanup()
+
+    def _create_session(self, result_dir, name, prompt="test", updated_at=None, created_at=None):
+        session_dir = result_dir / name
+        session_dir.mkdir(parents=True)
+        (session_dir / "image.png").write_bytes(b"image")
+        manifest = {
+            "id": name, "prompt": prompt, "mode": "generate", "size": "1024x1024",
+            "status": "completed", "urls": [f"/api/results/{name}/image.png"],
+            "created_at": created_at or f"2026-01-01T00:00:0{name[-1]}Z",
+            "updated_at": updated_at or f"2026-01-01T00:00:0{name[-1]}Z",
+        }
+        (session_dir / "session.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+        return manifest
+
+    def test_legacy_no_params_returns_array(self):
+        result_dir = Path(self.tmp_dir.name) / "history"
+        self.image_service.result_dir = result_dir
+        self._create_session(result_dir, "h-1")
+        response = self.client.get("/api/sessions")
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()["data"]
+        self.assertIsInstance(data, list)
+        self.assertEqual(len(data), 1)
+
+    def test_pagination_response_shape(self):
+        result_dir = Path(self.tmp_dir.name) / "history"
+        self.image_service.result_dir = result_dir
+        for i in range(5):
+            self._create_session(result_dir, f"h-{i}", updated_at=f"2026-01-01T00:00:0{i}Z", created_at=f"2026-01-01T00:00:0{i}Z")
+        response = self.client.get("/api/sessions?limit=2")
+        data = response.get_json()["data"]
+        self.assertIsInstance(data, dict)
+        self.assertIn("items", data)
+        self.assertIn("has_more", data)
+        self.assertIn("next_cursor", data)
+        self.assertIsInstance(data["items"], list)
+        self.assertLessEqual(len(data["items"]), 2)
+        self.assertTrue(data["has_more"])
+
+    def test_pagination_cursor_stability(self):
+        result_dir = Path(self.tmp_dir.name) / "history"
+        self.image_service.result_dir = result_dir
+        for i in range(6):
+            self._create_session(result_dir, f"h-{i}", updated_at=f"2026-01-01T00:00:0{i}Z", created_at=f"2026-01-01T00:00:0{i}Z")
+        first = self.client.get("/api/sessions?limit=3")
+        first_data = first.get_json()["data"]
+        self.assertTrue(first_data["has_more"])
+        cursor = first_data["next_cursor"]
+        self.assertIsNotNone(cursor)
+        second = self.client.get(f"/api/sessions?limit=3&cursor={cursor}")
+        second_data = second.get_json()["data"]
+        first_ids = {item["id"] for item in first_data["items"]}
+        second_ids = {item["id"] for item in second_data["items"]}
+        self.assertEqual(first_ids & second_ids, set(), "Pages should not overlap")
+
+    def test_bad_manifest_is_skipped_not_500(self):
+        result_dir = Path(self.tmp_dir.name) / "history"
+        self.image_service.result_dir = result_dir
+        good_dir = result_dir / "good-1"
+        good_dir.mkdir(parents=True)
+        (good_dir / "image.png").write_bytes(b"image")
+        (good_dir / "session.json").write_text(json.dumps({"id": "good-1", "prompt": "ok", "mode": "generate", "size": "1024x1024", "status": "completed", "urls": ["/api/results/good-1/image.png"], "created_at": "2026-01-01T00:00:01Z", "updated_at": "2026-01-01T00:00:01Z"}, ensure_ascii=False), encoding="utf-8")
+        bad_dir = result_dir / "bad-1"
+        bad_dir.mkdir(parents=True)
+        (bad_dir / "image.png").write_bytes(b"image")
+        (bad_dir / "session.json").write_text("NOT VALID JSON {{{", encoding="utf-8")
+        response = self.client.get("/api/sessions")
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()["data"]
+        if isinstance(data, list):
+            ids = [item["id"] for item in data]
+        else:
+            ids = [item["id"] for item in data["items"]]
+        self.assertIn("good-1", ids)
+        self.assertNotIn("bad-1", ids)
+
+    def test_limit_out_of_range_returns_400(self):
+        result_dir = Path(self.tmp_dir.name) / "history"
+        self.image_service.result_dir = result_dir
+        self._create_session(result_dir, "h-1")
+        resp_zero = self.client.get("/api/sessions?limit=0")
+        self.assertEqual(resp_zero.status_code, 400)
+        resp_huge = self.client.get("/api/sessions?limit=101")
+        self.assertEqual(resp_huge.status_code, 400)
+
+    def test_invalid_cursor_returns_400(self):
+        result_dir = Path(self.tmp_dir.name) / "history"
+        self.image_service.result_dir = result_dir
+        self._create_session(result_dir, "h-1")
+        response = self.client.get("/api/sessions?limit=10&cursor=!!!invalid!!!")
+        self.assertEqual(response.status_code, 400)
+
+    def test_last_page_has_no_more(self):
+        result_dir = Path(self.tmp_dir.name) / "history"
+        self.image_service.result_dir = result_dir
+        for i in range(3):
+            self._create_session(result_dir, f"h-{i}", updated_at=f"2026-01-01T00:00:0{i}Z", created_at=f"2026-01-01T00:00:0{i}Z")
+        response = self.client.get("/api/sessions?limit=10")
+        data = response.get_json()["data"]
+        self.assertFalse(data["has_more"])
+        self.assertIsNone(data["next_cursor"])
+
+    def test_summary_response_omits_large_fields(self):
+        result_dir = Path(self.tmp_dir.name) / "history"
+        self.image_service.result_dir = result_dir
+        session_dir = result_dir / "h-1"
+        session_dir.mkdir(parents=True)
+        (session_dir / "image.png").write_bytes(b"image")
+        manifest = {"id": "h-1", "prompt": "test", "mode": "generate", "size": "1024x1024", "status": "completed", "urls": ["/api/results/h-1/image.png"], "created_at": "2026-01-01T00:00:01Z", "updated_at": "2026-01-01T00:00:01Z", "attempts": [{"api_id": "x", "ok": True}], "response_meta": {"key": "value"}}
+        (session_dir / "session.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+        response = self.client.get("/api/sessions?limit=10")
+        data = response.get_json()["data"]
+        item = data["items"][0]
+        self.assertNotIn("attempts", item)
+        self.assertNotIn("response_meta", item)
+
 
 
 if __name__ == "__main__":

@@ -322,9 +322,94 @@ POST /api/tasks/{task_id}/cancel
 GET /api/sessions
 ```
 
-读取后端 `history/<会话ID>/session.json`，返回所有已完成且有图片的会话。作品集页面使用该接口渲染照片墙。
+读取后端 `history/<会话ID>/session.json`，返回已完成且有图片的会话。作品集页面使用该接口渲染照片墙。
+
+#### 分页查询参数
+
+```http
+GET /api/sessions?limit=30&cursor=<opaque>&q=<search>&sort=updated_desc
+```
+
+| 参数 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `limit` | int | 30 | 每页数量，范围 1-100，超出范围返回 400 |
+| `cursor` | string | 无 | 不透明游标，内部编码排序键，前端不应解析其格式 |
+| `q` | string | 无 | 在 `prompt` 中做子串搜索（服务端执行） |
+| `from` | ISO 8601 | 无 | 按 `updated_at`/`created_at` 过滤起始时间 |
+| `to` | ISO 8601 | 无 | 按 `updated_at`/`created_at` 过滤结束时间 |
+| `sort` | string | `updated_desc` | 目前仅支持 `updated_desc` |
+
+**向后兼容**：不带任何查询参数时，接口返回完整数组（旧版行为）。带上 `limit` 或 `cursor` 时，返回分页对象。
+
+**分页响应**：
+
+```json
+{
+  "items": [
+    {
+      "id": "session-id",
+      "prompt": "短提示文本",
+      "mode": "generate",
+      "size": "1024x1024",
+      "n": 1,
+      "status": "completed",
+      "images": [
+        {
+          "index": 0,
+          "url": "/api/results/session-id/image.png",
+          "filename": "image.png",
+          "session_id": "session-id"
+        }
+      ],
+      "reference_images": [],
+      "api_name": "Primary",
+      "created_at": "2026-08-15T00:00:00Z",
+      "updated_at": "2026-08-15T00:00:00Z",
+      "expires_at": null
+    }
+  ],
+  "next_cursor": "opaque-cursor-or-null",
+  "has_more": true
+}
+```
+
+**游标规则**：游标至少包含最后一条记录的排序键 `(updated_at 或 created_at, id)`。下一页查询严格取排序键小于该游标的记录。无效游标返回 400。逐目录读取 manifest 时，单个 JSON 损坏、权限错误或并发写入时记录 warning 并跳过，不会导致整个请求 500。
+
+**列表字段约束**：分页列表只返回展示和选择所需的摘要及图片元数据，默认省略 `attempts`、`response_meta` 等大字段。`prompt` 在列表中有长度上限；完整 `prompt` 可在详情或复用操作时按需读取。`urls` 字段在过渡期继续返回，前端通过 mapper 兼容旧数据。
+
+不带分页参数时，`has_more` 和 `next_cursor` 不存在，前端通过 mapper 同时兼容"数组"和"分页对象"两种形态。
 
 同一会话重新生成失败（或排队/取消）时，manifest 不会清掉上一次成功的结果：顶层仍保留 `status: "completed"` 与原有 `urls`，最近一次尝试的信息记录在附加字段 `last_task_id`、`last_status`、`last_error`、`last_attempts` 中，因此该会话在本接口与作品集中不会消失。
+
+### 6.2 批量导出（草案）
+
+```http
+POST /api/sessions/export
+Content-Type: application/json
+```
+
+请求体：
+
+```json
+{
+  "items": [
+    {"session_id": "session-id", "image_index": 0},
+    {"session_id": "session-id", "image_index": 1}
+  ]
+}
+```
+
+**安全要求**：
+
+- 只接受 `session_id` 和 `image_index`，不接受任意 URL、绝对路径或用户提供的文件名。
+- 服务端从对应 `session.json` 的 `urls`/`images` 解析目标，并确认目标属于该 history 目录。
+- 只允许本地已持久化的 `/api/results` 文件；manifest 中仍是远程 URL 的项默认跳过并返回失败明细。
+- 校验 history id、索引、扩展名、MIME、单文件大小、总大小和总数量。
+- ZIP 临时文件或流式输出完成后清理；响应设置 `application/zip` 和安全的 `Content-Disposition`。
+- 生成失败项不能泄露服务器路径；只返回 `session_id`、`image_index` 和可读错误原因。
+- 部分文件被跳过时，ZIP 内附 `export-report.json`；若没有任何成功文件，返回结构化 JSON 错误而非空 ZIP。
+
+此接口为后续阶段实现，当前文档先行约定。
 
 ### 6.2 删除会话
 
