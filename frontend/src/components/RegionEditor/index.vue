@@ -41,6 +41,7 @@ const zoomOpen = ref(false)
 let imageElement = null
 let maskCanvas = null
 let maskContext = null
+let restoreGeneration = 0
 let drawing = false
 let startPoint = null
 let lastPoint = null
@@ -100,18 +101,22 @@ function onDrop(event) {
 function readImageFile(file) {
   if (!file) return
   if (!file.type.startsWith('image/')) { ElMessage.warning('请选择图片文件'); return }
+  const token = ++restoreGeneration
   const reader = new FileReader()
   reader.onerror = () => { ElMessage.error('无法读取该图片文件，可能是浏览器不支持的格式') }
   reader.onload = () => {
+    if (token !== restoreGeneration) return
     const img = new Image()
     img.onerror = () => { ElMessage.error('无法读取该图片文件，可能是浏览器不支持的格式') }
     img.onload = async () => {
+      if (token !== restoreGeneration) return
       imageDataUrl.value = reader.result
       fileName.value = file.name
       imageElement = img
       imageRevision += 1
       initMaskCanvas()
       await nextTick()
+      if (token !== restoreGeneration) return
       drawScene()
       emitMaskState()
     }
@@ -132,7 +137,7 @@ function initMaskCanvas() {
   canUndo.value = false
 }
 
-async function loadImageDataUrl(dataUrl, nextFileName = '') {
+async function loadImageDataUrl(dataUrl, nextFileName = '', token = restoreGeneration) {
   if (!dataUrl) return false
   const img = new Image()
   await new Promise((resolve, reject) => {
@@ -140,12 +145,14 @@ async function loadImageDataUrl(dataUrl, nextFileName = '') {
     img.onerror = reject
     img.src = dataUrl
   })
+  if (token !== restoreGeneration) return false
   imageDataUrl.value = dataUrl
   fileName.value = nextFileName || fileName.value || 'restored-image'
   imageElement = img
   imageRevision += 1
   initMaskCanvas()
   await nextTick()
+  if (token !== restoreGeneration) return false
   drawScene()
   emitMaskState()
   return true
@@ -600,11 +607,12 @@ function exportDraft() {
 }
 
 async function restoreDraft(draft) {
+  const token = ++restoreGeneration
   if (!draft?.image) {
     clearAll()
     return false
   }
-  const restored = await loadImageDataUrl(draft.image, draft.fileName || '')
+  const restored = await loadImageDataUrl(draft.image, draft.fileName || '', token)
   if (!restored) return false
 
   if (draft.mask && maskContext) {
@@ -614,9 +622,11 @@ async function restoreDraft(draft) {
       maskImage.onerror = reject
       maskImage.src = draft.mask
     })
+    if (token !== restoreGeneration) return false
     maskContext.clearRect(0, 0, PANEL_WIDTH, PANEL_HEIGHT)
     maskContext.drawImage(maskImage, 0, 0, PANEL_WIDTH, PANEL_HEIGHT)
   }
+  if (token !== restoreGeneration) return false
   tool.value = ['brush', 'rect', 'eraser'].includes(draft.tool) ? draft.tool : 'brush'
   brushSize.value = Number.isFinite(Number(draft.brushSize)) ? Number(draft.brushSize) : 42
   markerColor.value = normalizeMarkerColor(draft.markerColor)
@@ -633,6 +643,7 @@ async function restoreDraft(draft) {
 }
 
 function clearAll() {
+  restoreGeneration += 1
   imageDataUrl.value = ''
   fileName.value = ''
   imageElement = null
@@ -762,6 +773,7 @@ onMounted(() => {
   drawScene()
 })
 onBeforeUnmount(() => {
+  restoreGeneration += 1
   resizeObserver?.disconnect()
   resizeObserver = null
   observedZoomCanvas = null

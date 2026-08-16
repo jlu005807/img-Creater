@@ -14,7 +14,10 @@ import {
 } from '../../api/generation'
 import { backendRouteMissingMessage, isBackendRouteMissing } from '../../api/client'
 import { downloadImage } from '../../utils/download'
+import { createHistoryInteractionGuard } from '../../utils/historyInteraction'
+import { historyTimeBounds } from '../../utils/sessionHistory'
 import { useGenerationHistory } from '../../composables/useGenerationHistory'
+import { useInfiniteScrollSentinel } from '../../composables/useInfiniteScrollSentinel'
 import { useSettings } from '../../composables/useSettings'
 import { usePromptTemplates } from '../../composables/usePromptTemplates'
 import RegionEditor from '../RegionEditor/index.vue'
@@ -29,6 +32,8 @@ const TASK_EXPIRED_MESSAGE = '任务已过期或后端已重启，请重新生�
 const DRAFT_KEY = 'studio-form-draft'
 const EDIT_DRAFT_FLUSH_MS = 3000
 const HISTORY_WIDTH = '276px'
+const HISTORY_PAGE_SIZE = 30
+const SESSION_SUMMARY_PROMPT_MAX = 4000
 
 const form = reactive({
   prompt: '',
@@ -144,14 +149,27 @@ const {
   updateEntry,
   removeEntry,
   clearHistory: clearStoredHistory,
-  loadPersistedSessions,
+  invalidateSessionRequests,
+  refreshSessions,
+  ensureSessions,
+  ensureSessionDetails,
+  loadMoreSessions,
+  retrySessions,
+  initialLoading,
+  loadingMore,
+  loadError,
+  serverResultsCurrent,
+  hasMore,
 } = useGenerationHistory()
 const displayHistoryId = ref(null)
 const clockNow = ref(Date.now())
+const historyScrollRef = ref(null)
+const historySentinelRef = ref(null)
 
 const pollTimers = new Map()
 const pollFailures = new Map()
 let clockTimer = null
+const historyInteraction = createHistoryInteractionGuard()
 // 局部编辑草稿的本地工作缓冲：画布本身持有内容，这里只记录“有未落盘改动”的脏标记
 // 和一个防抖定时器；到期/切换/提交时才调用 exportDraft() 拉取重草稿并持久化。
 let editDraftFlushTimer = null
@@ -160,6 +178,15 @@ let editDraftDirty = false
 const savedDraftImageRevisions = new Map()
 // Set on unmount so late-resolving awaits cannot re-arm timers in a dead instance.
 let disposed = false
+
+function beginHistoryInteraction() {
+  restoringEditDraft.value = false
+  return historyInteraction.begin()
+}
+
+function isCurrentHistoryInteraction(token) {
+  return !disposed && historyInteraction.isCurrent(token)
+}
 
 function isRunningStatus(value) {
   return ['submitting', 'queued', 'processing'].includes(value)
@@ -171,6 +198,10 @@ function isStoppedStatus(value) {
 
 function findHistoryEntry(id) {
   return history.value.find((entry) => entry.id === id) || null
+}
+
+function isCurrentHistoryEntry(entry, token) {
+  return Boolean(entry?.id) && isCurrentHistoryInteraction(token) && Boolean(findHistoryEntry(entry.id))
 }
 
 const activeEntry = computed(() => findHistoryEntry(displayHistoryId.value))
@@ -379,19 +410,78 @@ function stopResultDrag() {
 // ---- history search + time filter ----
 const historyQuery = ref('')
 const historyTimeFilter = ref('all') // all | today | week | month
-const historySort = ref('time_desc') // time_desc | time_asc | prompt_asc | prompt_desc
 const historyTimeOptions = [
   { value: 'all', label: '全部' },
   { value: 'today', label: '今天' },
   { value: 'week', label: '本周' },
   { value: 'month', label: '本月' },
 ]
-const historySortOptions = [
-  { value: 'time_desc', label: '最新' },
-  { value: 'time_asc', label: '最早' },
-  { value: 'prompt_asc', label: '提示词 A-Z' },
-  { value: 'prompt_desc', label: '提示词 Z-A' },
-]
+function historyServerParams() {
+  const bounds = historyTimeBounds(historyTimeFilter.value)
+  return {
+    q: historyQuery.value.trim(),
+    from: bounds.from,
+    to: bounds.to,
+    limit: HISTORY_PAGE_SIZE,
+  }
+}
+
+function historyServerQueryKey(params = historyServerParams()) {
+  return JSON.stringify([
+    historyQuery.value.trim(),
+    historyTimeFilter.value,
+    params.from || null,
+  ])
+}
+
+let historyFilterTimer = null
+
+async function refreshHistorySessions() {
+  try {
+    const params = historyServerParams()
+    await refreshSessions(params, { queryKey: historyServerQueryKey(params) })
+  } catch {
+    // The inline retry state keeps the current local/live entries usable.
+  }
+}
+
+function scheduleHistoryRefresh() {
+  invalidateSessionRequests()
+  clearTimeout(historyFilterTimer)
+  historyFilterTimer = setTimeout(() => {
+    historyFilterTimer = null
+    refreshHistorySessions()
+  }, 300)
+}
+
+watch([historyQuery, historyTimeFilter], scheduleHistoryRefresh)
+
+const canLoadMoreHistory = computed(
+  () => hasMore.value && !initialLoading.value && !loadingMore.value && !loadError.value,
+)
+
+async function loadNextHistoryPage() {
+  try {
+    await loadMoreSessions()
+  } catch {
+    // The shared store keeps the failed cursor for the Retry command.
+  }
+}
+
+async function retryHistoryLoad() {
+  try {
+    await retrySessions()
+  } catch {
+    // Keep the current list and Retry command visible.
+  }
+}
+
+useInfiniteScrollSentinel({
+  rootRef: historyScrollRef,
+  sentinelRef: historySentinelRef,
+  enabled: canLoadMoreHistory,
+  onIntersect: loadNextHistoryPage,
+})
 
 function withinTimeFilter(ts) {
   if (historyTimeFilter.value === 'all') return true
@@ -418,16 +508,16 @@ const historyItems = computed(() => {
   const q = historyQuery.value.trim().toLowerCase()
   return history.value
     .filter((entry) => {
+      // A successful server refresh already applied q/from against the full
+      // manifest (including prompts longer than the summary cap). While a
+      // refresh is pending, or failed, apply the local predicate so stale
+      // server rows do not masquerade as results for the new query.
+      if (entry._origin === 'server' && serverResultsCurrent.value) return true
       if (!withinTimeFilter(entry.time)) return false
       if (q && !(entry.prompt || '').toLowerCase().includes(q)) return false
       return true
     })
-    .sort((a, b) => {
-      if (historySort.value === 'time_asc') return Number(a.time || 0) - Number(b.time || 0)
-      if (historySort.value === 'prompt_asc') return String(a.prompt || '').localeCompare(String(b.prompt || ''))
-      if (historySort.value === 'prompt_desc') return String(b.prompt || '').localeCompare(String(a.prompt || ''))
-      return Number(b.time || 0) - Number(a.time || 0)
-    })
+    .sort((a, b) => Number(b.time || 0) - Number(a.time || 0))
     .map((entry) => {
       return { ...entry, _status: entry._status || 'completed' }
     })
@@ -521,6 +611,7 @@ async function submitTask(reuseId = null) {
     }
     editDraft = regionEditorRef.value?.exportDraft?.()
   }
+  beginHistoryInteraction()
   const currentReferenceImages = [...referenceImages.value]
   isSubmitting.value = true
 
@@ -962,28 +1053,56 @@ async function persistEditDraftNow(entryId, draft) {
   }
 }
 
-async function restoreEditDraftForEntry(entry) {
+async function restoreEditDraftForEntry(entry, token) {
+  if (!isCurrentHistoryEntry(entry, token)) return false
   restoringEditDraft.value = true
   try {
     let draft = entry.editDraft || null
     if (!draft) {
       draft = await getEditDraft(entry.id)
+      if (!isCurrentHistoryEntry(entry, token)) return false
       if (draft) updateEntry(entry.id, { editDraft: draft })
     }
+    if (!isCurrentHistoryEntry(entry, token)) return false
     if (draft) {
       await regionEditorRef.value?.restoreDraft?.(draft)
+      if (!isCurrentHistoryEntry(entry, token)) return false
     } else {
       regionEditorRef.value?.clearAll?.()
     }
+    return true
   } catch {
+    if (!isCurrentHistoryEntry(entry, token)) return false
     regionEditorRef.value?.clearAll?.()
+    return false
   } finally {
-    restoringEditDraft.value = false
+    if (isCurrentHistoryEntry(entry, token)) restoringEditDraft.value = false
   }
 }
 
 // ---- history actions ----
+async function resolveHistoryEntryForReuse(entry, token) {
+  if (!isCurrentHistoryEntry(entry, token)) return null
+  if (!entry || entry._origin !== 'server' || entry._detailsLoaded) return entry
+  try {
+    const resolved = await ensureSessionDetails(entry.id)
+    return isCurrentHistoryEntry(resolved, token) ? resolved : null
+  } catch (error) {
+    if (!isCurrentHistoryEntry(entry, token)) return null
+    if (String(entry.prompt || '').length >= SESSION_SUMMARY_PROMPT_MAX) {
+      ElMessage.error('完整历史参数加载失败，为避免使用被截断的 Prompt，本次未切换，请重试')
+      return null
+    }
+    ElMessage.warning(error.message || '完整历史参数加载失败，已使用当前摘要')
+    return entry
+  }
+}
+
 async function recallHistory(entry) {
+  const token = beginHistoryInteraction()
+  entry = await resolveHistoryEntryForReuse(entry, token)
+  if (!isCurrentHistoryEntry(entry, token)) return
+  if (!entry) return
   const sameEntry = entry.id === displayHistoryId.value
   // 重复点击当前会话时保留画布上的未落盘改动；切换到其它会话则丢弃本地缓冲，
   // 之后再召回原纪录时看到的仍是其原始草稿。
@@ -996,7 +1115,8 @@ async function recallHistory(entry) {
   referenceImages.value = Array.isArray(entry.referenceImages) ? [...entry.referenceImages] : []
   if (entry.mode) mode.value = entry.mode
   if (entry.mode === 'edit') {
-    if (!keepWorkingCanvas) await restoreEditDraftForEntry(entry)
+    if (!keepWorkingCanvas) await restoreEditDraftForEntry(entry, token)
+    if (!isCurrentHistoryEntry(entry, token)) return
   } else {
     regionEditorRef.value?.clearAll?.()
     maskState.value = { hasImage: false, hasMask: false }
@@ -1013,6 +1133,7 @@ async function deleteHistory(entry) {
     })
     // historyItems 传入的是渲染时的浅拷贝；确认框打开期间提交可能刚拿到
     // taskId，必须按当前活动条目决定是否取消。
+    beginHistoryInteraction()
     const live = findHistoryEntry(entry.id) || entry
     if (isRunningStatus(live._status) && live.task?.taskId) {
       try {
@@ -1029,8 +1150,9 @@ async function deleteHistory(entry) {
     } catch {
       ElMessage.warning('后端会话目录删除失败，本地记录已移除')
     }
+    const removedDisplayedEntry = displayHistoryId.value === entry.id
     removeEntry(entry.id)
-    if (displayHistoryId.value === entry.id) {
+    if (removedDisplayedEntry) {
       const nextEntry = history.value[0] || null
       displayHistoryId.value = null
       if (nextEntry) {
@@ -1046,6 +1168,7 @@ async function deleteHistory(entry) {
 }
 
 function newConversation() {
+  beginHistoryInteraction()
   persistCurrentEditDraft()
   discardEditDraftBuffer()
   displayHistoryId.value = null
@@ -1064,6 +1187,7 @@ async function clearAllHistory() {
       confirmButtonText: '删除全部',
       cancelButtonText: '取消',
     })
+    beginHistoryInteraction()
     clearTimers()
     savedDraftImageRevisions.clear()
     const runningTasks = history.value.filter((entry) => isRunningStatus(entry._status) && entry.task?.taskId)
@@ -1086,6 +1210,10 @@ async function clearAllHistory() {
 
 // Retry a failed entry with the same params and overwrite it (no new entry).
 async function retryHistory(entry) {
+  const token = beginHistoryInteraction()
+  entry = await resolveHistoryEntryForReuse(entry, token)
+  if (!isCurrentHistoryEntry(entry, token)) return
+  if (!entry) return
   persistCurrentEditDraft()
   discardEditDraftBuffer()
   form.prompt = entry.prompt || ''
@@ -1094,7 +1222,8 @@ async function retryHistory(entry) {
   if (entry.mode) mode.value = entry.mode
   if (entry.mode === 'edit') {
     displayHistoryId.value = entry.id
-    await restoreEditDraftForEntry(entry)
+    await restoreEditDraftForEntry(entry, token)
+    if (!isCurrentHistoryEntry(entry, token)) return
   }
   submitTask(entry.id)
 }
@@ -1166,7 +1295,8 @@ watch([() => form.prompt, () => form.size, mode], () => {
 
 onMounted(async () => {
   try {
-    await loadPersistedSessions()
+    const params = historyServerParams()
+    await ensureSessions(params, { queryKey: historyServerQueryKey(params) })
   } catch (error) {
     ElMessage.warning(error.message || '后端历史会话加载失败，仅显示本地历史')
   }
@@ -1174,6 +1304,8 @@ onMounted(async () => {
 })
 onBeforeUnmount(() => {
   disposed = true
+  historyInteraction.invalidate()
+  clearTimeout(historyFilterTimer)
   // 卸载前落盘一次未保存的草稿（仅限未完成的编辑上下文，见 persistCurrentEditDraft）。
   persistCurrentEditDraft()
   clearTimers()
@@ -1184,6 +1316,10 @@ onBeforeUnmount(() => {
 watch(
   history,
   (items) => {
+    if (displayHistoryId.value && !items.some((item) => item.id === displayHistoryId.value)) {
+      displayHistoryId.value = items[0]?.id || null
+      return
+    }
     if (!displayHistoryId.value && items.length) {
       displayHistoryId.value = items[0].id
     }
@@ -1222,7 +1358,7 @@ watch(
       </div>
 
       <!-- Search + time filter -->
-      <div v-if="history.length" class="space-y-2 border-b border-[var(--studio-line)] px-3 py-2">
+      <div v-if="history.length || historyQuery || historyTimeFilter !== 'all'" class="space-y-2 border-b border-[var(--studio-line)] px-3 py-2">
         <el-input v-model="historyQuery" size="small" clearable placeholder="搜索提示词…" />
         <div class="flex gap-1">
           <button
@@ -1238,13 +1374,13 @@ watch(
             {{ opt.label }}
           </button>
         </div>
-        <el-select v-model="historySort" size="small" class="w-full" placeholder="排序">
-          <el-option v-for="opt in historySortOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
-        </el-select>
       </div>
 
-      <div class="thin-scrollbar flex-1 overflow-auto">
-        <div v-if="!history.length" class="flex min-h-[120px] items-center justify-center px-4 text-xs text-[var(--studio-muted)]">
+      <div ref="historyScrollRef" class="thin-scrollbar flex-1 overflow-auto">
+        <div v-if="initialLoading && !historyItems.length" class="flex min-h-[120px] items-center justify-center px-4 text-xs text-[var(--studio-muted)]">
+          正在加载历史记录…
+        </div>
+        <div v-else-if="!history.length && !historyQuery && historyTimeFilter === 'all'" class="flex min-h-[120px] items-center justify-center px-4 text-xs text-[var(--studio-muted)]">
           暂无历史记录，提交一次生成后出现
         </div>
         <div v-else-if="!historyItems.length" class="flex min-h-[120px] items-center justify-center px-4 text-center text-xs text-[var(--studio-muted)]">
@@ -1291,6 +1427,14 @@ watch(
             </div>
           </div>
         </div>
+        <div ref="historySentinelRef" class="h-px" aria-hidden="true"></div>
+        <div v-if="initialLoading" class="px-4 py-3 text-center text-xs text-[var(--studio-muted)]">正在刷新历史记录…</div>
+        <div v-else-if="loadingMore" class="px-4 py-3 text-center text-xs text-[var(--studio-muted)]">正在加载更多记录…</div>
+        <div v-else-if="loadError" class="flex items-center justify-center gap-2 px-3 py-3 text-center text-xs text-[var(--studio-coral)]">
+          <span class="min-w-0 truncate" :title="loadError.message">{{ loadError.message || '历史记录加载失败' }}</span>
+          <button type="button" class="shrink-0 font-bold text-[var(--studio-teal)] hover:underline" @click="retryHistoryLoad">重试</button>
+        </div>
+        <div v-else-if="!hasMore && history.length" class="px-4 py-3 text-center text-xs text-[var(--studio-muted)]">已加载全部记录</div>
       </div>
     </aside>
 

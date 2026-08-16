@@ -2,41 +2,75 @@
 import { computed, onMounted, ref } from 'vue'
 import { Download, Picture, Refresh } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
-import { listSessions } from '../../api/generation'
-import { backendRouteMissingMessage, isBackendRouteMissing } from '../../api/client'
+import { useGenerationHistory } from '../../composables/useGenerationHistory'
+import { useInfiniteScrollSentinel } from '../../composables/useInfiniteScrollSentinel'
 import { downloadImage } from '../../utils/download'
 
-const loading = ref(false)
-const sessions = ref([])
+const {
+  history,
+  refreshSessions,
+  ensureSessions,
+  loadMoreSessions,
+  retrySessions,
+  initialLoading,
+  loadingMore,
+  loadError,
+  hasMore,
+} = useGenerationHistory()
+
+const galleryScrollRef = ref(null)
+const gallerySentinelRef = ref(null)
+const canLoadMore = computed(
+  () => hasMore.value && !initialLoading.value && !loadingMore.value && !loadError.value,
+)
 
 const images = computed(() => {
-  return sessions.value.flatMap((session) => {
-    const list = Array.isArray(session.images) ? session.images : []
-    return list.map((image, index) => ({
-      ...image,
-      key: `${session.id}-${index}-${image.url}`,
-      prompt: session.prompt || '',
-      mode: session.mode || 'generate',
-      size: session.size || '',
-      updatedAt: session.updated_at || session.created_at || '',
-      sessionId: session.id,
-    }))
-  })
+  return history.value
+    .filter((session) => (session.status || session._status) === 'completed')
+    .flatMap((session) => {
+      const list = Array.isArray(session.images) ? session.images : []
+      return list.map((image) => ({
+        ...image,
+        prompt: session.prompt || '',
+        mode: session.mode || 'generate',
+        size: session.size || '',
+        updatedAt: session.updatedAt || session.createdAt || '',
+      }))
+    })
 })
 
 const previewUrls = computed(() => images.value.map((item) => item.url))
 
 async function loadGallery() {
-  loading.value = true
   try {
-    const data = await listSessions()
-    sessions.value = Array.isArray(data) ? data : []
-  } catch (error) {
-    ElMessage.error(isBackendRouteMissing(error) ? backendRouteMissingMessage('作品集') : error.message || '作品集加载失败')
-  } finally {
-    loading.value = false
+    await refreshSessions()
+  } catch {
+    // The shared inline state keeps the failed request retryable.
   }
 }
+
+async function loadNextGalleryPage() {
+  try {
+    await loadMoreSessions()
+  } catch {
+    // The shared inline state keeps the failed cursor retryable.
+  }
+}
+
+async function retryGalleryLoad() {
+  try {
+    await retrySessions()
+  } catch {
+    // Keep the current cards and retry command visible.
+  }
+}
+
+useInfiniteScrollSentinel({
+  rootRef: galleryScrollRef,
+  sentinelRef: gallerySentinelRef,
+  enabled: canLoadMore,
+  onIntersect: loadNextGalleryPage,
+})
 
 async function downloadOne(item, index) {
   const ok = await downloadImage(item.url, `img-Creater-${item.sessionId}-${index + 1}`)
@@ -54,7 +88,13 @@ function formatTime(value) {
   }
 }
 
-onMounted(loadGallery)
+onMounted(async () => {
+  try {
+    await ensureSessions({})
+  } catch {
+    // The shared inline state keeps the failed request retryable.
+  }
+})
 </script>
 
 <template>
@@ -65,12 +105,16 @@ onMounted(loadGallery)
           <p class="text-xs font-semibold uppercase tracking-[0.16em] text-[var(--studio-teal)]">Gallery</p>
           <h2 class="mt-1 text-2xl font-black">作品集</h2>
         </div>
-        <el-button :icon="Refresh" :loading="loading" @click="loadGallery">刷新</el-button>
+        <el-button :icon="Refresh" :loading="initialLoading" @click="loadGallery">刷新</el-button>
       </div>
     </div>
 
-    <div v-loading="loading" class="studio-panel thin-scrollbar min-h-0 flex-1 overflow-auto rounded-lg p-5">
-      <div v-if="!images.length && !loading" class="flex h-full min-h-[360px] items-center justify-center rounded-md border border-dashed border-[var(--studio-line)] bg-[var(--studio-surface-soft)] text-center">
+    <div
+      ref="galleryScrollRef"
+      v-loading="initialLoading && !images.length"
+      class="studio-panel thin-scrollbar min-h-0 flex-1 overflow-auto rounded-lg p-5"
+    >
+      <div v-if="!images.length && !initialLoading && !loadError" class="flex h-full min-h-[360px] items-center justify-center rounded-md border border-dashed border-[var(--studio-line)] bg-[var(--studio-surface-soft)] text-center">
         <div>
           <el-icon class="text-4xl text-[var(--studio-teal)]"><Picture /></el-icon>
           <p class="mt-3 text-lg font-black">暂无作品</p>
@@ -78,7 +122,15 @@ onMounted(loadGallery)
         </div>
       </div>
 
-      <div v-else class="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-4">
+      <div v-else-if="!images.length && !initialLoading && loadError" class="flex min-h-[220px] items-center justify-center rounded-md border border-dashed border-[var(--studio-line)] bg-[var(--studio-surface-soft)] px-5 text-center">
+        <div>
+          <el-icon class="text-4xl text-[var(--studio-coral)]"><Picture /></el-icon>
+          <p class="mt-3 text-sm font-semibold text-[var(--studio-coral)]">{{ loadError.message || '作品加载失败' }}</p>
+          <button type="button" class="mt-3 text-xs font-bold text-[var(--studio-teal)] hover:underline" @click="retryGalleryLoad">重试</button>
+        </div>
+      </div>
+
+      <div v-else-if="images.length" class="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-4">
         <article
           v-for="(item, index) in images"
           :key="item.key"
@@ -115,6 +167,15 @@ onMounted(loadGallery)
           </div>
         </article>
       </div>
+
+      <div ref="gallerySentinelRef" class="h-px" aria-hidden="true"></div>
+      <div v-if="initialLoading" class="py-4 text-center text-xs text-[var(--studio-muted)]">正在刷新作品…</div>
+      <div v-else-if="loadingMore" class="py-4 text-center text-xs text-[var(--studio-muted)]">正在加载更多作品…</div>
+      <div v-else-if="loadError && images.length" class="flex items-center justify-center gap-2 py-4 text-xs text-[var(--studio-coral)]">
+        <span>{{ loadError.message || '作品加载失败' }}</span>
+        <button type="button" class="font-bold text-[var(--studio-teal)] hover:underline" @click="retryGalleryLoad">重试</button>
+      </div>
+      <div v-else-if="!hasMore && !initialLoading" class="py-4 text-center text-xs text-[var(--studio-muted)]">已加载全部作品</div>
     </div>
   </section>
 </template>

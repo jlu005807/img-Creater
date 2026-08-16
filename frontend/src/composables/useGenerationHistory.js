@@ -1,133 +1,482 @@
 import { ref } from 'vue'
-import { listSessions } from '../api/generation'
-import { backendRouteMissingMessage, isBackendRouteMissing } from '../api/client'
+import { getSession, listSessions } from '../api/generation.js'
+import { backendRouteMissingMessage, isBackendRouteMissing } from '../api/client.js'
+import { applySessionPage, mapSessionSummary } from '../utils/sessionHistory.js'
 
 const STORAGE_KEY = 'studio-generation-history'
-const MAX_ENTRIES = 30
+const SESSION_PAGE_SIZE = 30
+const STORAGE_CACHE_LIMIT = 30
 const RUNNING_STATUSES = new Set(['submitting', 'queued', 'processing'])
 
-// Shared singleton so the drawer and the gallery see the same list.
-const history = ref(load())
+function persistedUrlList(value) {
+  return Array.isArray(value)
+    ? value.filter((url) => typeof url === 'string' && !url.startsWith('data:'))
+    : []
+}
+
+function cachedEntry(value) {
+  if (!value || typeof value !== 'object' || typeof value.id !== 'string') return null
+  const mapped = mapSessionSummary({
+    id: value.id,
+    prompt: value.prompt,
+    mode: value.mode,
+    size: value.size,
+    status: value._status || value.status,
+    created_at: value.createdAt ?? value.created_at,
+    updated_at: value.updatedAt ?? value.updated_at,
+    images: value.images,
+    urls: value.urls,
+    reference_images: value.referenceImages ?? value.reference_images,
+    time: value.time,
+    task: value.task,
+    api_name: value.apiName ?? value.api_name,
+    expires_at: value.expiresAt,
+  })
+  return {
+    ...mapped,
+    _origin: value._origin || (RUNNING_STATUSES.has(mapped._status) ? 'local' : 'server'),
+    attempts: [],
+    responseMeta: null,
+    startedAt: Number(value.startedAt || 0) || null,
+    maxWaitSeconds: Number(value.maxWaitSeconds || 0) || null,
+    errorMessage: typeof value.errorMessage === 'string' ? value.errorMessage : '',
+  }
+}
 
 function load() {
+  if (typeof window === 'undefined') return []
   try {
     const parsed = JSON.parse(window.localStorage.getItem(STORAGE_KEY))
-    return Array.isArray(parsed) ? parsed : []
+    return Array.isArray(parsed)
+      ? parsed.slice(0, STORAGE_CACHE_LIMIT).map(cachedEntry).filter(Boolean)
+      : []
   } catch {
     return []
   }
 }
 
-function persistedUrlList(value) {
-  return Array.isArray(value) ? value.filter((url) => typeof url === 'string' && !url.startsWith('data:')) : []
+function cachedTask(task) {
+  if (!task || typeof task !== 'object' || !task.taskId) return null
+  return {
+    taskId: task.taskId,
+    apiId: task.apiId ?? null,
+    apiName: task.apiName ?? '',
+    apiType: task.apiType ?? null,
+    effectiveApiType: task.effectiveApiType ?? null,
+    requestUrl: task.requestUrl ?? null,
+    upstreamTaskId: task.upstreamTaskId ?? null,
+    upstreamRequestId: task.upstreamRequestId ?? null,
+    pollCount: task.pollCount ?? 0,
+    lastPollStatus: task.lastPollStatus ?? null,
+    waitPhase: task.waitPhase ?? null,
+    lastPollError: task.lastPollError ?? null,
+  }
 }
 
-function referenceImagesForSession(session) {
-  return persistedUrlList(session?.reference_images)
-}
-
-// base64 (data:) images are far too large for the ~5MB localStorage quota, so
-// only remote URLs are persisted; data: results stay in memory for this session.
 function sanitizeForStorage(entries) {
   return entries.map((entry) => {
+    const urls = persistedUrlList(entry.urls)
+    const images = Array.isArray(entry.images)
+      ? entry.images
+        .filter((image) => image && urls.includes(image.url))
+        .map((image) => ({
+          key: image.key,
+          sessionId: image.sessionId,
+          imageIndex: image.imageIndex,
+          url: image.url,
+          filename: image.filename,
+          expiresAt: image.expiresAt ?? null,
+        }))
+      : []
     return {
-      ...entry,
-      urls: persistedUrlList(entry.urls),
+      id: entry.id,
+      prompt: String(entry.prompt || '').slice(0, 4000),
+      mode: entry.mode || 'generate',
+      size: entry.size || '1024x1024',
+      status: entry.status || entry._status || 'completed',
+      createdAt: entry.createdAt || '',
+      updatedAt: entry.updatedAt || '',
+      images,
       referenceImages: persistedUrlList(entry.referenceImages),
-      editDraft: undefined,
+      urls,
+      time: Number(entry.time || 0),
+      _status: entry._status || 'completed',
+      _origin: entry._origin || 'server',
+      task: cachedTask(entry.task),
+      apiName: entry.apiName || '',
+      expiresAt: entry.expiresAt ?? null,
+      startedAt: Number(entry.startedAt || 0) || null,
+      maxWaitSeconds: Number(entry.maxWaitSeconds || 0) || null,
+      errorMessage: entry.errorMessage || '',
     }
   })
 }
 
+// Keep only a bounded, lightweight startup cache. The loaded in-memory
+// history remains unbounded and the backend is the completed-session source.
 function persist() {
+  if (typeof window === 'undefined') return
   try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(sanitizeForStorage(history.value)))
+    const cached = sanitizeForStorage(history.value.slice(0, STORAGE_CACHE_LIMIT))
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(cached))
   } catch {
     /* ignore quota / availability errors */
   }
 }
 
-export function useGenerationHistory() {
+function mappedImagesForEntry(entry, ignoreExistingImages = false) {
+  return mapSessionSummary({
+    ...entry,
+    images: ignoreExistingImages ? undefined : entry.images,
+    status: entry._status || entry.status,
+    expires_at: entry.expiresAt,
+  }).images
+}
+
+function normalizedQuery(params) {
+  const query = {}
+  for (const [key, value] of Object.entries(params || {})) {
+    if (key === 'cursor' || key === 'limit') continue
+    if (value !== undefined && value !== null && value !== '') query[key] = value
+  }
+  return query
+}
+
+function sessionQueryKey(params) {
+  const query = normalizedQuery(params)
+  return JSON.stringify(
+    Object.keys(query)
+      .sort()
+      .map((key) => [key, query[key]]),
+  )
+}
+
+function normalizedLoadError(error) {
+  if (!isBackendRouteMissing(error)) return error
+  const next = new Error(backendRouteMissingMessage('历史会话'))
+  next.status = error.status
+  return next
+}
+
+// Module-level refs intentionally survive App.vue's Playground/Gallery v-if
+// remounts, so both views share the same pages and request generation.
+const history = ref(load())
+const initialLoading = ref(false)
+const loadingMore = ref(false)
+const loadError = ref(null)
+const hasMore = ref(true)
+const nextCursor = ref(null)
+const serverResultsCurrent = ref(false)
+const detailRequests = new Map()
+
+let requestGeneration = 0
+let currentQuery = {}
+let currentQueryKey = sessionQueryKey(currentQuery)
+let loadedQueryKey = null
+let loadedSuccessfully = false
+let consumedCursors = new Set()
+let tombstoneIds = new Set()
+let activeRefreshToken = null
+let activeLoadMoreToken = null
+let failedOperation = null
+
+export function useGenerationHistory({
+  loadSessionPage = listSessions,
+  loadSessionDetail = getSession,
+} = {}) {
+  function withoutTombstonedEntries(items) {
+    return items.filter((item) => !tombstoneIds.has(item.id))
+  }
+
   function addEntry(entry) {
     const item = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       time: Date.now(),
       _status: 'queued',
+      _origin: 'local',
       ...entry,
     }
-    history.value = [item, ...history.value].slice(0, MAX_ENTRIES)
+    item._origin = item._origin || 'local'
+    item.status = item._status || item.status || 'queued'
+    item.images = mappedImagesForEntry(item)
+    tombstoneIds.delete(item.id)
+    history.value = [item, ...history.value.filter((existing) => existing.id !== item.id)]
     persist()
     return item
   }
 
   function updateEntry(id, fields) {
-    const idx = history.value.findIndex((e) => e.id === id)
-    if (idx >= 0) {
-      history.value[idx] = { ...history.value[idx], ...fields }
-      persist()
+    const idx = history.value.findIndex((entry) => entry.id === id)
+    if (idx < 0) return
+    const next = { ...history.value[idx], ...fields }
+    if ('_status' in fields) {
+      next.status = fields._status
+      if (RUNNING_STATUSES.has(fields._status)) next._origin = 'local'
     }
+    if ('urls' in fields || 'images' in fields || 'expiresAt' in fields) {
+      next.images = mappedImagesForEntry(next, 'urls' in fields || 'expiresAt' in fields)
+    }
+    history.value[idx] = next
+    persist()
   }
 
   function removeEntry(id) {
+    tombstoneIds.add(id)
+    detailRequests.delete(id)
     history.value = history.value.filter((entry) => entry.id !== id)
+    if (!history.value.length && !hasMore.value) nextCursor.value = null
     persist()
   }
 
   function clearHistory() {
+    requestGeneration += 1
+    activeRefreshToken = null
+    activeLoadMoreToken = null
+    failedOperation = null
+    currentQuery = {}
+    currentQueryKey = sessionQueryKey(currentQuery)
+    loadedQueryKey = null
+    loadedSuccessfully = false
+    serverResultsCurrent.value = false
+    consumedCursors = new Set()
+    tombstoneIds = new Set()
+    detailRequests.clear()
     history.value = []
+    initialLoading.value = false
+    loadingMore.value = false
+    loadError.value = null
+    hasMore.value = false
+    nextCursor.value = null
     persist()
   }
 
-  async function loadPersistedSessions() {
-    let sessions
+  function invalidateSessionRequests() {
+    requestGeneration += 1
+    activeRefreshToken = null
+    activeLoadMoreToken = null
+    detailRequests.clear()
+    failedOperation = null
+    currentQueryKey = null
+    loadedQueryKey = null
+    loadedSuccessfully = false
+    serverResultsCurrent.value = false
+    initialLoading.value = true
+    loadingMore.value = false
+    loadError.value = null
+    hasMore.value = false
+    nextCursor.value = null
+  }
+
+  async function refreshSessions(params = {}, { queryKey = sessionQueryKey(params) } = {}) {
+    const generation = ++requestGeneration
+    const token = {}
+    const query = normalizedQuery(params)
+    currentQuery = query
+    currentQueryKey = queryKey
+    loadedSuccessfully = false
+    serverResultsCurrent.value = false
+    consumedCursors = new Set()
+    tombstoneIds = new Set()
+    detailRequests.clear()
+    activeRefreshToken = token
+    activeLoadMoreToken = null
+    failedOperation = null
+    initialLoading.value = true
+    loadingMore.value = false
+    loadError.value = null
+
     try {
-      sessions = await listSessions()
+      const payload = await loadSessionPage({ ...query, limit: SESSION_PAGE_SIZE })
+      if (generation !== requestGeneration || activeRefreshToken !== token) return []
+
+      const isLegacyFullManifestArray = Array.isArray(payload)
+      const page = applySessionPage(history.value, payload, { replaceServer: true })
+      const items = withoutTombstonedEntries(page.items)
+      history.value = items
+      nextCursor.value = page.nextCursor
+      hasMore.value = page.hasMore
+      loadedQueryKey = currentQueryKey
+      loadedSuccessfully = true
+      serverResultsCurrent.value = !isLegacyFullManifestArray
+      loadError.value = null
+      persist()
+      return items
     } catch (error) {
-      if (isBackendRouteMissing(error)) {
-        const next = new Error(backendRouteMissingMessage('历史会话'))
-        next.status = error.status
-        throw next
+      if (generation !== requestGeneration || activeRefreshToken !== token) return []
+      const normalized = normalizedLoadError(error)
+      loadedSuccessfully = false
+      serverResultsCurrent.value = false
+      loadError.value = normalized
+      failedOperation = { type: 'refresh', params: query, queryKey }
+      throw normalized
+    } finally {
+      if (generation === requestGeneration && activeRefreshToken === token) {
+        activeRefreshToken = null
+        initialLoading.value = false
       }
-      throw error
     }
-    if (!Array.isArray(sessions) || !sessions.length) return []
-    const existingById = new Map(history.value.map((entry) => [entry.id, entry]))
-    for (const session of sessions) {
-      // 正在跑新任务的本地条目不能被后端 manifest 覆盖：重新生成期间
-      // manifest 仍保留上一次完成的内容（旧 task_id / 旧图），直接合并会
-      // 把运行态改写成 completed 并中断轮询恢复。
-      const existing = existingById.get(session.id)
-      if (
-        existing &&
-        RUNNING_STATUSES.has(existing._status) &&
-        existing.task?.taskId &&
-        existing.task.taskId !== session.task_id
-      ) {
-        continue
-      }
-      const urls = Array.isArray(session.urls) ? session.urls : []
-      const entry = {
-        id: session.id,
-        prompt: session.prompt || '',
-        mode: session.mode || 'generate',
-        size: session.size || '1024x1024',
-        urls,
-        referenceImages: referenceImagesForSession(session),
-        apiName: session.api_name || '',
-        time: Date.parse(session.updated_at || session.created_at || '') || Date.now(),
-        _status: 'completed',
-        task: session.task_id ? { taskId: session.task_id, apiId: session.api_id, apiName: session.api_name } : null,
-        attempts: Array.isArray(session.attempts) ? session.attempts : [],
-        expiresAt: session.expires_at ?? null,
-      }
-      existingById.set(entry.id, { ...(existingById.get(entry.id) || {}), ...entry })
-    }
-    history.value = Array.from(existingById.values())
-      .sort((a, b) => Number(b.time || 0) - Number(a.time || 0))
-      .slice(0, MAX_ENTRIES)
-    persist()
-    return sessions
   }
 
-  return { history, addEntry, updateEntry, removeEntry, clearHistory, loadPersistedSessions }
+  // Component instances are intentionally short-lived because App.vue uses
+  // v-if/v-else for page switching. Reuse the already loaded cursor chain when
+  // the requested server query is unchanged; an explicit refresh still calls
+  // refreshSessions directly and always starts a new first-page request.
+  async function ensureSessions(params = {}, { queryKey = sessionQueryKey(params) } = {}) {
+    const key = queryKey
+    const requestKey = sessionQueryKey(params)
+    if (
+      loadedSuccessfully &&
+      (loadedQueryKey === key || sessionQueryKey(currentQuery) === requestKey)
+    ) {
+      return history.value
+    }
+    if (
+      initialLoading.value &&
+      activeRefreshToken &&
+      (currentQueryKey === key || sessionQueryKey(currentQuery) === requestKey)
+    ) {
+      return history.value
+    }
+    return refreshSessions(params, { queryKey: key })
+  }
+
+  async function ensureSessionDetails(historyId) {
+    const id = typeof historyId === 'string' ? historyId : historyId?.id
+    if (!id) return null
+
+    const entry = history.value.find((item) => item.id === id)
+    if (!entry) return null
+    if (entry._detailsLoaded || entry._origin !== 'server' || entry._status !== 'completed') {
+      return entry
+    }
+
+    const existingRequest = detailRequests.get(id)
+    if (existingRequest) return existingRequest
+
+    const requestedEntry = entry
+
+    const request = (async () => {
+      const payload = await loadSessionDetail(id)
+      const details = mapSessionSummary(payload)
+      if (!details.id || details.id !== id) {
+        throw new Error('历史详情响应与请求的会话不匹配')
+      }
+
+      const index = history.value.findIndex((item) => item.id === id)
+      if (index < 0) return null
+      const current = history.value[index]
+      if (current !== requestedEntry || tombstoneIds.has(id)) return null
+      if (current._origin !== 'server' || current._status !== 'completed') return current
+
+      const detailedEntry = {
+        ...current,
+        ...details,
+        _detailsLoaded: true,
+      }
+      history.value[index] = detailedEntry
+      persist()
+      return detailedEntry
+    })()
+    detailRequests.set(id, request)
+
+    try {
+      return await request
+    } finally {
+      if (detailRequests.get(id) === request) detailRequests.delete(id)
+    }
+  }
+
+  async function loadMoreSessions() {
+    if (
+      activeLoadMoreToken ||
+      initialLoading.value ||
+      loadError.value ||
+      !hasMore.value ||
+      !nextCursor.value
+    ) {
+      return []
+    }
+
+    if (consumedCursors.has(nextCursor.value)) {
+      nextCursor.value = null
+      hasMore.value = false
+      loadError.value = null
+      return []
+    }
+
+    const generation = requestGeneration
+    const requestedCursor = nextCursor.value
+    const token = {}
+    activeLoadMoreToken = token
+    failedOperation = null
+    loadingMore.value = true
+    loadError.value = null
+
+    try {
+      const payload = await loadSessionPage({
+        ...currentQuery,
+        limit: SESSION_PAGE_SIZE,
+        cursor: requestedCursor,
+      })
+      if (generation !== requestGeneration || activeLoadMoreToken !== token) return []
+
+      const page = applySessionPage(history.value, payload, {
+        requestedCursor,
+        seenCursors: consumedCursors,
+      })
+      consumedCursors.add(requestedCursor)
+      const items = withoutTombstonedEntries(page.items)
+      history.value = items
+      nextCursor.value = page.nextCursor
+      hasMore.value = page.hasMore
+      loadError.value = null
+      persist()
+      return items
+    } catch (error) {
+      if (generation !== requestGeneration || activeLoadMoreToken !== token) return []
+      const normalized = normalizedLoadError(error)
+      loadError.value = normalized
+      failedOperation = { type: 'loadMore' }
+      throw normalized
+    } finally {
+      if (generation === requestGeneration && activeLoadMoreToken === token) {
+        activeLoadMoreToken = null
+        loadingMore.value = false
+      }
+    }
+  }
+
+  async function retrySessions() {
+    if (failedOperation?.type === 'loadMore') {
+      loadError.value = null
+      return loadMoreSessions()
+    }
+    const params = failedOperation?.params || currentQuery
+    const queryKey = failedOperation?.queryKey || sessionQueryKey(params)
+    return refreshSessions(params, { queryKey })
+  }
+
+  // Backward-compatible name for existing callers.
+  const loadPersistedSessions = refreshSessions
+
+  return {
+    history,
+    addEntry,
+    updateEntry,
+    removeEntry,
+    clearHistory,
+    invalidateSessionRequests,
+    loadPersistedSessions,
+    refreshSessions,
+    ensureSessions,
+    ensureSessionDetails,
+    loadMoreSessions,
+    retrySessions,
+    initialLoading,
+    loadingMore,
+    loadError,
+    serverResultsCurrent,
+    hasMore,
+    nextCursor,
+  }
 }

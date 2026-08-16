@@ -339,9 +339,9 @@ GET /api/sessions?limit=30&cursor=<opaque>&q=<search>&sort=updated_desc
 | `to` | ISO 8601 | 无 | 按 `updated_at`/`created_at` 过滤结束时间 |
 | `sort` | string | `updated_desc` | 目前仅支持 `updated_desc` |
 
-**向后兼容**：不带任何查询参数时，接口返回完整数组（旧版行为）。带上 `limit` 或 `cursor` 时，返回分页对象。
+**向后兼容**：不带任何查询参数时，接口返回完整数组（旧版行为）。只要带上任一查询参数（`limit`、`cursor`、`q`、`from`、`to` 或 `sort`），就返回分页对象；因此单独使用搜索或时间筛选也会启动分页查询。
 
-**分页响应**：
+**分页响应**：以下代码展示统一成功信封中 `data` 字段的内容；完整响应仍为 `{"success": true, "data": { ... }}`。
 
 ```json
 {
@@ -373,15 +373,47 @@ GET /api/sessions?limit=30&cursor=<opaque>&q=<search>&sort=updated_desc
 }
 ```
 
-**游标规则**：游标至少包含最后一条记录的排序键 `(updated_at 或 created_at, id)`。下一页查询严格取排序键小于该游标的记录。无效游标返回 400。逐目录读取 manifest 时，单个 JSON 损坏、权限错误或并发写入时记录 warning 并跳过，不会导致整个请求 500。
+**游标规则**：游标至少包含最后一条记录的排序键 `(updated_at 或 created_at, id)`。下一页查询严格取排序键小于该游标的记录。缺失或非法的 `updated_at` 会回退到 `created_at`，两者都不可用时使用会话目录的 mtime；最终都以 `id` 做稳定 tie-break。无效游标返回 400。逐目录读取 manifest 时，单个 JSON 损坏、权限错误或并发写入时记录 warning 并跳过，不会导致整个请求 500。
 
-**列表字段约束**：分页列表只返回展示和选择所需的摘要及图片元数据，默认省略 `attempts`、`response_meta` 等大字段。`prompt` 在列表中有长度上限；完整 `prompt` 可在详情或复用操作时按需读取。`urls` 字段在过渡期继续返回，前端通过 mapper 兼容旧数据。
+**列表字段约束**：分页列表只返回展示和选择所需的摘要及图片元数据，默认省略 `attempts`、`response_meta` 等大字段。`prompt` 在列表中最多返回 4000 个字符；完整 `prompt` 由详情接口在回看或复用操作时按需读取。`urls` 字段在过渡期继续返回，前端通过 mapper 兼容旧数据。
 
-不带分页参数时，`has_more` 和 `next_cursor` 不存在，前端通过 mapper 同时兼容"数组"和"分页对象"两种形态。
+不带任何查询参数时，`has_more` 和 `next_cursor` 不存在，前端通过 mapper 同时兼容"数组"和"分页对象"两种形态。
 
-同一会话重新生成失败（或排队/取消）时，manifest 不会清掉上一次成功的结果：顶层仍保留 `status: "completed"` 与原有 `urls`，最近一次尝试的信息记录在附加字段 `last_task_id`、`last_status`、`last_error`、`last_attempts` 中，因此该会话在本接口与作品集中不会消失。
+同一会话重新生成失败（或排队/取消）时，manifest 不会清掉上一次成功的结果：顶层仍保留 `status: "completed"` 与原有 `urls`，最近一次尝试的信息记录在附加字段 `last_task_id`、`last_status`、`last_error`、`last_attempts` 中，因此该会话在本接口与作品集中不会消失。`last_attempts` 属于磁盘 manifest 的附加信息，分页摘要默认省略它；需要完整 manifest 时应按需读取详情。
 
-### 6.2 批量导出（草案）
+### 6.2 查询会话详情
+
+```http
+GET /api/sessions/{history_id}
+```
+
+读取指定已完成会话的完整 `session.json`，成功响应仍使用统一信封。`data` 保留完整 `prompt`、`attempts`、`response_meta`、最近一次尝试字段等 manifest 内容，并补齐规范化的 `id`、`urls`、`images` 与 `reference_images`：
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": "session-id",
+    "prompt": "完整提示词，不受列表 4000 字符上限影响",
+    "status": "completed",
+    "urls": ["/api/results/session-id/image.png"],
+    "images": [
+      {
+        "index": 0,
+        "url": "/api/results/session-id/image.png",
+        "filename": "image.png",
+        "session_id": "session-id"
+      }
+    ],
+    "attempts": [],
+    "response_meta": {}
+  }
+}
+```
+
+前端只在用户回看或复用服务端历史时按需请求一次详情，并在内存中标记已加载，避免把完整 manifest 塞入每一页列表。会话不存在、不是有效的已完成会话，或 manifest 已损坏/不可读时返回安全的 `404`；日志只记录安全会话标识和异常类型，不向响应或 warning 泄露绝对路径。
+
+### 6.3 批量导出（草案）
 
 ```http
 POST /api/sessions/export
@@ -411,7 +443,7 @@ Content-Type: application/json
 
 此接口为后续阶段实现，当前文档先行约定。
 
-### 6.2 删除会话
+### 6.4 删除会话
 
 ```http
 DELETE /api/sessions/{history_id}
@@ -422,7 +454,7 @@ DELETE /api/sessions
 
 > 注意：删除是**不可恢复的破坏性操作**，后端不做二次确认；按 ID 删除时目录不存在也返回成功。响应分别为 `{"deleted": true, "id": "..."}` 与 `{"deleted": <删除数量>}`。
 
-### 6.3 局部编辑草稿
+### 6.5 局部编辑草稿
 
 ```http
 GET /api/edit-drafts/{history_id}
@@ -433,7 +465,7 @@ PUT /api/edit-drafts/{history_id}
 
 `PUT` 支持增量保存：当请求体缺少 `image`（或为 `null`/空串）且磁盘上已有草稿时，后端把新载荷合并到已存草稿之上，保留原有 `image` 与未提交的字段——前端因此只在原图变化时上传一次完整 base64 原图，之后每次只传蒙版与元数据。磁盘上的草稿始终是完整形态，`GET` 返回结果与旧版全量草稿一致。
 
-### 6.4 提示词模板
+### 6.6 提示词模板
 
 ```http
 GET    /api/prompt-templates
@@ -521,6 +553,7 @@ Content-Type: application/json
 
 - 查询或修改了不存在的配置项
 - 轮询时提供了不存在或已过期的 `task_id`
+- 查询的会话详情不存在、未完成或 manifest 不可读
 
 ### 413 Payload Too Large
 

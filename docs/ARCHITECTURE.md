@@ -24,7 +24,8 @@ Vue 3 Desktop UI
 - 任务状态轮询节奏
 - 超时控制
 - 结果展示与下载
-- 作品集照片墙展示后端已完成会话
+- 通过共享分页状态展示历史侧栏与作品集照片墙
+- 在实际滚动容器触底时继续加载后端已完成会话
 
 ### 后端负责
 
@@ -33,6 +34,7 @@ Vue 3 Desktop UI
 - 在 worker 线程内按节点优先级执行容灾，并适配不同上游协议（OpenAI 兼容 / 异步中转）
 - 把任务生命周期与结果保存在进程内 `TaskStore`，供 `/status` 查询
 - 把成功图片、会话参数和局部编辑草稿保存到后端历史目录
+- 为已完成会话提供稳定游标分页、服务端搜索和时间筛选
 - 对前端统一返回结构化错误
 
 ### 上游服务负责
@@ -107,6 +109,7 @@ history/
 - `GET /api/status`
 - `POST /api/tasks/{task_id}/cancel`
 - `GET /api/sessions`
+- `GET /api/sessions/{history_id}`
 - `DELETE /api/sessions/{history_id}`（破坏性：直接删除会话目录，无二次确认）
 - `DELETE /api/sessions`（破坏性：清空全部会话目录，无二次确认）
 - `GET /api/edit-drafts/{history_id}`
@@ -188,6 +191,11 @@ frontend/src/
     Playground/index.vue
     RegionEditor/index.vue
     Settings/index.vue
+  composables/
+    useGenerationHistory.js
+    useInfiniteScrollSentinel.js
+  utils/
+    sessionHistory.js
   App.vue
   styles.css
 ```
@@ -229,7 +237,9 @@ frontend/src/
 - 发起 `/api/generate` 或 `/api/edit`
 - 每 4 秒轮询一次 `/api/status`
 - 维护任务信息、耗时、错误和结果图片列表
-- 启动时合并后端已完成会话，恢复本地历史索引
+- 复用共享会话分页状态，恢复本地运行任务并按需加载后端已完成会话
+- 把搜索词和时间范围交给服务端查询，管理历史侧栏的触底加载与重试状态
+- 回看或复用服务端摘要前按需读取完整会话详情，避免截断的 prompt 被静默提交
 
 这里是整个交互链路的中心组件。
 
@@ -237,9 +247,30 @@ frontend/src/
 
 职责：
 
-- 调用 `GET /api/sessions`
-- 将所有成功图片以照片墙形式展示
+- 消费共享的 `useGenerationHistory` 分页状态
+- 将已加载的成功图片以照片墙形式展示，并在触底时请求下一页
 - 提供放大预览和下载
+
+### 共享会话分页状态
+
+`useGenerationHistory.js` 的响应式状态定义在模块级，因此 `App.vue` 用 `v-if` 在 Playground 与 Gallery 间切换并销毁组件时，在**同一查询条件**下已经加载的页、游标和请求代次仍然保留。切换到不同查询（例如从带筛选的 Playground 进入 Gallery）会按新查询重新加载首页。这里保留的是共享历史分页状态，不代表 Playground 的筛选控件、选中项或编辑器全部跨组件持久化；这些状态按现有草稿和任务恢复规则处理。两个页面共享以下状态：
+
+- 已加载会话、`nextCursor`、`hasMore`
+- 首页与下一页的独立 loading 状态
+- 当前查询、失败操作和可重试错误
+- 请求代次、已消费游标与删除 tombstone
+
+`sessionHistory.js` 负责把旧版数组响应和分页对象统一映射为 camelCase 会话/图片模型，并按会话 ID 去重。刷新第一页时，后端摘要替换已完成历史；本地 `queued`、`processing`、`failed`、`cancelled` 等任务状态继续保留，运行中的新任务不会被旧 manifest 覆盖。分页摘要的 prompt 最多 4000 个字符；`ensureSessionDetails()` 在回看/复用时调用 `GET /api/sessions/{history_id}`，合并完整 prompt、attempts 与 response metadata，并对同一已加载会话复用内存详情。
+
+历史 store 在 `localStorage` 中只保存最多 30 条轻量启动缓存和任务恢复字段；表单草稿、主题和偏好仍由各自的 localStorage key 管理。内存中的分页结果不再截断为 30 条，完整的已完成历史始终以后端 `history/<session-id>/session.json` 为事实来源。
+
+`useInfiniteScrollSentinel.js` 优先用 `IntersectionObserver` 观察实际滚动容器底部；环境不支持时使用距底部 160px 的被动 scroll 监听，并在有实际布局尺寸的短容器仍接近底部时继续检查；隐藏或零尺寸容器不会触发预取。共享 store 同时限制只存在一个 `loadMore` 请求，并用请求代次阻止旧查询覆盖新查询。
+
+Playground 的 `today` / `week` / `month` 范围在每次刷新请求时按当前时间重新计算；动态 `to` 不进入共享查询键，日期边界对应的 `from` 会进入查询键。界面只承诺后端支持的 `updated_desc`（最新优先）全局顺序，不把当前已加载页的本地排序伪装成全历史排序。
+
+Stage 1 的已知限制：任务状态轮询定时器仍由 Playground 组件实例持有。切换到 Gallery 会暂停该实例的轮询；返回 Playground 后，`restoreRunningTasks()` 会依据共享历史中的运行态任务恢复轮询。跨页面持续运行的共享 task manager 计划在 Stage 4 实现。
+
+首页和下一页的失败状态分别保留在共享 store 中：失败不会自动重复请求，界面保留当前内容和 `Retry` 操作；下一页重试会沿用原游标，不会重复追加已成功的页面。首批记录不足以产生滚动条时，sentinel 会继续补页，直到出现可滚动空间、后端返回末页或请求失败。
 
 ### `components/RegionEditor/index.vue`
 
@@ -338,7 +369,7 @@ User uploads image
 - `custom` 和通用 `async`：JSON 中带 `image`/`marked_image`、可选 `source_image`、`reference_images` 和顺序数组 `images`
 - `fnuu.net`：按接入手册只使用 `image` 字段；局部编辑时 `image` 数组顺序为干净原图、彩色标注图、可选参考图
 
-## 8.1 参考图（文生图）
+### 8.1 参考图（文生图）
 
 文生图可附带最多 N 张参考图（上限在设置中可配置，默认 3；后端硬上限 8）。前端以 `reference_images`（data URL 数组）提交，后端按协议转发：
 
