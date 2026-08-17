@@ -85,6 +85,23 @@ def cancel_generation_task(task_id: str):
         return _image_error(exc)
 
 
+@generation_bp.post("/sessions/export")
+def export_session_images():
+    try:
+        from backend.services.session_export_service import (
+            SessionExportError,
+            export_sessions,
+        )
+
+        result_dir = _result_dir()
+        payload = request.get_json(silent=True)
+        return export_sessions(current_app, result_dir, payload)
+    except SessionExportError as exc:
+        return _error(exc.message, exc.status_code, exc.details)
+    except Exception as exc:
+        return _image_error(exc)
+
+
 @generation_bp.get("/sessions")
 def list_sessions():
     try:

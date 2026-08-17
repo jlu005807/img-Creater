@@ -14,7 +14,7 @@ def create_app() -> Flask:
     logging.getLogger("backend.services.image_service").setLevel(logging.INFO)
     # Local single-user tool: only the Vite dev origin needs cross-origin access.
     allowed = os.getenv("FRONTEND_ORIGIN", "http://127.0.0.1:5173,http://localhost:5173").split(",")
-    CORS(app, resources={r"/api/*": {"origins": [o.strip() for o in allowed if o.strip()]}})
+    CORS(app, resources={r"/api/*": {"origins": [o.strip() for o in allowed if o.strip()], "expose_headers": ["X-Export-Skipped-Count"]}})
 
     # Cap request bodies so oversized base64 image uploads can't exhaust
     # memory; edits carry one already-marked image inline.

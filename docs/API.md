@@ -441,7 +441,7 @@ Content-Type: application/json
 - 生成失败项不能泄露服务器路径；只返回 `session_id`、`image_index` 和可读错误原因。
 - 部分文件被跳过时，ZIP 内附 `export-report.json`；若没有任何成功文件，返回结构化 JSON 错误而非空 ZIP。
 
-此接口为后续阶段实现，当前文档先行约定。
+此接口已实现。安全限制：最多 50 项，单文件 50MB，总量 200MB。允许 PNG/JPEG/WebP。
 
 ### 6.4 删除会话
 
