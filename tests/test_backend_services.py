@@ -3384,5 +3384,194 @@ class StatusLookupTests(TestCase):
             self.assertEqual(getattr(ctx.exception, "status_code", None), 404)
 
 
+class BoundedExecutorTests(TestCase):
+    """Stage 4.1: ImageService uses a bounded ThreadPoolExecutor instead of
+    spawning unbounded daemon threads."""
+
+    def _config(self, tmp_dir):
+        config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+        config_service.create_config({
+            "name": "Primary",
+            "base_url": "https://api.openai.com",
+            "api_key": "key-1",
+            "model": "gpt-image-2",
+            "status": True,
+        })
+        return config_service
+
+    def test_default_max_concurrency_is_positive(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = self._config(tmp_dir)
+            service = _service(config_service, FakeHttpClient())
+            self.assertGreater(service.max_concurrency, 0)
+
+    def test_executor_is_created_lazily(self):
+        """When run_async=False, no executor is created until needed."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = self._config(tmp_dir)
+            service = _service(config_service, FakeHttpClient())
+            self.assertIsNone(service._executor)
+
+    def test_async_submit_uses_thread_pool_executor(self):
+        """When run_async=True, the service uses a ThreadPoolExecutor rather
+        than spawning raw daemon threads."""
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = self._config(tmp_dir)
+            store = TaskStore()
+            barrier = threading.Event()
+
+            class BlockingHttpClient(FakeHttpClient):
+                def post(self, url, **kwargs):
+                    self.posts.append((url, kwargs))
+                    barrier.wait(timeout=10)
+                    response = self.post_responses.pop(0)
+                    if isinstance(response, Exception):
+                        raise response
+                    return response
+
+            client = BlockingHttpClient(
+                post_responses=[FakeResponse(200, {"data": [{"url": "http://x/a.png"}]})]
+            )
+            service = ImageService(
+                config_service=config_service,
+                http_client=client,
+                run_async=True,
+                async_poll_interval=0,
+                persist_results=False,
+                store=store,
+                max_concurrency=2,
+            )
+            try:
+                result = service.submit_generation(prompt="test")
+                task_id = result["task_id"]
+                self.assertIsInstance(service._executor, ThreadPoolExecutor)
+                task = store.get(task_id)
+                self.assertIn(task["status"], ("queued", "processing"))
+            finally:
+                barrier.set()
+                service.shutdown(wait=True)
+
+    def test_max_concurrency_limits_parallel_workers(self):
+        """Submitting more tasks than max_concurrency blocks excess tasks in
+        the executor queue; only max_concurrency run at once."""
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = self._config(tmp_dir)
+            store = TaskStore()
+            active_count = {"value": 0, "max": 0}
+            lock = threading.Lock()
+            barrier = threading.Event()
+
+            class CountingHttpClient(FakeHttpClient):
+                def post(self, url, **kwargs):
+                    self.posts.append((url, kwargs))
+                    with lock:
+                        active_count["value"] += 1
+                        active_count["max"] = max(active_count["max"], active_count["value"])
+                    barrier.wait(timeout=15)
+                    with lock:
+                        active_count["value"] -= 1
+                    response = self.post_responses.pop(0)
+                    if isinstance(response, Exception):
+                        raise response
+                    return response
+
+            responses = [
+                FakeResponse(200, {"data": [{"url": f"http://x/{i}.png"}]})
+                for i in range(5)
+            ]
+            client = CountingHttpClient(post_responses=responses)
+            service = ImageService(
+                config_service=config_service,
+                http_client=client,
+                run_async=True,
+                async_poll_interval=0,
+                persist_results=False,
+                store=store,
+                max_concurrency=2,
+            )
+            try:
+                task_ids = []
+                for i in range(5):
+                    r = service.submit_generation(prompt=f"task-{i}")
+                    task_ids.append(r["task_id"])
+                for tid in task_ids:
+                    for _ in range(200):
+                        t = store.get(tid)
+                        if t and t["status"] in ("completed", "failed", "cancelled"):
+                            break
+                        time.sleep(0.05)
+                barrier.set()
+                service.shutdown(wait=True)
+                self.assertLessEqual(active_count["max"], 2)
+            finally:
+                barrier.set()
+                service.shutdown(wait=True)
+
+    def test_shutdown_releases_executor(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = self._config(tmp_dir)
+            service = ImageService(
+                config_service=config_service,
+                http_client=FakeHttpClient(),
+                run_async=True,
+                persist_results=False,
+                store=TaskStore(),
+                max_concurrency=1,
+            )
+            service.shutdown(wait=True)
+            self.assertTrue(service._executor is None or service._executor._shutdown)
+
+    def test_queue_limit_rejects_excess(self):
+        """When the pending queue exceeds the configured limit, submit raises
+        instead of enqueuing unboundedly."""
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = self._config(tmp_dir)
+            store = TaskStore()
+            barrier = threading.Event()
+
+            class BlockingHttpClient(FakeHttpClient):
+                def post(self, url, **kwargs):
+                    self.posts.append((url, kwargs))
+                    barrier.wait(timeout=15)
+                    response = self.post_responses.pop(0)
+                    if isinstance(response, Exception):
+                        raise response
+                    return response
+
+            client = BlockingHttpClient(
+                post_responses=[FakeResponse(200, {"data": [{"url": "http://x/placeholder.png"}]}) for _ in range(20)]
+            )
+            service = ImageService(
+                config_service=config_service,
+                http_client=client,
+                run_async=True,
+                async_poll_interval=0,
+                persist_results=False,
+                store=store,
+                max_concurrency=1,
+                max_queue=3,
+            )
+            submitted = []
+            rejected = 0
+            try:
+                for i in range(20):
+                    try:
+                        r = service.submit_generation(prompt=f"task-{i}")
+                        submitted.append(r["task_id"])
+                    except Exception:
+                        rejected += 1
+            finally:
+                barrier.set()
+                service.shutdown(wait=True)
+            self.assertLessEqual(len(submitted), 4)
+            self.assertGreater(rejected, 0)
+
 if __name__ == "__main__":
     main()

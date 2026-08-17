@@ -18,6 +18,9 @@ from .config_service import ConfigService, DEFAULT_MODEL
 from .task_store import TaskStore, task_store as default_task_store
 
 
+_DEFAULT_MAX_CONCURRENCY = 4
+_DEFAULT_MAX_QUEUE = 16
+
 _VALID_QUALITY = {"auto", "low", "medium", "high"}
 DEFAULT_RESULT_DIR = Path(__file__).resolve().parents[2] / "history"
 KNOWN_ASYNC_RELAY_HOSTS = {"fnuu.net", "www.fnuu.net"}
@@ -104,6 +107,8 @@ class ImageService:
         run_async: bool = True,
         result_dir: str | Path | None = DEFAULT_RESULT_DIR,
         persist_results: bool = True,
+        max_concurrency: int = _DEFAULT_MAX_CONCURRENCY,
+        max_queue: int = _DEFAULT_MAX_QUEUE,
     ):
         self.config_service = config_service or ConfigService()
         if http_client is None:
@@ -118,6 +123,11 @@ class ImageService:
         self.store = store or default_task_store
         # When False the worker runs inline (used by tests for determinism).
         self.run_async = run_async
+        self.max_concurrency = max(1, max_concurrency)
+        self.max_queue = max(0, max_queue)
+        self._executor = None  # type: Any | None  # lazily created
+        self._pending_count = 0
+        self._executor_lock = threading.Lock()
         self.persist_results = persist_results
         self.result_dir = Path(result_dir) if result_dir is not None else DEFAULT_RESULT_DIR
         # 写 session.json 的读-改-写用单一全局锁串行化即可：写入很短且都在
@@ -234,12 +244,7 @@ class ImageService:
             len(payload.get("reference_images") or []),
         )
         if self.run_async:
-            thread = threading.Thread(
-                target=self._execute_task,
-                args=(task_id, providers, payload, operation),
-                daemon=True,
-            )
-            thread.start()
+            self._submit_to_executor(task_id, providers, payload, operation)
         else:
             self._execute_task(task_id, providers, payload, operation)
         return {
@@ -252,6 +257,65 @@ class ImageService:
         }
 
     # ------------------------------------------------------------------ worker
+
+    def _submit_to_executor(
+        self,
+        task_id: str,
+        providers: list[dict[str, Any]],
+        payload: dict[str, Any],
+        operation: str,
+    ) -> None:
+        """Submit a task to the bounded thread pool executor.
+
+        If the pending queue is full, the task is rejected with an error
+        stored in the task store instead of blocking indefinitely.
+        """
+        with self._executor_lock:
+            if self._executor is None:
+                from concurrent.futures import ThreadPoolExecutor
+
+                self._executor = ThreadPoolExecutor(
+                    max_workers=self.max_concurrency,
+                    thread_name_prefix="img-worker",
+                )
+            if self.max_queue > 0 and self._pending_count >= self.max_queue:
+                self.store.update(
+                    task_id,
+                    status="failed",
+                    error="ä»»å¡éåå·²æ»¡ï¼è¯·ç¨åéè¯",
+                )
+                logger.warning(
+                    "[image] task rejected (queue full) task_id=%s pending=%d max_queue=%d",
+                    task_id,
+                    self._pending_count,
+                    self.max_queue,
+                )
+                raise AllProvidersFailed("ä»»å¡éåå·²æ»¡ï¼è¯·ç¨åéè¯", status_code=429)
+            self._pending_count += 1
+            self._executor.submit(self._execute_task_wrapper, task_id, providers, payload, operation)
+
+    def _execute_task_wrapper(
+        self,
+        task_id: str,
+        providers: list[dict[str, Any]],
+        payload: dict[str, Any],
+        operation: str,
+    ) -> None:
+        """Wraps _execute_task to ensure the pending counter is decremented."""
+        try:
+            self._execute_task(task_id, providers, payload, operation)
+        finally:
+            with self._executor_lock:
+                self._pending_count -= 1
+
+    def shutdown(self, wait: bool = True) -> None:
+        """Gracefully shut down the executor, waiting for in-flight tasks."""
+        with self._executor_lock:
+            executor = self._executor
+            self._executor = None
+        if executor is not None:
+            executor.shutdown(wait=wait)
+            logger.info("[image] executor shut down wait=%s", wait)
 
     def _execute_task(
         self,

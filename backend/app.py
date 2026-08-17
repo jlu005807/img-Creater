@@ -1,3 +1,4 @@
+import atexit
 import logging
 import os
 
@@ -27,6 +28,10 @@ def create_app() -> Flask:
         from .services.image_service import ImageService
 
         app.config["IMAGE_SERVICE"] = ImageService(config_service=ConfigService())
+
+        # Register graceful shutdown of the bounded thread pool executor.
+        _img_service = app.config["IMAGE_SERVICE"]
+        atexit.register(_img_service.shutdown, wait=False)
 
     @app.get("/api/health")
     def health_check():
