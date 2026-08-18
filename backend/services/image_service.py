@@ -15,9 +15,9 @@ from math import gcd
 from urllib.parse import unquote, urlparse
 
 from .config_service import ConfigService, DEFAULT_MODEL
-from .task_store import TaskStore, task_store as default_task_store
 from .provider_registry import ProviderRegistry
 from .structured_logging import TaskLogAdapter
+from .task_store import TaskStore
 
 
 _DEFAULT_MAX_CONCURRENCY = 4
@@ -122,7 +122,7 @@ class ImageService:
         self.generation_timeout = generation_timeout
         self.async_poll_interval = async_poll_interval
         self.async_max_wait = async_max_wait
-        self.store = store or default_task_store
+        self.store = store or TaskStore()
         # When False the worker runs inline (used by tests for determinism).
         self.run_async = run_async
         self.max_concurrency = max(1, max_concurrency)

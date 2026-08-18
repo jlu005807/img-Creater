@@ -11,7 +11,14 @@ class ProviderRegistry:
     separate adapter classes without changing the dispatch site.
     """
 
+    # Per-class handler registry.  Using __init_subclass__ ensures each
+    # subclass gets its own dict instead of silently sharing the parent's
+    # mutable class attribute.
     _handlers: dict[str, str] = {}
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        cls._handlers = {}
 
     @classmethod
     def register(cls, api_type: str, method_name: str) -> Callable:

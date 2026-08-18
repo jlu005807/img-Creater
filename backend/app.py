@@ -1,21 +1,33 @@
 import atexit
 import logging
 import os
+import sys
 
 from flask import Flask, jsonify, send_from_directory
 from flask_cors import CORS
 
 from backend.services.structured_logging import configure_structured_logging
 
+# When running under a test runner (unittest discover / pytest), suppress
+# JSON log noise by default.  Tests that assert on log output override the
+# level in their own setUp/tearDown.
+if any("unittest" in mod or "pytest" in mod for mod in sys.modules):
+    os.environ.setdefault("LOG_LEVEL", "WARNING")
+else:
+    os.environ.setdefault("LOG_LEVEL", "INFO")
+
 
 def create_app() -> Flask:
-    configure_structured_logging(level=logging.INFO)
+    # LOG_LEVEL env var (set by tests to "WARNING") overrides the default
+    # INFO level so structured JSON output does not flood test output.
+    _log_level = logging.getLevelName(os.environ.get("LOG_LEVEL", "INFO").upper())
+    configure_structured_logging(level=_log_level)
     app = Flask(__name__)
     # Surface app-level INFO logs (e.g. the detection startup status) on the
     # console when launched via run.ps1.
-    app.logger.setLevel(logging.INFO)
-    logging.getLogger("backend.services.image_service").setLevel(logging.INFO)
-    logging.getLogger("backend.services.structured_logging").setLevel(logging.INFO)
+    app.logger.setLevel(_log_level)
+    logging.getLogger("backend.services.image_service").setLevel(_log_level)
+    logging.getLogger("backend.services.structured_logging").setLevel(_log_level)
     # Local single-user tool: only the Vite dev origin needs cross-origin access.
     allowed = os.getenv("FRONTEND_ORIGIN", "http://127.0.0.1:5173,http://localhost:5173").split(",")
     CORS(app, resources={r"/api/*": {"origins": [o.strip() for o in allowed if o.strip()], "expose_headers": ["X-Export-Skipped-Count"]}})

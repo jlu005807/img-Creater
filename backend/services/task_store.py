@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import atexit
 import os
 import sqlite3
 import threading
@@ -42,6 +43,7 @@ class TaskStore:
         if db_path is not None:
             self._init_db()
             self._load_from_db()
+            self._register_cleanup()
 
     # ------------------------------------------------------------------ db
 
@@ -191,11 +193,11 @@ class TaskStore:
                 self._db.close()
                 self._db = None
 
-    def __del__(self) -> None:
-        try:
-            self.close()
-        except Exception:
-            pass
+    def _register_cleanup(self) -> None:
+        """Register atexit cleanup for the SQLite connection.
 
-
-task_store = TaskStore()
+        Unlike __del__, atexit runs before interpreter teardown so sqlite3
+        connections close cleanly without risking 'Interpreter already
+        finalised' exceptions.
+        """
+        atexit.register(self.close)

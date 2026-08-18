@@ -5,6 +5,7 @@ import binascii
 import json
 import math
 import shutil
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,83 @@ from backend.services.image_service import ImageService, ImageServiceError
 
 
 generation_bp = Blueprint("generation", __name__)
+
+_SESSION_CACHE_TTL = 5.0
+_session_cache: dict[str, tuple[float, float, list[dict[str, Any]]]] = {}
+
+
+def _load_session_records(result_dir) -> list[dict[str, Any]]:
+    """Load session records from disk with a short TTL cache.
+
+    For a single-user local tool the history directory rarely changes between
+    consecutive pagination requests.  Caching the full scan for 5 seconds
+    avoids redundant directory enumeration and manifest parsing.
+    """
+    if not result_dir.exists() or not result_dir.is_dir():
+        return []
+
+    key = str(result_dir)
+    try:
+        dir_mtime = result_dir.stat().st_mtime
+    except OSError:
+        dir_mtime = 0.0
+
+    cached = _session_cache.get(key)
+    if cached is not None:
+        cached_ts, cached_mtime, cached_records = cached
+        if dir_mtime == cached_mtime and (time.monotonic() - cached_ts) < _SESSION_CACHE_TTL:
+            return cached_records
+
+    records = _scan_session_records(result_dir)
+    _session_cache[key] = (time.monotonic(), dir_mtime, records)
+    return records
+
+
+def _scan_session_records(result_dir) -> list[dict[str, Any]]:
+    if not result_dir.exists() or not result_dir.is_dir():
+        return []
+    records = []
+    seen_ids: dict[str, str] = {}
+    # Directory order is not guaranteed by pathlib/filesystems.  Loading in
+    # name order gives duplicate public IDs a deterministic winner and makes
+    # the cursor tie-breaker stable across requests.
+    try:
+        session_dirs = sorted(result_dir.iterdir(), key=lambda path: path.name)
+    except OSError as exc:
+        current_app.logger.warning(
+            "Unable to enumerate history directory (%s)",
+            type(exc).__name__,
+        )
+        return []
+    for session_dir in session_dirs:
+        manifest_path = session_dir / "session.json"
+        try:
+            if not session_dir.is_dir() or not manifest_path.exists():
+                continue
+            with manifest_path.open("r", encoding="utf-8-sig") as fh:
+                manifest = json.load(fh)
+            record = _session_record(manifest, session_dir.name, session_dir)
+        except (OSError, UnicodeError, json.JSONDecodeError, _SessionManifestError) as exc:
+            current_app.logger.warning(
+                "Skipping unreadable session %s (%s)",
+                session_dir.name,
+                type(exc).__name__,
+            )
+            continue
+        if record is not None:
+            public_id = record["id"]
+            if public_id in seen_ids:
+                current_app.logger.warning(
+                    "Skipping duplicate session id %s from directory %s (already loaded from %s)",
+                    _safe_session_log_identifier(public_id),
+                    session_dir.name,
+                    seen_ids[public_id],
+                )
+                continue
+            seen_ids[public_id] = session_dir.name
+            records.append(record)
+    return records
+
 
 _SESSION_DEFAULT_LIMIT = 30
 _SESSION_MAX_LIMIT = 100
@@ -238,56 +316,6 @@ def _parse_iso8601(value: Any, field_name: str) -> datetime:
         return parsed.astimezone(timezone.utc)
     except (ValueError, OverflowError) as exc:
         raise ImageServiceError(f"{field_name} must be a valid ISO-8601 date", status_code=400) from exc
-
-
-def _load_session_records(result_dir) -> list[dict[str, Any]]:
-    if not result_dir.exists() or not result_dir.is_dir():
-        return []
-
-    records = []
-    seen_ids: dict[str, str] = {}
-    # Directory order is not guaranteed by pathlib/filesystems.  Loading in
-    # name order gives duplicate public IDs a deterministic winner and makes
-    # the cursor tie-breaker stable across requests.
-    try:
-        session_dirs = sorted(result_dir.iterdir(), key=lambda path: path.name)
-    except OSError as exc:
-        current_app.logger.warning(
-            "Unable to enumerate history directory (%s)",
-            type(exc).__name__,
-        )
-        return []
-    for session_dir in session_dirs:
-        manifest_path = session_dir / "session.json"
-        try:
-            if not session_dir.is_dir() or not manifest_path.exists():
-                continue
-            with manifest_path.open("r", encoding="utf-8-sig") as fh:
-                manifest = json.load(fh)
-            record = _session_record(manifest, session_dir.name, session_dir)
-        except (OSError, UnicodeError, json.JSONDecodeError, _SessionManifestError) as exc:
-            # Keep diagnostics useful without exposing the server's absolute
-            # manifest path.  The directory name plus exception class is
-            # enough to identify a damaged legacy session safely.
-            current_app.logger.warning(
-                "Skipping unreadable session %s (%s)",
-                session_dir.name,
-                type(exc).__name__,
-            )
-            continue
-        if record is not None:
-            public_id = record["id"]
-            if public_id in seen_ids:
-                current_app.logger.warning(
-                    "Skipping duplicate session id %s from directory %s (already loaded from %s)",
-                    _safe_session_log_identifier(public_id),
-                    session_dir.name,
-                    seen_ids[public_id],
-                )
-                continue
-            seen_ids[public_id] = session_dir.name
-            records.append(record)
-    return records
 
 
 def _session_dir_for_public_id(result_dir: Path, public_id: str) -> Path | None:
