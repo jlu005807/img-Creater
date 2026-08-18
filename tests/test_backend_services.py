@@ -3573,5 +3573,138 @@ class BoundedExecutorTests(TestCase):
             self.assertLessEqual(len(submitted), 4)
             self.assertGreater(rejected, 0)
 
+
+class SqliteTaskStoreTests(TestCase):
+    """Stage 4.2: TaskStore persists task state to SQLite for recovery."""
+
+    def test_sqlite_store_creates_and_persists(self):
+        from backend.services.task_store import TaskStore
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "tasks.db"
+            store = TaskStore(db_path=str(db_path))
+            task_id = store.create("generate")
+            task = store.get(task_id)
+            self.assertIsNotNone(task)
+            self.assertEqual(task["status"], "queued")
+            self.assertEqual(task["operation"], "generate")
+            self.assertTrue(db_path.exists())
+            store.close()
+
+    def test_sqlite_store_update_persists(self):
+        from backend.services.task_store import TaskStore
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "tasks.db"
+            store = TaskStore(db_path=str(db_path))
+            task_id = store.create("generate")
+            store.update(task_id, status="processing", api_name="openai")
+            task = store.get(task_id)
+            self.assertEqual(task["status"], "processing")
+            self.assertEqual(task["api_name"], "openai")
+            store.close()
+
+    def test_sqlite_store_survives_restart(self):
+        from backend.services.task_store import TaskStore
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "tasks.db"
+            store1 = TaskStore(db_path=str(db_path))
+            task_id = store1.create("edit")
+            store1.update(task_id, status="completed", urls=["http://x/a.png"])
+
+            # Simulate restart by creating a new store with the same db.
+            store2 = TaskStore(db_path=str(db_path))
+            task = store2.get(task_id)
+            self.assertIsNotNone(task)
+            self.assertEqual(task["status"], "completed")
+            self.assertEqual(task["urls"], ["http://x/a.png"])
+            self.assertEqual(task["operation"], "edit")
+            store1.close()
+            store2.close()
+
+    def test_sqlite_store_cancel_persists(self):
+        from backend.services.task_store import TaskStore
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "tasks.db"
+            store1 = TaskStore(db_path=str(db_path))
+            task_id = store1.create("generate")
+            store1.cancel(task_id)
+
+            store2 = TaskStore(db_path=str(db_path))
+            task = store2.get(task_id)
+            self.assertEqual(task["status"], "cancelled")
+            self.assertTrue(store2.is_cancelled(task_id))
+            store1.close()
+            store2.close()
+
+    def test_sqlite_store_cancelled_task_ignores_updates(self):
+        from backend.services.task_store import TaskStore
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "tasks.db"
+            store = TaskStore(db_path=str(db_path))
+            task_id = store.create("generate")
+            store.cancel(task_id)
+            store.update(task_id, status="completed")
+            task = store.get(task_id)
+            self.assertEqual(task["status"], "cancelled")
+            store.close()
+
+    def test_sqlite_store_get_nonexistent_returns_none(self):
+        from backend.services.task_store import TaskStore
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "tasks.db"
+            store = TaskStore(db_path=str(db_path))
+            self.assertIsNone(store.get("nonexistent-id"))
+            store.close()
+
+    def test_sqlite_store_evicts_expired_on_create(self):
+        from backend.services.task_store import TaskStore
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "tasks.db"
+            store = TaskStore(db_path=str(db_path), ttl_seconds=1)
+            task_id = store.create("generate")
+            store.update(task_id, status="completed")
+            # Wait for TTL to expire.
+            time.sleep(1.1)
+            store.create("generate")  # triggers eviction
+            self.assertIsNone(store.get(task_id))
+            store.close()
+
+    def test_sqlite_store_lists_pending_tasks(self):
+        from backend.services.task_store import TaskStore
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "tasks.db"
+            store = TaskStore(db_path=str(db_path))
+            t1 = store.create("generate")
+            t2 = store.create("edit")
+            store.update(t1, status="processing")
+            # t2 is still queued
+            pending = store.list_active()
+            ids = [t["task_id"] for t in pending]
+            self.assertIn(t1, ids)
+            self.assertIn(t2, ids)
+            store.update(t1, status="completed")
+            pending = store.list_active()
+            ids = [t["task_id"] for t in pending]
+            self.assertNotIn(t1, ids)
+            self.assertIn(t2, ids)
+            store.close()
+
+    def test_memory_store_still_works_without_db(self):
+        from backend.services.task_store import TaskStore
+
+        store = TaskStore()
+        task_id = store.create("generate")
+        task = store.get(task_id)
+        self.assertIsNotNone(task)
+        self.assertEqual(task["status"], "queued")
+
+
 if __name__ == "__main__":
     main()
