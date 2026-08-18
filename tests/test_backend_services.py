@@ -701,9 +701,9 @@ class OpenAIProviderTests(TestCase):
 
             output = "\n".join(logs.output)
             self.assertEqual(result["status"], "completed")
-            self.assertIn("[image] provider failed", output)
-            self.assertIn("[image] candidate success", output)
-            self.assertIn("[image] task completed", output)
+            self.assertIn("provider failed", output)
+            self.assertIn("candidate success", output)
+            self.assertIn("task completed", output)
 
     def test_openai_edit_uses_submitted_marked_image_without_mask(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

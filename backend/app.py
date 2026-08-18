@@ -5,14 +5,17 @@ import os
 from flask import Flask, jsonify, send_from_directory
 from flask_cors import CORS
 
+from backend.services.structured_logging import configure_structured_logging
+
 
 def create_app() -> Flask:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
+    configure_structured_logging(level=logging.INFO)
     app = Flask(__name__)
     # Surface app-level INFO logs (e.g. the detection startup status) on the
     # console when launched via run.ps1.
     app.logger.setLevel(logging.INFO)
     logging.getLogger("backend.services.image_service").setLevel(logging.INFO)
+    logging.getLogger("backend.services.structured_logging").setLevel(logging.INFO)
     # Local single-user tool: only the Vite dev origin needs cross-origin access.
     allowed = os.getenv("FRONTEND_ORIGIN", "http://127.0.0.1:5173,http://localhost:5173").split(",")
     CORS(app, resources={r"/api/*": {"origins": [o.strip() for o in allowed if o.strip()], "expose_headers": ["X-Export-Skipped-Count"]}})

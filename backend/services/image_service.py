@@ -17,6 +17,7 @@ from urllib.parse import unquote, urlparse
 from .config_service import ConfigService, DEFAULT_MODEL
 from .task_store import TaskStore, task_store as default_task_store
 from .provider_registry import ProviderRegistry
+from .structured_logging import TaskLogAdapter
 
 
 _DEFAULT_MAX_CONCURRENCY = 4
@@ -351,10 +352,11 @@ class ImageService:
         operation: str,
     ) -> None:
         history_id = str(payload.get("history_id") or "").strip() or None
+        tlog = TaskLogAdapter(logger, {"task_id": task_id, "operation": operation, "history_id": history_id or ""})
         if self.store.is_cancelled(task_id):
             return
         self.store.update(task_id, status="processing", history_id=history_id)
-        logger.info("[image] task processing task_id=%s operation=%s history_id=%s", task_id, operation, history_id or "")
+        tlog.info("task processing")
         attempts: list[dict[str, Any]] = []
         # Each provider/mode carries its own positive timeout. Do not cap it
         # with a fixed global generation limit; user-configured timeouts are
@@ -365,14 +367,7 @@ class ImageService:
                 if self.store.is_cancelled(task_id):
                     return
                 self.store.update(task_id, api_id=provider["id"], api_name=provider["name"])
-                logger.info(
-                    "[image] provider start task_id=%s operation=%s api_id=%s api_name=%s api_type=%s",
-                    task_id,
-                    operation,
-                    provider.get("id"),
-                    provider.get("name"),
-                    provider.get("api_type"),
-                )
+                tlog.info("provider start", extra={"api_id": provider.get("id"), "api_name": provider.get("name"), "api_type": provider.get("api_type")})
                 ok, urls, expires_at, response_meta, provider_attempts = self._run_provider_plan(
                     provider, payload, operation, deadline
                 )
@@ -382,14 +377,7 @@ class ImageService:
                 self.store.update(task_id, attempts=list(attempts))
                 if not ok:
                     last_error = provider_attempts[-1].get("error") if provider_attempts else ""
-                    logger.warning(
-                        "[image] provider failed task_id=%s api_id=%s api_name=%s attempts=%d error=%s",
-                        task_id,
-                        provider.get("id"),
-                        provider.get("name"),
-                        len(provider_attempts),
-                        last_error,
-                    )
+                    tlog.warning("provider failed", extra={"api_id": provider.get("id"), "api_name": provider.get("name"), "attempts": len(provider_attempts), "error": last_error})
                     continue
 
                 if not urls:
@@ -397,12 +385,7 @@ class ImageService:
                         self._failed_attempt(provider, ProviderRequestError("节点返回空图片列表"))
                     )
                     self.store.update(task_id, attempts=list(attempts))
-                    logger.warning(
-                        "[image] provider returned empty urls task_id=%s api_id=%s api_name=%s",
-                        task_id,
-                        provider.get("id"),
-                        provider.get("name"),
-                    )
+                    tlog.warning("provider returned empty urls", extra={"api_id": provider.get("id"), "api_name": provider.get("name")})
                     continue
 
                 session_id = history_id or task_id
@@ -438,19 +421,10 @@ class ImageService:
                     configured_api_type=self._last_attempt_value(attempts, "configured_api_type"),
                     effective_api_type=self._last_attempt_value(attempts, "effective_api_type"),
                 )
-                logger.info(
-                    "[image] task completed task_id=%s operation=%s api_id=%s api_name=%s effective_api_type=%s urls=%d history_id=%s",
-                    task_id,
-                    operation,
-                    provider.get("id"),
-                    provider.get("name"),
-                    self._last_attempt_value(attempts, "effective_api_type") or provider.get("api_type"),
-                    len(urls),
-                    session_id,
-                )
+                tlog.info("task completed", extra={"api_id": provider.get("id"), "api_name": provider.get("name"), "effective_api_type": self._last_attempt_value(attempts, "effective_api_type") or provider.get("api_type"), "urls": len(urls), "session_id": session_id})
                 return
 
-            logger.warning("[image] task failed task_id=%s operation=%s attempts=%d error=all providers failed", task_id, operation, len(attempts))
+            tlog.warning("task failed: all providers failed", extra={"attempts": len(attempts)})
             self._persist_failed_session_manifest(
                 history_id=history_id,
                 payload=payload,
@@ -466,7 +440,7 @@ class ImageService:
                 error="所有 API 节点均失败",
             )
         except TaskCancelled:
-            logger.info("[image] task cancelled task_id=%s operation=%s", task_id, operation)
+            tlog.info("task cancelled")
             self._persist_failed_session_manifest(
                 history_id=history_id,
                 payload=payload,
@@ -489,7 +463,7 @@ class ImageService:
                     error=exc.message,
                 )
                 self.store.update(task_id, status="failed", attempts=list(attempts), error=exc.message)
-                logger.warning("[image] task failed task_id=%s operation=%s error=%s", task_id, operation, exc.message)
+                tlog.warning("task failed", extra={"error": exc.message})
         except Exception as exc:  # noqa: BLE001 - never let the worker die silently
             if not self.store.is_cancelled(task_id):
                 self._persist_failed_session_manifest(
@@ -511,6 +485,8 @@ class ImageService:
         deadline: float | None = None,
     ) -> tuple[bool, list[str], Any, dict[str, Any], list[dict[str, Any]]]:
         attempts: list[dict[str, Any]] = []
+        _task_id = str(payload.get("_task_id") or "").strip()
+        tlog = TaskLogAdapter(logger, {"task_id": _task_id, "operation": operation})
         for candidate in self._provider_mode_candidates(provider):
             self._raise_if_cancelled(payload)
             candidate["request_url"] = self._candidate_request_url(candidate, payload, operation)
@@ -538,30 +514,13 @@ class ImageService:
                 candidate["request_url"] = self._candidate_request_url(candidate, payload, operation)
                 self.store_timeout_hint(payload, candidate)
                 task_id = str(payload.get("_task_id") or "").strip()
-                logger.info(
-                    "[image] candidate request task_id=%s operation=%s api_id=%s api_name=%s configured_api_type=%s effective_api_type=%s attempt=%d/%d url=%s",
-                    task_id,
-                    operation,
-                    candidate.get("id"),
-                    candidate.get("name"),
-                    candidate.get("configured_api_type") or candidate.get("api_type"),
-                    candidate.get("effective_api_type") or candidate.get("api_type"),
-                    attempt_index + 1,
-                    retries + 1,
-                    candidate.get("request_url"),
-                )
+                tlog = TaskLogAdapter(logger, {"task_id": task_id, "operation": operation})
+                tlog.info("candidate request", extra={"api_id": candidate.get("id"), "api_name": candidate.get("name"), "configured_api_type": candidate.get("configured_api_type") or candidate.get("api_type"), "effective_api_type": candidate.get("effective_api_type") or candidate.get("api_type"), "attempt": attempt_index + 1, "max_attempts": retries + 1, "url": candidate.get("request_url")})
                 urls, expires_at, response_meta = self._run_provider(candidate, payload, operation, deadline)
                 self._raise_if_cancelled(payload)
                 if not urls:
                     raise ProviderRequestError("provider returned an empty image list")
-                logger.info(
-                    "[image] candidate success task_id=%s api_id=%s api_name=%s effective_api_type=%s urls=%d",
-                    task_id,
-                    candidate.get("id"),
-                    candidate.get("name"),
-                    candidate.get("effective_api_type") or candidate.get("api_type"),
-                    len(urls),
-                )
+                tlog.info("candidate success", extra={"api_id": candidate.get("id"), "api_name": candidate.get("name"), "effective_api_type": candidate.get("effective_api_type") or candidate.get("api_type"), "urls": len(urls)})
                 return True, urls, expires_at, response_meta, None
             except TaskCancelled:
                 raise
@@ -603,16 +562,7 @@ class ImageService:
                 break
             except Exception as exc:  # noqa: BLE001 - caller records the final failure
                 last_error = exc
-                logger.warning(
-                    "[image] candidate failed task_id=%s api_id=%s api_name=%s effective_api_type=%s attempt=%d/%d error=%s",
-                    str(payload.get("_task_id") or "").strip(),
-                    candidate.get("id"),
-                    candidate.get("name"),
-                    candidate.get("effective_api_type") or candidate.get("api_type"),
-                    attempt_index + 1,
-                    retries + 1,
-                    exc,
-                )
+                tlog.warning("candidate failed", extra={"api_id": candidate.get("id"), "api_name": candidate.get("name"), "effective_api_type": candidate.get("effective_api_type") or candidate.get("api_type"), "attempt": attempt_index + 1, "max_attempts": retries + 1, "error": str(exc)})
                 if isinstance(exc, ProviderTimeoutError):
                     self._raise_upstream_timeout(candidate, exc)
                 if attempt_index >= retries:

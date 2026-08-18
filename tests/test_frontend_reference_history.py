@@ -17,7 +17,7 @@ class ReferenceHistorySourceTests(TestCase):
         self.assertIn("mapSessionSummary", history_source)
         self.assertIn("referenceImages: stringList(session.reference_images ?? session.referenceImages)", mapper_source)
         self.assertIn("referenceImages.value = Array.isArray(entry.referenceImages)", playground_source)
-        self.assertIn("referenceImages: persistedReferenceImages(result)", playground_source)
+        self.assertIn("const acceptedReferenceImages = persistedReferenceImages(result)", playground_source)
         self.assertIn("function persistedReferenceImages", playground_source)
 
     def test_submit_acceptance_updates_history_with_persisted_reference_urls(self):
