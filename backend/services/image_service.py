@@ -16,6 +16,7 @@ from urllib.parse import unquote, urlparse
 
 from .config_service import ConfigService, DEFAULT_MODEL
 from .task_store import TaskStore, task_store as default_task_store
+from .provider_registry import ProviderRegistry
 
 
 _DEFAULT_MAX_CONCURRENCY = 4
@@ -804,13 +805,7 @@ class ImageService:
         self, provider: dict[str, Any], payload: dict[str, Any], operation: str, deadline: float | None = None
     ) -> tuple[list[str], Any, dict[str, Any]]:
         api_type = str(provider.get("api_type") or "openai").strip().lower()
-        if api_type == "async":
-            return self._run_async_provider(provider, payload, operation, deadline)
-        if api_type == "custom":
-            return self._run_custom_provider(provider, payload, operation, deadline)
-        if api_type == "chat":
-            return self._run_chat_completions_provider(provider, payload, operation, deadline)
-        return self._run_openai_provider(provider, payload, operation, deadline)
+        return ProviderRegistry.dispatch(self, api_type, provider, payload, operation, deadline)
 
     def _remaining(self, deadline: float | None, request_cap: float | None = None) -> float:
         """Seconds left in the task budget, capped at the active provider
@@ -838,6 +833,7 @@ class ImageService:
 
     # --------------------------------------------------- OpenAI-compatible API
 
+    @ProviderRegistry.register("openai", "_run_openai_provider")
     def _run_openai_provider(
         self, provider: dict[str, Any], payload: dict[str, Any], operation: str, deadline: float | None = None
     ) -> tuple[list[str], Any, dict[str, Any]]:
@@ -1153,6 +1149,7 @@ class ImageService:
 
     # ------------------------------------------------------- async relay (opt)
 
+    @ProviderRegistry.register("async", "_run_async_provider")
     def _run_async_provider(
         self, provider: dict[str, Any], payload: dict[str, Any], operation: str, deadline: float | None = None
     ) -> tuple[list[str], Any, dict[str, Any]]:
@@ -2036,6 +2033,7 @@ class ImageService:
 
     # ------------------------------------------------------- custom direct URL
 
+    @ProviderRegistry.register("custom", "_run_custom_provider")
     def _run_custom_provider(
         self, provider: dict[str, Any], payload: dict[str, Any], operation: str, deadline: float | None = None
     ) -> tuple[list[str], Any, dict[str, Any]]:
@@ -2076,6 +2074,7 @@ class ImageService:
 
     # ------------------------------------------------------- Chat Completions
 
+    @ProviderRegistry.register("chat", "_run_chat_completions_provider")
     def _run_chat_completions_provider(
         self, provider: dict[str, Any], payload: dict[str, Any], operation: str, deadline: float | None = None
     ) -> tuple[list[str], Any, dict[str, Any]]:
