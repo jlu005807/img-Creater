@@ -26,11 +26,20 @@ def create_app() -> Flask:
     if "IMAGE_SERVICE" not in app.config:
         from .services.config_service import ConfigService
         from .services.image_service import ImageService
+        from .services.task_store import TaskStore
+        from .services.image_service import DEFAULT_RESULT_DIR
 
-        app.config["IMAGE_SERVICE"] = ImageService(config_service=ConfigService())
+        # Use a SQLite-backed task store so tasks survive restarts.
+        _task_db_path = os.getenv("TASK_DB_PATH", str(DEFAULT_RESULT_DIR / "tasks.db"))
+        _task_store = TaskStore(db_path=_task_db_path)
+
+        _img_service = ImageService(config_service=ConfigService(), store=_task_store)
+        app.config["IMAGE_SERVICE"] = _img_service
+
+        # Recover tasks interrupted by the previous process (if any).
+        _img_service.recover_interrupted_tasks()
 
         # Register graceful shutdown of the bounded thread pool executor.
-        _img_service = app.config["IMAGE_SERVICE"]
         atexit.register(_img_service.shutdown, wait=False)
 
     @app.get("/api/health")

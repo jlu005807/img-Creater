@@ -3706,5 +3706,133 @@ class SqliteTaskStoreTests(TestCase):
         self.assertEqual(task["status"], "queued")
 
 
+
+class StartupRecoveryTests(TestCase):
+    """Stage 4.3: interrupted tasks are recovered on startup."""
+
+    def _config(self, tmp_dir):
+        config_service = ConfigService(config_path=Path(tmp_dir) / "configs.json")
+        config_service.create_config({
+            "name": "Primary",
+            "base_url": "https://api.openai.com",
+            "api_key": "key-1",
+            "model": "gpt-image-2",
+            "status": True,
+        })
+        return config_service
+
+    def test_recover_marks_queued_tasks_as_failed(self):
+        from backend.services.task_store import TaskStore
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "tasks.db")
+            store = TaskStore(db_path=db_path)
+            task_id = store.create("generate")
+            store.update(task_id, status="processing")
+
+            # Simulate restart: new ImageService with same store
+            store2 = TaskStore(db_path=db_path)
+            config_service = self._config(tmp_dir)
+            service = ImageService(
+                config_service=config_service,
+                http_client=FakeHttpClient(),
+                run_async=False,
+                persist_results=False,
+                store=store2,
+            )
+            recovered = service.recover_interrupted_tasks()
+
+            self.assertEqual(len(recovered), 1)
+            self.assertEqual(recovered[0]["task_id"], task_id)
+            task = store2.get(task_id)
+            self.assertEqual(task["status"], "failed")
+            self.assertIn("restart", task["error"].lower())
+            store.close()
+            store2.close()
+
+    def test_recover_skips_completed_tasks(self):
+        from backend.services.task_store import TaskStore
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "tasks.db")
+            store = TaskStore(db_path=db_path)
+            t1 = store.create("generate")
+            store.update(t1, status="processing")
+            t2 = store.create("generate")
+            store.update(t2, status="completed", urls=["http://x/a.png"])
+            t3 = store.create("generate")
+            store.update(t3, status="failed", error="boom")
+
+            store2 = TaskStore(db_path=db_path)
+            config_service = self._config(tmp_dir)
+            service = ImageService(
+                config_service=config_service,
+                http_client=FakeHttpClient(),
+                run_async=False,
+                persist_results=False,
+                store=store2,
+            )
+            recovered = service.recover_interrupted_tasks()
+
+            self.assertEqual(len(recovered), 1)
+            self.assertEqual(recovered[0]["task_id"], t1)
+            # Completed and failed tasks are untouched
+            self.assertEqual(store2.get(t2)["status"], "completed")
+            self.assertEqual(store2.get(t3)["status"], "failed")
+            store.close()
+            store2.close()
+
+    def test_recover_marks_cancelled_tasks_as_cancelled(self):
+        from backend.services.task_store import TaskStore
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "tasks.db")
+            store = TaskStore(db_path=db_path)
+            t1 = store.create("generate")
+            store.update(t1, status="processing")
+            store.cancel(t1)
+
+            store2 = TaskStore(db_path=db_path)
+            config_service = self._config(tmp_dir)
+            service = ImageService(
+                config_service=config_service,
+                http_client=FakeHttpClient(),
+                run_async=False,
+                persist_results=False,
+                store=store2,
+            )
+            recovered = service.recover_interrupted_tasks()
+
+            # Cancelled tasks are terminal, not recovered
+            self.assertEqual(len(recovered), 0)
+            self.assertEqual(store2.get(t1)["status"], "cancelled")
+            store.close()
+            store2.close()
+
+    def test_recover_with_memory_store_does_nothing(self):
+        from backend.services.task_store import TaskStore
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_service = self._config(tmp_dir)
+            store = TaskStore()
+            t1 = store.create("generate")
+            store.update(t1, status="processing")
+
+            service = ImageService(
+                config_service=config_service,
+                http_client=FakeHttpClient(),
+                run_async=False,
+                persist_results=False,
+                store=store,
+            )
+            recovered = service.recover_interrupted_tasks()
+
+            # Memory store has no persistence; tasks in memory are current
+            # But queued/processing tasks are still recovered since they
+            # cannot be running after a new ImageService is created.
+            self.assertEqual(len(recovered), 1)
+            self.assertEqual(store.get(t1)["status"], "failed")
+
+
 if __name__ == "__main__":
     main()

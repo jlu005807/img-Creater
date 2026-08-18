@@ -308,6 +308,31 @@ class ImageService:
             with self._executor_lock:
                 self._pending_count -= 1
 
+    def recover_interrupted_tasks(self) -> list[dict[str, Any]]:
+        """Mark non-terminal tasks as failed after a process restart.
+
+        Called at startup when using a persistent (SQLite) task store.
+        Any task in 'queued' or 'processing' status was interrupted by the
+        restart and cannot be resumed; mark it as failed with a clear error
+        message so the frontend stops polling and shows a recoverable state.
+
+        Returns the list of recovered task summaries.
+        """
+        active = self.store.list_active()
+        recovered = []
+        for task in active:
+            task_id = task["task_id"]
+            self.store.update(
+                task_id,
+                status="failed",
+                error="Interrupted by server restart",
+            )
+            recovered.append({"task_id": task_id, "operation": task.get("operation")})
+            logger.info("[image] recovered interrupted task task_id=%s operation=%s", task_id, task.get("operation", ""))
+        if recovered:
+            logger.info("[image] recovered %d interrupted tasks on startup", len(recovered))
+        return recovered
+
     def shutdown(self, wait: bool = True) -> None:
         """Gracefully shut down the executor, waiting for in-flight tasks."""
         with self._executor_lock:
