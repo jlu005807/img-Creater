@@ -20,15 +20,13 @@ import { useGenerationHistory } from '../../composables/useGenerationHistory'
 import { useInfiniteScrollSentinel } from '../../composables/useInfiniteScrollSentinel'
 import { useSettings } from '../../composables/useSettings'
 import { usePromptTemplates } from '../../composables/usePromptTemplates'
+import { useTaskPolling } from '../../composables/useTaskPolling'
 import RegionEditor from '../RegionEditor/index.vue'
 
 const { settings } = useSettings()
 const { templates, loadTemplates, pendingFill, requestRandomFill } = usePromptTemplates()
 const promptZoomOpen = ref(false)
 
-const POLL_INTERVAL_MS = 4000
-const POLL_FAILURE_LIMIT = 5
-const TASK_EXPIRED_MESSAGE = '任务已过期或后端已重启，请重新生成'
 const DRAFT_KEY = 'studio-form-draft'
 const EDIT_DRAFT_FLUSH_MS = 3000
 const HISTORY_WIDTH = '276px'
@@ -162,12 +160,27 @@ const {
   hasMore,
 } = useGenerationHistory()
 const displayHistoryId = ref(null)
+
+const {
+  pollTimers,
+  pollFailures,
+  clearPollTimer,
+  clearAllTimers,
+  schedulePoll,
+  pollStatusOnce,
+  stopWithError,
+  stopWithCancelled,
+  cancelTask: cancelTaskViaComposable,
+} = useTaskPolling({
+  isDisposed: () => disposed,
+  findEntry: findHistoryEntry,
+  updateEntry,
+  elapsedForEntry,
+})
 const clockNow = ref(Date.now())
 const historyScrollRef = ref(null)
 const historySentinelRef = ref(null)
 
-const pollTimers = new Map()
-const pollFailures = new Map()
 let clockTimer = null
 const historyInteraction = createHistoryInteractionGuard()
 // 局部编辑草稿的本地工作缓冲：画布本身持有内容，这里只记录“有未落盘改动”的脏标记
@@ -551,18 +564,10 @@ function historyTime(ts) {
 
 // ---- timers ----
 function clearTimers() {
-  pollTimers.forEach((timer) => window.clearTimeout(timer))
-  pollTimers.clear()
-  pollFailures.clear()
+  clearAllTimers()
   discardEditDraftBuffer()
   if (clockTimer) window.clearInterval(clockTimer)
   clockTimer = null
-}
-
-function clearPollTimer(entryId) {
-  const timer = pollTimers.get(entryId)
-  if (timer) window.clearTimeout(timer)
-  pollTimers.delete(entryId)
 }
 
 // 丢弃本地草稿缓冲：切换到其它会话、提交成功或删除当前会话后调用。
@@ -724,150 +729,6 @@ async function submitTask(reuseId = null) {
   }
 }
 
-function schedulePoll(entryId, taskData = null, delay = POLL_INTERVAL_MS) {
-  if (disposed) return
-  const entry = findHistoryEntry(entryId)
-  const activeTask = taskData || entry?.task
-  if (!entry || !activeTask || !isRunningStatus(entry._status)) return
-  clearPollTimer(entryId)
-  pollTimers.set(entryId, window.setTimeout(() => pollStatusOnce(entryId), delay))
-}
-
-function isTaskExpiredError(error) {
-  // Backend replies 404 with this envelope message when the task record is
-  // gone (TTL / restart); a real missing route returns an HTML 404 instead.
-  return Number(error?.status) === 404 && String(error?.message || '').includes('任务不存在')
-}
-
-async function pollStatusOnce(entryId) {
-  const entry = findHistoryEntry(entryId)
-  const activeTask = entry?.task
-  if (!entry || !activeTask || !isRunningStatus(entry._status)) return
-
-  try {
-    const result = await getGenerationStatus({
-      apiId: activeTask.apiId,
-      taskId: activeTask.taskId,
-    })
-    if (disposed) return
-    pollFailures.delete(entryId)
-
-    const nextTask = { ...activeTask }
-    if (result.api_name || result.api_id) {
-      nextTask.apiId = result.api_id
-      nextTask.apiName = result.api_name
-    }
-    if (result.request_id) nextTask.requestId = result.request_id
-    if (result.request_url) nextTask.requestUrl = result.request_url
-    if (result.upstream_request_id) nextTask.upstreamRequestId = result.upstream_request_id
-    if (result.upstream_task_id) nextTask.upstreamTaskId = result.upstream_task_id
-    nextTask.pollCount = result.poll_count ?? nextTask.pollCount
-    nextTask.lastPollStatus = result.last_poll_status || nextTask.lastPollStatus
-    nextTask.lastPollError = result.last_poll_error || ''
-    if (result.wait_phase) nextTask.waitPhase = result.wait_phase
-    if (result.configured_api_type) nextTask.configuredApiType = result.configured_api_type
-    if (result.effective_api_type) nextTask.effectiveApiType = result.effective_api_type
-    if (result.operation) {
-      nextTask.operation = result.operation
-    }
-    const nextAttempts = Array.isArray(result.attempts) ? result.attempts : entry.attempts || []
-
-    if (result.status === 'completed') {
-      const urls = result.urls || []
-      clearPollTimer(entryId)
-      if (urls.length) {
-        updateEntry(entryId, {
-          task: nextTask,
-          urls,
-          apiName: nextTask.apiName || result.api_name || '',
-          _status: 'completed',
-          attempts: nextAttempts,
-          expiresAt: result.expires_at ?? null,
-          referenceImages: persistedReferenceImages(result),
-          maxWaitSeconds: result.max_wait_seconds ?? entry.maxWaitSeconds ?? null,
-          elapsedSeconds: elapsedForEntry(entry),
-        })
-      } else {
-        updateEntry(entryId, {
-          task: nextTask,
-          _status: 'failed',
-          attempts: nextAttempts,
-          errorMessage: '任务完成但未返回图片 URL',
-          maxWaitSeconds: result.max_wait_seconds ?? entry.maxWaitSeconds ?? null,
-          elapsedSeconds: elapsedForEntry(entry),
-        })
-      }
-      return
-    }
-
-    if (result.status === 'cancelled') {
-      stopWithCancelled(entryId, result.error || '任务已手动停止', { task: nextTask, attempts: nextAttempts })
-      return
-    }
-
-    if (result.status === 'failed') {
-      stopWithError(entryId, result.error || '任务失败', { task: nextTask, attempts: nextAttempts })
-      return
-    }
-
-    updateEntry(entryId, {
-      task: nextTask,
-      _status: result.status || 'processing',
-      attempts: nextAttempts,
-      expiresAt: result.expires_at ?? entry.expiresAt ?? null,
-      maxWaitSeconds: result.max_wait_seconds ?? entry.maxWaitSeconds ?? null,
-    })
-    schedulePoll(entryId, nextTask)
-  } catch (error) {
-    if (disposed) return
-    if (isTaskExpiredError(error)) {
-      stopWithError(entryId, TASK_EXPIRED_MESSAGE)
-      return
-    }
-    if (isBackendRouteMissing(error)) {
-      stopWithError(entryId, backendRouteMissingMessage('任务状态轮询'))
-      return
-    }
-    const statusCode = Number(error?.status)
-    if (statusCode >= 400 && statusCode < 500) {
-      stopWithError(entryId, error.message || '查询任务状态失败')
-      return
-    }
-    // 网络抖动 / 后端重启中 / 5xx：任务可能仍在运行，继续轮询并累计失败次数。
-    const failures = (pollFailures.get(entryId) || 0) + 1
-    if (failures >= POLL_FAILURE_LIMIT) {
-      stopWithError(entryId, `多次轮询失败: ${error.message || '查询任务状态失败'}`)
-      return
-    }
-    pollFailures.set(entryId, failures)
-    schedulePoll(entryId, activeTask)
-  }
-}
-
-function stopWithError(entryId, message, extra = {}) {
-  const entry = findHistoryEntry(entryId)
-  clearPollTimer(entryId)
-  pollFailures.delete(entryId)
-  updateEntry(entryId, {
-    _status: 'failed',
-    errorMessage: message,
-    elapsedSeconds: elapsedForEntry(entry),
-    ...extra,
-  })
-}
-
-function stopWithCancelled(entryId, message = '任务已手动停止', extra = {}) {
-  const entry = findHistoryEntry(entryId)
-  clearPollTimer(entryId)
-  pollFailures.delete(entryId)
-  updateEntry(entryId, {
-    _status: 'cancelled',
-    errorMessage: message,
-    elapsedSeconds: elapsedForEntry(entry),
-    ...extra,
-  })
-}
-
 async function stopActiveTask() {
   const entry = activeEntry.value
   const taskId = entry?.task?.taskId
@@ -882,63 +743,16 @@ async function stopActiveTask() {
         cancelButtonText: '继续等待',
       },
     )
-    const result = await cancelGenerationTask(taskId)
-    const nextTask = {
-      ...entry.task,
-      apiId: result?.api_id || entry.task.apiId,
-      apiName: result?.api_name || entry.task.apiName,
-      operation: result?.operation || entry.task.operation,
-      requestId: result?.request_id || entry.task.requestId,
-      requestUrl: result?.request_url || entry.task.requestUrl,
-      upstreamRequestId: result?.upstream_request_id || entry.task.upstreamRequestId,
-      upstreamTaskId: result?.upstream_task_id || entry.task.upstreamTaskId,
-      pollCount: result?.poll_count ?? entry.task.pollCount,
-      lastPollStatus: result?.last_poll_status || entry.task.lastPollStatus,
-      lastPollError: result?.last_poll_error || '',
-      waitPhase: result?.wait_phase || entry.task.waitPhase,
-      configuredApiType: result?.configured_api_type || entry.task.configuredApiType,
-      effectiveApiType: result?.effective_api_type || entry.task.effectiveApiType,
-    }
-    const nextAttempts = Array.isArray(result?.attempts) ? result.attempts : entry.attempts || []
-    // Completed while the confirm dialog was open: keep the result, don't
-    // rewrite it to cancelled.
-    if (findHistoryEntry(entry.id)?._status === 'completed') {
+    const cancelResult = await cancelTaskViaComposable(entry.id, entry)
+    if (cancelResult?.alreadyCompleted) {
       ElMessage.info('任务已完成，无需停止')
       return
     }
-    if (result?.status === 'completed') {
-      clearPollTimer(entry.id)
-      pollFailures.delete(entry.id)
-      const urls = result.urls || []
-      updateEntry(entry.id, {
-        task: nextTask,
-        urls,
-        apiName: nextTask.apiName || result.api_name || '',
-        _status: 'completed',
-        attempts: nextAttempts,
-        errorMessage: '',
-        expiresAt: result.expires_at ?? null,
-        referenceImages: persistedReferenceImages(result),
-        maxWaitSeconds: result.max_wait_seconds ?? entry.maxWaitSeconds ?? null,
-        elapsedSeconds: elapsedForEntry(entry),
-      })
-      ElMessage.info('任务已完成，无需停止')
-      return
-    }
-    stopWithCancelled(entry.id, result?.error || '任务已手动停止', {
-      task: nextTask,
-      attempts: nextAttempts,
-    })
     ElMessage.success('已停止本地等待')
   } catch (error) {
     if (error === 'cancel') return
-    // 确认框打开期间任务已完成：结果已在手，不能被过期 404 覆盖成失败。
     if (findHistoryEntry(entry.id)?._status === 'completed') {
       ElMessage.info('任务已完成，无需停止')
-      return
-    }
-    if (isTaskExpiredError(error)) {
-      stopWithError(entry.id, TASK_EXPIRED_MESSAGE)
       return
     }
     if (isBackendRouteMissing(error)) {
@@ -948,7 +762,6 @@ async function stopActiveTask() {
     ElMessage.error(error.message || '停止任务失败')
   }
 }
-
 async function reusePrompt() {
   try {
     if (!templates.value.length) {
